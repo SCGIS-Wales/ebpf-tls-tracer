@@ -7,6 +7,7 @@ CFLAGS = -O2 -target bpf -I./include  # Include the headers from the 'include' d
 # Paths
 SRC_DIR = src
 OBJ_DIR = obj
+BIN_DIR = bin
 INCLUDE_DIR = include
 
 # Sources and objects
@@ -18,15 +19,18 @@ USER_OBJECT = $(OBJ_DIR)/user_space.o
 CLI_OBJECT = $(OBJ_DIR)/cli_tool.o
 
 # Output binaries
-USER_BINARY = user_space
-CLI_BINARY = cli_tool
+USER_BINARY = $(BIN_DIR)/user_space
+CLI_BINARY = $(BIN_DIR)/cli_tool
 
-# Create object directory if it doesn't exist
+# Create necessary directories
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
+
 # Default target
-all: $(OBJ_DIR) $(BPF_OBJECT) $(USER_BINARY) $(CLI_BINARY)
+all: $(OBJ_DIR) $(BIN_DIR) $(BPF_OBJECT) $(USER_BINARY) $(CLI_BINARY)
 
 # Compile eBPF program
 $(BPF_OBJECT): $(BPF_PROGRAM)
@@ -50,4 +54,4 @@ $(CLI_BINARY): $(CLI_OBJECT)
 
 # Clean up build artifacts
 clean:
-	rm -rf $(OBJ_DIR) $(USER_BINARY) $(CLI_BINARY)
+	rm -rf $(OBJ_DIR) $(BIN_DIR)

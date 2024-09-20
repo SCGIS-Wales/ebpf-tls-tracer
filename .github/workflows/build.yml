@@ -44,13 +44,17 @@ jobs:
         run: make
 
       - name: List build output
-        run: ls -la  # List all files to ensure the binaries are created
+        run: ls -la bin  # List the binaries created in the bin directory
 
-      - name: Find cli_tool binary
-        run: find . -name 'cli_tool'  # Find the location of the cli_tool binary
-
-      - name: Set correct permissions for cli_tool
-        run: chmod +x ./cli_tool || echo "cli_tool not found"  # Ensure the cli_tool binary is executable
+      - name: Verify CLI tool exists and set permissions
+        run: |
+          if [ -f bin/cli_tool ]; then
+            chmod +x bin/cli_tool
+            echo "cli_tool is ready."
+          else
+            echo "cli_tool not found in bin directory."
+            exit 1
+          fi
 
       - name: Run the eBPF CLI Tool
-        run: ./cli_tool --start
+        run: ./bin/cli_tool --start
