@@ -24,8 +24,14 @@ jobs:
           # Install kernel headers needed for eBPF development
           sudo apt-get install -y linux-headers-$(uname -r) linux-headers-generic
           
-          # Create a symbolic link for asm headers
+          # Install additional glibc development headers
+          sudo apt-get install -y libc6-dev libc6-dev-i386
+
+          # Create symbolic links for missing asm headers
           sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
+          
+          # Create symbolic links for missing bits headers
+          sudo ln -s /usr/include/x86_64-linux-gnu/bits /usr/include/bits
 
       - name: List all files in project directory
         run: ls -la
