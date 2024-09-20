@@ -23,33 +23,30 @@ USER_BINARY = $(BIN_DIR)/user_space
 CLI_BINARY = $(BIN_DIR)/cli_tool
 
 # Create necessary directories
-$(OBJ_DIR):
-	mkdir -p $(OBJ_DIR)
-
-$(BIN_DIR):
-	mkdir -p $(BIN_DIR)
+$(OBJ_DIR) $(BIN_DIR):
+	mkdir -p $(OBJ_DIR) $(BIN_DIR)
 
 # Default target
 all: $(OBJ_DIR) $(BIN_DIR) $(BPF_OBJECT) $(USER_BINARY) $(CLI_BINARY)
 
 # Compile eBPF program
-$(BPF_OBJECT): $(BPF_PROGRAM)
+$(BPF_OBJECT): $(BPF_PROGRAM) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Compile user-space program
-$(USER_OBJECT): $(USER_PROGRAM)
+$(USER_OBJECT): $(USER_PROGRAM) | $(OBJ_DIR)
 	gcc -I$(INCLUDE_DIR) -c $< -o $@
 
 # Compile CLI tool
-$(CLI_OBJECT): $(CLI_TOOL)
+$(CLI_OBJECT): $(CLI_TOOL) | $(OBJ_DIR)
 	gcc -I$(INCLUDE_DIR) -c $< -o $@
 
 # Link user-space binary
-$(USER_BINARY): $(USER_OBJECT)
+$(USER_BINARY): $(USER_OBJECT) | $(BIN_DIR)
 	gcc -o $@ $^
 
 # Link CLI tool binary
-$(CLI_BINARY): $(CLI_OBJECT)
+$(CLI_BINARY): $(CLI_OBJECT) | $(BIN_DIR)
 	gcc -o $@ $^
 
 # Clean up build artifacts
