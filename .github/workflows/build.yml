@@ -34,7 +34,7 @@ jobs:
           sudo ln -s /usr/include/x86_64-linux-gnu/bits /usr/include/bits
 
       - name: List all files in project directory
-        run: ls -la
+        run: ls -la /app/include
 
       - name: Build the eBPF CLI Tool
         run: make
