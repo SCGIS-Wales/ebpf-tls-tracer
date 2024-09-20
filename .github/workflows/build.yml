@@ -24,8 +24,8 @@ jobs:
           # Install kernel headers needed for eBPF development
           sudo apt-get install -y linux-headers-$(uname -r) linux-headers-generic
           
-          # Manually add missing architecture-specific headers that contain asm/types.h
-          sudo apt-get install -y linux-kernel-headers
+          # Create a symbolic link for asm headers
+          sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
       - name: List all files in project directory
         run: ls -la
