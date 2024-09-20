@@ -1,0 +1,31 @@
+name: Build and Test eBPF CLI Tool
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc make libbpf-dev linux-headers-$(uname -r) build-essential iproute2 git wget curl bpfcc-tools libelf-dev iputils-ping net-tools python3 python3-pip python3-setuptools kmod libmnl-dev linux-libc-dev linux-headers-generic
+
+      - name: List all files in project directory
+        run: ls -la
+
+      - name: Build the eBPF CLI Tool
+        run: make
+
+      - name: Run the eBPF CLI Tool
+        run: ./cli_tool --start
