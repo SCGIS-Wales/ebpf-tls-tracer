@@ -46,10 +46,11 @@ jobs:
       - name: List build output
         run: ls -la  # List all files to ensure the binaries are created
 
-      - name: Verify CLI tool is executable
-        run: |
-          chmod +x cli_tool  # Ensure the cli_tool binary is executable
-          ls -la cli_tool
+      - name: Find cli_tool binary
+        run: find . -name 'cli_tool'  # Find the location of the cli_tool binary
+
+      - name: Set correct permissions for cli_tool
+        run: chmod +x ./cli_tool || echo "cli_tool not found"  # Ensure the cli_tool binary is executable
 
       - name: Run the eBPF CLI Tool
         run: ./cli_tool --start
