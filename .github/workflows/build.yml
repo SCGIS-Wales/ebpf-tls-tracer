@@ -33,8 +33,10 @@ jobs:
           # Create symbolic links for missing bits headers
           sudo ln -s /usr/include/x86_64-linux-gnu/bits /usr/include/bits
 
-      - name: List all files in project directory
-        run: ls -la /app/include
+      - name: Verify include directory
+        run: |
+          ls -la
+          ls -la include  # Check if the include directory exists at the root level
 
       - name: Build the eBPF CLI Tool
         run: make
