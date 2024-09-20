@@ -19,7 +19,13 @@ jobs:
       - name: Set up dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm gcc make libbpf-dev linux-headers-$(uname -r) build-essential iproute2 git wget curl bpfcc-tools libelf-dev iputils-ping net-tools python3 python3-pip python3-setuptools kmod libmnl-dev linux-libc-dev linux-headers-generic
+          sudo apt-get install -y clang llvm gcc make libbpf-dev build-essential iproute2 git wget curl bpfcc-tools libelf-dev iputils-ping net-tools python3 python3-pip python3-setuptools kmod libmnl-dev linux-libc-dev
+          
+          # Install kernel headers needed for eBPF development
+          sudo apt-get install -y linux-headers-$(uname -r) linux-headers-generic
+          
+          # Manually add missing architecture-specific headers that contain asm/types.h
+          sudo apt-get install -y linux-kernel-headers
 
       - name: List all files in project directory
         run: ls -la
