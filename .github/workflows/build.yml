@@ -284,19 +284,24 @@ jobs:
           echo "tls-tracer DaemonSet deployed"
 
       - name: Generate TLS traffic from apigee namespace
+        timeout-minutes: 5
         run: |
+          # All curl commands use --connect-timeout 10 --max-time 15 to prevent hangs
+
           # === HTTP/1.1 requests (explicit --http1.1 flag) ===
           echo "--- HTTP/1.1 traffic ---"
           for i in 1 2 3; do
             kubectl exec -n apigee apigee-test-client -- \
-              curl -s -o /dev/null --http1.1 -w "HTTP/1.1 GET ${i}: HTTP %{http_code}\n" \
+              curl -s -o /dev/null --http1.1 --connect-timeout 10 --max-time 15 \
+              -w "HTTP/1.1 GET ${i}: HTTP %{http_code}\n" \
               https://httpbin.org/get 2>/dev/null || echo "HTTP/1.1 GET ${i}: failed (expected in CI)"
             sleep 1
           done
 
           # HTTP/1.1 POST
           kubectl exec -n apigee apigee-test-client -- \
-            curl -s -o /dev/null --http1.1 -w "HTTP/1.1 POST: HTTP %{http_code}\n" \
+            curl -s -o /dev/null --http1.1 --connect-timeout 10 --max-time 15 \
+            -w "HTTP/1.1 POST: HTTP %{http_code}\n" \
             -X POST -H "Content-Type: application/json" -d '{"test":"data"}' \
             https://httpbin.org/post 2>/dev/null || echo "HTTP/1.1 POST: failed"
 
@@ -304,34 +309,37 @@ jobs:
           echo "--- HTTP/2 traffic ---"
           for i in 1 2; do
             kubectl exec -n apigee apigee-test-client -- \
-              curl -s -o /dev/null --http2 -w "HTTP/2 GET ${i}: HTTP %{http_code}\n" \
+              curl -s -o /dev/null --http2 --connect-timeout 10 --max-time 15 \
+              -w "HTTP/2 GET ${i}: HTTP %{http_code}\n" \
               https://httpbin.org/get 2>/dev/null || echo "HTTP/2 GET ${i}: failed"
             sleep 1
           done
 
-          # === WebSocket upgrade attempt (server won't upgrade, but we detect the header) ===
+          # === WebSocket upgrade attempt (we just need the Upgrade header in TLS) ===
           echo "--- WebSocket upgrade attempt ---"
           kubectl exec -n apigee apigee-test-client -- \
-            curl -s -o /dev/null --http1.1 -w "WS upgrade: HTTP %{http_code}\n" \
+            curl -s -o /dev/null --http1.1 --connect-timeout 10 --max-time 15 \
+            -w "WS upgrade: HTTP %{http_code}\n" \
             -H "Upgrade: websocket" -H "Connection: Upgrade" \
             -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
             -H "Sec-WebSocket-Version: 13" \
-            https://echo.websocket.org/ 2>/dev/null || echo "WebSocket: failed (expected)"
+            https://httpbin.org/get 2>/dev/null || echo "WebSocket: failed (expected)"
 
-          # === gRPC-style traffic (HTTP/2 POST to gRPC endpoint) ===
+          # === gRPC-style traffic (HTTP/2 POST with gRPC headers) ===
           echo "--- gRPC-style traffic ---"
           kubectl exec -n apigee apigee-test-client -- \
-            curl -s -o /dev/null --http2 -w "gRPC-style: HTTP %{http_code}\n" \
+            curl -s -o /dev/null --http2 --connect-timeout 10 --max-time 15 \
+            -w "gRPC-style: HTTP %{http_code}\n" \
             -H "content-type: application/grpc" \
             -H "te: trailers" \
-            -X POST https://grpc.io/ 2>/dev/null || echo "gRPC-style: failed (expected)"
+            -X POST https://httpbin.org/post 2>/dev/null || echo "gRPC-style: failed (expected)"
 
           # === Node-level traffic (guaranteed to use node's libssl) ===
           echo "--- Node-level traffic ---"
           docker exec tls-tracer-ci-control-plane \
             sh -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1 && \
-                   curl -s -o /dev/null --http1.1 https://httpbin.org/get && echo 'Node HTTP/1.1: OK' && \
-                   curl -s -o /dev/null --http2 https://httpbin.org/get && echo 'Node HTTP/2: OK'" \
+                   curl -s -o /dev/null --connect-timeout 10 --max-time 15 --http1.1 https://httpbin.org/get && echo 'Node HTTP/1.1: OK' && \
+                   curl -s -o /dev/null --connect-timeout 10 --max-time 15 --http2 https://httpbin.org/get && echo 'Node HTTP/2: OK'" \
             2>/dev/null || echo "Node traffic: failed (non-critical)"
 
           # Give tracer time to capture events
