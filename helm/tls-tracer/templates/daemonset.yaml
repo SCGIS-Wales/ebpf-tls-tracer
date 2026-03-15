@@ -75,6 +75,15 @@ spec:
             - {{ . | quote }}
             {{- end }}
           {{- end }}
+          env:
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           securityContext:
             # S6 fix: privileged: true is REQUIRED for eBPF program loading (bpf() syscall),
             # uprobe/kprobe attachment, and accessing /sys/kernel/debug.
