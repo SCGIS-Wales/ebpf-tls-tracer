@@ -6,6 +6,7 @@
 // plaintext data flowing through TLS connections, along with
 // the remote IP address and port of each connection.
 
+#define _GNU_SOURCE  /* for memmem() */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,8 @@
 #include <ctype.h>
 #include <regex.h>
 #include <arpa/inet.h>
+#include <limits.h>  /* for ULONG_MAX */
+#include <sys/stat.h>  /* for mkdir() */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "tracer.h"
@@ -25,8 +28,84 @@
 #define PERF_POLL_TIMEOUT  100
 #define MAX_PROBES         16
 #define MAX_SANITIZE_PATTERNS 32
+#define DNS_CACHE_SIZE     4096  /* max cached hostname entries */
+#define DNS_CACHE_TTL      300   /* seconds before expiry */
 
 static volatile sig_atomic_t exiting = 0;
+
+/* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
+ * When a Host: header is parsed, the hostname is stored here.
+ * Subsequent events on the same connection inherit the cached hostname
+ * even if they don't contain an HTTP Host header. */
+struct dns_cache_entry {
+    __u32 pid;
+    __u32 fd;
+    time_t last_seen;
+    char   hostname[256];
+};
+
+static struct dns_cache_entry dns_cache[DNS_CACHE_SIZE];
+static int dns_cache_count = 0;
+
+static const char *dns_cache_lookup(__u32 pid, __u32 fd)
+{
+    time_t now = time(NULL);
+    for (int i = 0; i < dns_cache_count; i++) {
+        if (dns_cache[i].pid == pid && dns_cache[i].fd == fd) {
+            if (now - dns_cache[i].last_seen > DNS_CACHE_TTL) {
+                /* Expired — evict by swapping with last entry */
+                dns_cache[i] = dns_cache[--dns_cache_count];
+                return NULL;
+            }
+            dns_cache[i].last_seen = now;
+            return dns_cache[i].hostname;
+        }
+    }
+    return NULL;
+}
+
+static void dns_cache_store(__u32 pid, __u32 fd, const char *hostname)
+{
+    if (!hostname || !hostname[0] || fd == 0)
+        return;
+
+    time_t now = time(NULL);
+
+    /* Update existing entry */
+    for (int i = 0; i < dns_cache_count; i++) {
+        if (dns_cache[i].pid == pid && dns_cache[i].fd == fd) {
+            snprintf(dns_cache[i].hostname, sizeof(dns_cache[i].hostname), "%s", hostname);
+            dns_cache[i].last_seen = now;
+            return;
+        }
+    }
+
+    /* Evict expired entries first */
+    for (int i = 0; i < dns_cache_count; ) {
+        if (now - dns_cache[i].last_seen > DNS_CACHE_TTL) {
+            dns_cache[i] = dns_cache[--dns_cache_count];
+        } else {
+            i++;
+        }
+    }
+
+    /* Add new entry (evict oldest if full) */
+    int slot;
+    if (dns_cache_count < DNS_CACHE_SIZE) {
+        slot = dns_cache_count++;
+    } else {
+        /* Find and evict the oldest entry */
+        slot = 0;
+        for (int i = 1; i < DNS_CACHE_SIZE; i++) {
+            if (dns_cache[i].last_seen < dns_cache[slot].last_seen)
+                slot = i;
+        }
+    }
+    dns_cache[slot].pid = pid;
+    dns_cache[slot].fd = fd;
+    dns_cache[slot].last_seen = now;
+    snprintf(dns_cache[slot].hostname, sizeof(dns_cache[slot].hostname), "%s", hostname);
+}
 
 /* Output format */
 enum output_fmt {
@@ -570,11 +649,13 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
     }
 }
 
-/* Print a JSON string value, escaping special characters */
-static void print_json_string(const char *s)
+/* Print a JSON string value, escaping special characters.
+ * For length-bounded strings (e.g. comm from kernel), use maxlen > 0
+ * to avoid reading past the buffer. If maxlen == 0, reads until NUL. */
+static void print_json_string_n(const char *s, size_t maxlen)
 {
     putchar('"');
-    for (; *s; s++) {
+    for (size_t i = 0; (maxlen == 0 ? *s : i < maxlen) && *s; s++, i++) {
         switch (*s) {
         case '"':  printf("\\\""); break;
         case '\\': printf("\\\\"); break;
@@ -589,6 +670,12 @@ static void print_json_string(const char *s)
         }
     }
     putchar('"');
+}
+
+/* Print a NUL-terminated JSON string value, escaping special characters */
+static void print_json_string(const char *s)
+{
+    print_json_string_n(s, 0);
 }
 
 static void handle_event(void *ctx, int cpu __attribute__((unused)),
@@ -631,12 +718,13 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
     }
 
     if (c->format == FMT_JSON) {
-        /* Get wall-clock timestamp */
+        /* Get wall-clock timestamp (use gmtime_r for thread-safety) */
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         char iso_time[64];
-        struct tm *tm = gmtime(&ts.tv_sec);
-        strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", tm);
+        struct tm tm_buf;
+        gmtime_r(&ts.tv_sec, &tm_buf);
+        strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", &tm_buf);
 
         /* Handle TCP connect error events */
         if (event->event_type == EVENT_CONNECT_ERROR) {
@@ -663,14 +751,14 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,"
-                   "\"comm\":\"%.*s\",\"event_type\":\"tcp_error\","
-                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
-                   "\"error_code\":%d,\"error\":\"%s\"}\n",
+                   "\"pid\":%u,\"tid\":%u,\"comm\":",
                    iso_time, ts.tv_nsec / 1000,
                    (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid,
-                   MAX_COMM_LEN, event->comm,
+                   event->pid, event->tid);
+            print_json_string_n(event->comm, MAX_COMM_LEN);
+            printf(",\"event_type\":\"tcp_error\","
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"error_code\":%d,\"error\":\"%s\"}\n",
                    remote_ip, event->remote_port,
                    ecode, err_desc);
             fflush(stdout);
@@ -689,20 +777,23 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,"
-                   "\"comm\":\"%.*s\",\"event_type\":\"tls_error\","
+                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid);
+            print_json_string_n(event->comm, MAX_COMM_LEN);
+            printf(",\"event_type\":\"tls_error\","
                    "\"direction\":\"%s\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"ssl_return_code\":%d",
-                   iso_time, ts.tv_nsec / 1000,
-                   (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid,
-                   MAX_COMM_LEN, event->comm,
                    direction_str(event->direction),
                    local_ip, event->local_port,
                    remote_ip, event->remote_port,
                    (int)event->error_code);
+
+            if (event->fd > 0)
+                printf(",\"conn_id\":\"%u:%u\"", event->pid, event->fd);
 
             if (tls_ver_str)
                 printf(",\"tls_version\":\"%s\"", tls_ver_str);
@@ -715,15 +806,15 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         /* Handle QUIC detection events */
         if (event->event_type == EVENT_QUIC_DETECTED) {
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,"
-                   "\"comm\":\"%.*s\",\"event_type\":\"quic_detected\","
+                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid);
+            print_json_string_n(event->comm, MAX_COMM_LEN);
+            printf(",\"event_type\":\"quic_detected\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"transport\":\"udp\",\"protocol\":\"quic\"}\n",
-                   iso_time, ts.tv_nsec / 1000,
-                   (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid,
-                   MAX_COMM_LEN, event->comm,
                    local_ip, event->local_port,
                    remote_ip, event->remote_port);
             fflush(stdout);
@@ -748,24 +839,38 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
 
         /* Emit one self-contained JSON event */
         printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-               "\"pid\":%u,\"tid\":%u,\"uid\":%u,"
-               "\"comm\":\"%.*s\",\"direction\":\"%s\","
+               "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
+               iso_time, ts.tv_nsec / 1000,
+               (unsigned long long)event->timestamp_ns,
+               event->pid, event->tid, event->uid);
+        print_json_string_n(event->comm, MAX_COMM_LEN);
+        printf(",\"direction\":\"%s\","
                "\"src_ip\":\"%s\",\"src_port\":%u,"
                "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                "\"data_len\":%u",
-               iso_time, ts.tv_nsec / 1000,
-               (unsigned long long)event->timestamp_ns,
-               event->pid, event->tid, event->uid,
-               MAX_COMM_LEN, event->comm,
                direction_str(event->direction),
                local_ip, event->local_port,
                remote_ip, event->remote_port,
                data_len);
 
-        /* DNS / hostname from HTTP Host header (best-effort) */
+        /* Connection ID for correlating events on the same TCP connection.
+         * Combines PID and socket fd into a unique identifier. */
+        if (event->fd > 0)
+            printf(",\"conn_id\":\"%u:%u\"", event->pid, event->fd);
+
+        /* DNS / hostname from HTTP Host header (best-effort).
+         * Cache the hostname per {pid, fd} so subsequent events on the same
+         * connection inherit it even without a Host header. */
+        const char *dns_hostname = NULL;
         if (http.host[0]) {
+            dns_hostname = http.host;
+            dns_cache_store(event->pid, event->fd, http.host);
+        } else if (event->fd > 0) {
+            dns_hostname = dns_cache_lookup(event->pid, event->fd);
+        }
+        if (dns_hostname) {
             printf(",\"dst_dns\":");
-            print_json_string(http.host);
+            print_json_string(dns_hostname);
         }
 
         /* K8s fields (only if populated) */
@@ -873,11 +978,11 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             strncmp(event->data, "250 ", 4) == 0))
             l7_proto = "smtps";
 
-        /* 7. Detect IMAP over TLS */
+        /* 7. Detect IMAP over TLS (use memmem for bounded search — R7 fix) */
         if (strcmp(l7_proto, "unknown") == 0 && data_len >= 4 && (
             strncmp(event->data, "* OK", 4) == 0 ||
             (event->data[0] >= 'A' && event->data[0] <= 'Z' &&
-             data_len >= 6 && strstr(event->data, "LOGIN") != NULL)))
+             data_len >= 6 && memmem(event->data, data_len, "LOGIN", 5) != NULL)))
             l7_proto = "imaps";
 
         /* 8. Detect Kafka wire protocol (binary header structure) */
@@ -1043,9 +1148,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         if (!c->data_only) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            struct tm *tm = localtime(&ts.tv_sec);
+            struct tm tm_buf;
+            localtime_r(&ts.tv_sec, &tm_buf);
             char timebuf[64];
-            strftime(timebuf, sizeof(timebuf), "%H:%M:%S", tm);
+            strftime(timebuf, sizeof(timebuf), "%H:%M:%S", &tm_buf);
 
             printf("%-12s %-6s PID=%-6u TID=%-6u UID=%-4u COMM=%-15.*s ADDR=%-21s LEN=%u\n",
                    timebuf,
@@ -1158,12 +1264,26 @@ int main(int argc, char **argv)
     int opt;
     while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:vh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'p':
-            cfg.filter_pid = (__u32)atoi(optarg);
+        case 'p': {
+            char *endp;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > UINT_MAX) {
+                fprintf(stderr, "Error: Invalid PID '%s'\n", optarg);
+                return 1;
+            }
+            cfg.filter_pid = (__u32)val;
             break;
-        case 'u':
-            cfg.filter_uid = (__u32)atoi(optarg);
+        }
+        case 'u': {
+            char *endp;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val > UINT_MAX) {
+                fprintf(stderr, "Error: Invalid UID '%s'\n", optarg);
+                return 1;
+            }
+            cfg.filter_uid = (__u32)val;
             break;
+        }
         case 'l':
             snprintf(cfg.ssl_lib, sizeof(cfg.ssl_lib), "%s", optarg);
             break;
@@ -1227,11 +1347,33 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    /* Open and load BPF object */
-    obj = bpf_object__open_file("bpf_program.o", NULL);
+    /* Open and load BPF object.
+     * Search order: installed path first, then CWD fallback for development.
+     * Using an absolute path prevents loading a malicious .o from CWD (S5 fix). */
+    const char *bpf_obj_paths[] = {
+        "/usr/local/lib/tls_tracer/bpf_program.o",
+        "/opt/tls_tracer/bpf_program.o",
+        "bpf_program.o",
+        NULL,
+    };
+    const char *bpf_obj_path = NULL;
+    for (int i = 0; bpf_obj_paths[i]; i++) {
+        if (access(bpf_obj_paths[i], R_OK) == 0) {
+            bpf_obj_path = bpf_obj_paths[i];
+            break;
+        }
+    }
+    if (!bpf_obj_path) {
+        fprintf(stderr, "Error: Cannot find bpf_program.o in any search path\n");
+        return 1;
+    }
+    if (cfg.verbose)
+        fprintf(stderr, "Loading BPF object: %s\n", bpf_obj_path);
+
+    obj = bpf_object__open_file(bpf_obj_path, NULL);
     if (!obj) {
-        fprintf(stderr, "Error: Failed to open BPF object file: %s\n",
-                strerror(errno));
+        fprintf(stderr, "Error: Failed to open BPF object file '%s': %s\n",
+                bpf_obj_path, strerror(errno));
         return 1;
     }
 
@@ -1369,7 +1511,13 @@ int main(int argc, char **argv)
     }
 
     /* Touch health file to signal readiness */
-    const char *health_file = "/tmp/tls_tracer_healthy";
+    /* Use a dedicated path for health file to prevent spoofing via /tmp (S4 fix).
+     * Falls back to /tmp if the directory doesn't exist (e.g., local dev). */
+    const char *health_file = "/var/run/tls-tracer/healthy";
+    if (access("/var/run/tls-tracer", F_OK) != 0) {
+        if (mkdir("/var/run/tls-tracer", 0755) != 0)
+            health_file = "/tmp/tls_tracer_healthy";  /* fallback */
+    }
     FILE *hf = fopen(health_file, "w");
     if (hf) {
         fprintf(hf, "ready\n");
