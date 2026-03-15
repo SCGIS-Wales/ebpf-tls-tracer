@@ -600,8 +600,11 @@ jobs:
           echo "${LOGS}"
 
           echo ""
-          echo "=== TLS Tracer stderr ==="
-          kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer --tail=50 2>&1 || true
+          echo "=== TLS Tracer stderr (K8s debug) ==="
+          # The tracer's verbose output (stderr) includes K8s metadata debug info.
+          # In kind, kubectl logs captures both stdout and stderr interleaved.
+          # Look for K8s-specific debug lines.
+          kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer --tail=100 2>&1 | grep -i "k8s\|environ\|POD_NAME\|cannot open" || echo "  (no K8s debug output found)"
 
           # Check that the tracer pod is running
           RUNNING=$(kubectl get pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer \

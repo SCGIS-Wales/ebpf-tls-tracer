@@ -296,8 +296,11 @@ static int read_proc_env(pid_t pid, const char *var_name, char *buf, size_t bufl
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
     FILE *f = fopen(path, "r");
-    if (!f)
+    if (!f) {
+        if (cfg.verbose && strcmp(var_name, "POD_NAME") == 0)
+            fprintf(stderr, "K8s: cannot open %s: %s\n", path, strerror(errno));
         return -1;
+    }
 
     size_t var_len = strlen(var_name);
     char *block = NULL;
@@ -403,11 +406,16 @@ static void get_k8s_meta(pid_t pid, struct k8s_meta *meta)
 
     /* Pod name and namespace are typically set by K8s downward API:
      * POD_NAME, POD_NAMESPACE, or HOSTNAME for pod name */
-    if (read_proc_env(pid, "POD_NAME", meta->pod_name, sizeof(meta->pod_name)) != 0)
-        read_proc_env(pid, "HOSTNAME", meta->pod_name, sizeof(meta->pod_name));
+    int rc = read_proc_env(pid, "POD_NAME", meta->pod_name, sizeof(meta->pod_name));
+    if (rc != 0)
+        rc = read_proc_env(pid, "HOSTNAME", meta->pod_name, sizeof(meta->pod_name));
 
     read_proc_env(pid, "POD_NAMESPACE", meta->pod_namespace, sizeof(meta->pod_namespace));
     read_container_id(pid, meta->container_id, sizeof(meta->container_id));
+
+    if (cfg.verbose && meta->pod_name[0])
+        fprintf(stderr, "K8s meta for PID %d: pod=%s ns=%s container=%s\n",
+                pid, meta->pod_name, meta->pod_namespace, meta->container_id);
 }
 
 /* --- R-3 fix: K8s metadata cache per PID ---
