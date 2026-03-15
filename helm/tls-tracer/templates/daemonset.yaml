@@ -25,6 +25,18 @@ spec:
         - name: tls-tracer
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
+          command: ["sh", "-c"]
+          args:
+            - >-
+              ./tls_tracer -f {{ .Values.outputFormat }}
+              {{- if .Values.verbose }} -v{{- end }}
+              {{- if .Values.filterPid }} -p {{ .Values.filterPid }}{{- end }}
+              {{- if .Values.filterUid }} -u {{ .Values.filterUid }}{{- end }}
+              {{- if .Values.sslLibPath }} -l {{ .Values.sslLibPath }}{{- end }}
+              {{- range .Values.sanitizePatterns }} -s '{{ . }}'{{- end }}
+              | tee /var/log/tls-tracer/events.json
+          {{- else }}
           args:
             - "-f"
             - "{{ .Values.outputFormat }}"
@@ -43,8 +55,27 @@ spec:
             - "-l"
             - "{{ .Values.sslLibPath }}"
             {{- end }}
+            {{- range .Values.sanitizePatterns }}
+            - "-s"
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
           securityContext:
             privileged: true
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/tls_tracer_healthy"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/tls_tracer_healthy"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 5
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -62,6 +93,84 @@ spec:
             - name: host-ssl-x86
               mountPath: /usr/lib/x86_64-linux-gnu
               readOnly: true
+            {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
+            - name: log-pipe
+              mountPath: /var/log/tls-tracer
+            {{- end }}
+        {{- if .Values.s3.enabled }}
+        - name: s3-shipper
+          image: "{{ .Values.s3.image.repository }}:{{ .Values.s3.image.tag }}"
+          imagePullPolicy: {{ .Values.s3.image.pullPolicy }}
+          command: ["sh", "-c", "pip install --quiet boto3 && python3 /scripts/s3_shipper.py"]
+          env:
+            - name: S3_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: S3_PREFIX
+              value: {{ .Values.s3.prefix | quote }}
+            - name: FLUSH_INTERVAL
+              value: {{ .Values.s3.flushIntervalSeconds | quote }}
+            - name: BATCH_SIZE
+              value: {{ .Values.s3.batchSize | quote }}
+            - name: AWS_REGION
+              value: {{ default .Values.metadata.awsRegion "" | quote }}
+            - name: AWS_ACCOUNT_ID
+              value: {{ .Values.metadata.awsAccountId | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.metadata.clusterName | quote }}
+            - name: TARGET_NAMESPACE
+              value: {{ .Values.metadata.targetNamespace | quote }}
+            - name: APP_NAME
+              value: {{ .Values.metadata.applicationName | quote }}
+            - name: ENVIRONMENT
+              value: {{ .Values.metadata.environment | quote }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            {{- toYaml .Values.s3.resources | nindent 12 }}
+          volumeMounts:
+            - name: log-pipe
+              mountPath: /var/log/tls-tracer
+            - name: s3-scripts
+              mountPath: /scripts
+              readOnly: true
+        {{- end }}
+        {{- if .Values.kinesis.enabled }}
+        - name: kinesis-shipper
+          image: "{{ .Values.kinesis.image.repository }}:{{ .Values.kinesis.image.tag }}"
+          imagePullPolicy: {{ .Values.kinesis.image.pullPolicy }}
+          command: ["sh", "-c", "pip install --quiet boto3 && python3 /scripts/kinesis_shipper.py"]
+          env:
+            - name: DELIVERY_STREAM
+              value: {{ .Values.kinesis.deliveryStreamName | quote }}
+            - name: AWS_REGION
+              value: {{ default .Values.metadata.awsRegion (default "" .Values.kinesis.region) | quote }}
+            - name: FLUSH_INTERVAL
+              value: {{ .Values.kinesis.flushIntervalSeconds | quote }}
+            - name: BATCH_SIZE
+              value: {{ .Values.kinesis.batchSize | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.metadata.clusterName | quote }}
+            - name: TARGET_NAMESPACE
+              value: {{ .Values.metadata.targetNamespace | quote }}
+            - name: APP_NAME
+              value: {{ .Values.metadata.applicationName | quote }}
+            - name: ENVIRONMENT
+              value: {{ .Values.metadata.environment | quote }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            {{- toYaml .Values.kinesis.resources | nindent 12 }}
+          volumeMounts:
+            - name: log-pipe
+              mountPath: /var/log/tls-tracer
+            - name: kinesis-scripts
+              mountPath: /scripts
+              readOnly: true
+        {{- end }}
       volumes:
         - name: debugfs
           hostPath:
@@ -83,6 +192,22 @@ spec:
           hostPath:
             path: /usr/lib/x86_64-linux-gnu
             type: DirectoryOrCreate
+        {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
+        - name: log-pipe
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.s3.enabled }}
+        - name: s3-scripts
+          configMap:
+            name: {{ include "tls-tracer.fullname" . }}-s3-shipper
+            defaultMode: 0755
+        {{- end }}
+        {{- if .Values.kinesis.enabled }}
+        - name: kinesis-scripts
+          configMap:
+            name: {{ include "tls-tracer.fullname" . }}-kinesis-shipper
+            defaultMode: 0755
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
