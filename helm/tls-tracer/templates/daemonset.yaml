@@ -90,6 +90,8 @@ spec:
             # There is no way to run eBPF tracing with reduced capabilities.
             # readOnlyRootFilesystem prevents runtime modification of the container.
             # runAsNonRoot cannot be set because eBPF requires root (CAP_BPF+CAP_PERFMON+CAP_SYS_ADMIN).
+            # H-2 fix: seccompProfile is not set because privileged:true overrides it.
+            # This is documented for audit compliance — privileged containers bypass seccomp.
             privileged: true
             readOnlyRootFilesystem: true
           readinessProbe:

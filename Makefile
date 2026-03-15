@@ -47,7 +47,7 @@ PREFIX     ?= /usr/local
 INSTALL_BIN := $(PREFIX)/bin
 INSTALL_LIB := $(PREFIX)/lib/tls_tracer
 
-.PHONY: all clean install uninstall test help
+.PHONY: all clean install uninstall test help check-deps
 
 all: $(BPF_OBJ) $(TRACER_BIN)
 
@@ -109,11 +109,19 @@ clean:
 	@echo "  CLEAN"
 	@rm -rf $(BUILD_DIR) $(BIN_DIR)
 
+# C-2 fix: check build dependencies for known CVEs
+check-deps:
+	@echo "  CHECK   libbpf version"
+	@pkg-config --modversion libbpf 2>/dev/null | grep -qv '^1\.5\.0$$' || \
+	  (echo "ERROR: libbpf 1.5.0 is vulnerable (CVE-2025-29481)" && exit 1)
+	@echo "  CHECK   dependencies OK"
+
 help:
 	@echo "eBPF TLS Tracer build targets:"
-	@echo "  all       - Build BPF program and tracer binary (default)"
-	@echo "  test      - Build and run unit tests"
-	@echo "  install   - Install to $(PREFIX)"
-	@echo "  uninstall - Remove installed files"
-	@echo "  clean     - Remove build artifacts"
-	@echo "  help      - Show this message"
+	@echo "  all        - Build BPF program and tracer binary (default)"
+	@echo "  test       - Build and run unit tests"
+	@echo "  check-deps - Check build deps for known CVEs"
+	@echo "  install    - Install to $(PREFIX)"
+	@echo "  uninstall  - Remove installed files"
+	@echo "  clean      - Remove build artifacts"
+	@echo "  help       - Show this message"
