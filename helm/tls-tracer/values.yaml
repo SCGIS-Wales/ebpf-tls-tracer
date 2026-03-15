@@ -38,7 +38,8 @@ metadata:
 
 image:
   repository: ghcr.io/scgis-wales/ebpf_tls_cli
-  tag: "latest"
+  # Pin to a specific version in production to avoid non-deterministic deploys
+  tag: "0.1.0"
   pullPolicy: IfNotPresent
 
 # --- 3. Tracer Settings ---

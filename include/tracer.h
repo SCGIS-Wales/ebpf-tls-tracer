@@ -66,6 +66,7 @@ struct tls_event_t {
     __u32 tid;
     __u32 uid;
     __u32 data_len;
+    __u32 fd;                /* socket fd from SSL->rbio->num (connection correlation) */
     __u16 tls_version;
     __u8  direction;         /* DIRECTION_READ or DIRECTION_WRITE */
     __u8  event_type;
