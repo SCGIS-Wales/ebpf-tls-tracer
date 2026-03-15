@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>
 #include <linux/ptrace.h>
+#include <stddef.h>  /* offsetof() for variable-length perf output */
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
@@ -320,8 +321,8 @@ int probe_connect_return(struct pt_regs *ctx)
                 event->remote_port = bpf_ntohs(sin6.sin6_port);
             }
 
-            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
-                                  event, sizeof(*event));
+            __u64 out_size = offsetof(struct tls_event_t, data);
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
         }
         goto cleanup;
     }
@@ -501,7 +502,10 @@ int probe_udp_sendmsg(struct pt_regs *ctx)
                               &sk->__sk_common.skc_v6_rcv_saddr);
     }
 
-    bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
+    {
+        __u64 out_size = offsetof(struct tls_event_t, data);
+        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
+    }
     return 0;
 }
 
@@ -766,8 +770,8 @@ int probe_ssl_read_return(struct pt_regs *ctx)
             enrich_event_with_conn_info(err_event, id);
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
-            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
-                                  err_event, sizeof(*err_event));
+            __u64 out_size = offsetof(struct tls_event_t, data);
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, err_event, out_size);
         }
         goto cleanup;
     }
@@ -795,8 +799,10 @@ int probe_ssl_read_return(struct pt_regs *ctx)
         read_len = MAX_DATA_LEN;
     event->data_len = read_len;
 
-    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0)
-        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
+    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
+        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
+    }
 
 cleanup:
     bpf_map_delete_elem(&ssl_args_map, &id);
@@ -853,8 +859,8 @@ int probe_ssl_write_return(struct pt_regs *ctx)
             enrich_event_with_conn_info(err_event, id);
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
-            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
-                                  err_event, sizeof(*err_event));
+            __u64 out_size = offsetof(struct tls_event_t, data);
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, err_event, out_size);
         }
         goto cleanup;
     }
@@ -882,8 +888,10 @@ int probe_ssl_write_return(struct pt_regs *ctx)
         write_len = MAX_DATA_LEN;
     event->data_len = write_len;
 
-    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0)
-        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
+    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
+        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
+    }
 
 cleanup:
     bpf_map_delete_elem(&ssl_args_map, &id);
