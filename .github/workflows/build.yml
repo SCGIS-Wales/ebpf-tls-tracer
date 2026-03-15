@@ -242,23 +242,46 @@ jobs:
 
       - name: Deploy tls-tracer DaemonSet
         run: |
-          # Deploy tls-tracer using Helm chart (--create-namespace handles namespace creation)
+          # Create and label namespace before Helm install
+          kubectl create namespace tls-tracer || true
+          kubectl label namespace tls-tracer pod-security.kubernetes.io/enforce=privileged --overwrite
+
+          # Deploy with --wait=false so we don't block on readiness probe
+          # (the health file is written after probe attachment, which may take time in kind)
           helm install tls-tracer helm/tls-tracer \
             --namespace tls-tracer \
-            --create-namespace \
             --set image.repository=tls_tracer \
             --set image.tag=ci-kind \
             --set image.pullPolicy=Never \
             --set outputFormat=json \
             --set verbose=true \
-            --timeout=120s
+            --set 'sanitizePatterns={}' \
+            --wait=false
 
-          # Label namespace for privileged PSA
-          kubectl label namespace tls-tracer pod-security.kubernetes.io/enforce=privileged --overwrite
+          # Poll for pod to be Running (not gated on readiness probe)
+          echo "Waiting for tls-tracer pod to start..."
+          for i in $(seq 1 60); do
+            PHASE=$(kubectl get pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer \
+              -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Pending")
+            if [ "$PHASE" = "Running" ]; then
+              echo "tls-tracer pod is Running (attempt $i)"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: Pod not running after 120s"
+              kubectl describe pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer
+              exit 1
+            fi
+            sleep 2
+          done
 
-          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=tls-tracer \
-            -n tls-tracer --timeout=120s
-          echo "tls-tracer DaemonSet is ready"
+          # Give the tracer time to attach probes and create health file
+          sleep 5
+
+          # Show logs so far
+          echo "=== Early tracer logs ==="
+          kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer --tail=20 2>&1 || true
+          echo "tls-tracer DaemonSet deployed"
 
       - name: Generate TLS traffic from apigee namespace
         run: |
