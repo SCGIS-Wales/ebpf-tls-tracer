@@ -148,7 +148,7 @@ static void test_field_assignment(void)
     event.addr_family = ADDR_FAMILY_IPV4;
     event.remote_addr_v4 = 0x0100007f;  /* 127.0.0.1 in network byte order */
     event.remote_port = 443;
-    strncpy(event.comm, "test_proc", MAX_COMM_LEN);
+    snprintf(event.comm, sizeof(event.comm), "%s", "test_proc");
     memcpy(event.data, "hello", 5);
 
     ASSERT_EQ(event.timestamp_ns, 1234567890ULL, "timestamp");
