@@ -1,0 +1,30 @@
+{{- /* K-1 fix: RBAC templates matching deploy/kubernetes/rbac.yaml.
+     The static manifest defines a ClusterRole for node access, but
+     the Helm chart was missing these resources. */ -}}
+{{- if .Values.serviceAccount.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}
+  labels:
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}
+  labels:
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tls-tracer.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "tls-tracer.fullname" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
