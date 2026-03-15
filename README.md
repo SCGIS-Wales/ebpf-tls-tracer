@@ -1,74 +1,77 @@
-# TLS Tracer
+# eBPF TLS Tracer
 
-An eBPF-based CLI tool for intercepting and inspecting TLS/SSL traffic in real time on Linux. It attaches uprobes to OpenSSL's `SSL_read` and `SSL_write` functions to capture plaintext data flowing through TLS connections — without modifying applications or terminating TLS sessions.
-
-Each captured event includes the **remote IP address** (IPv4 or IPv6) and **port** of the connection, correlated via kernel-level kprobes on the `connect()` syscall.
+An eBPF-based CLI tool for intercepting and inspecting TLS/SSL traffic in real time on Linux. Attaches uprobes to OpenSSL's `SSL_read`/`SSL_write` to capture plaintext data — without modifying applications or terminating TLS sessions.
 
 ## Features
 
-- **Trace TLS connections** and capture plaintext data from `SSL_read`/`SSL_write`
-- **Capture remote IP addresses** (IPv4 and IPv6) behind hostnames via connect() kprobe correlation
-- **Filter** captured data by PID, UID, or other criteria
-- **Output** in human-readable text or structured JSON format
-- **Hex dump** mode for binary protocol inspection
-- **Auto-detection** of the system's OpenSSL library path
-- **Low overhead** — uses eBPF perf buffers for efficient kernel-to-user data transfer
-- **Graceful shutdown** with proper resource cleanup on Ctrl+C / SIGTERM
+**Core capture:**
+- Intercept plaintext from `SSL_read`/`SSL_write` via eBPF uprobes
+- Capture source and destination IP:port (IPv4/IPv6) via `connect()` + `tcp_set_state` kprobes
+- Connection correlation via socket fd extraction (`conn_id` field)
+- TLS version detection (1.0–1.3) via `SSL_version` uprobe
+- TLS cipher suite capture via `SSL_get_current_cipher` uprobe
+- Mutual TLS (mTLS) detection via `SSL_get_certificate` uprobe
+
+**Protocol detection:**
+- HTTP/1.x — method, path, Host header, status code, User-Agent
+- HTTP/2 — frame parsing, RST_STREAM/GOAWAY error codes
+- gRPC — status codes (0–16), framing detection over HTTP/2
+- WebSocket — upgrade detection, close frame codes
+- Kafka — request/response frames, API key names (75 operations)
+- QUIC — UDP-based detection on ports 443/8443 (opt-in via `--quic`)
+- SMTP, IMAP, LDAP, AMQP, MQTT — via data signatures and well-known ports
+
+**Operations:**
+- JSON (NDJSON) and text output formats
+- PID/UID filtering
+- Regex-based data sanitization (sensitive headers redacted by default)
+- Kubernetes metadata enrichment (pod name, namespace, container ID)
+- DNS hostname caching per connection
+- Low overhead — variable-length perf buffer output, line-buffered stdout
 
 ## Quick Start
 
-**Option 1 — Pre-built binary** (x86_64 Linux):
-
-Download from [GitHub Releases](https://github.com/SCGIS-Wales/ebpf-tls-tracer/releases), then:
-
+**Pre-built binary** (x86_64 Linux):
 ```bash
+curl -LO https://github.com/SCGIS-Wales/ebpf-tls-tracer/releases/latest/download/tls_tracer-linux-x86_64.tar.gz
 tar xzf tls_tracer-linux-x86_64.tar.gz
-sudo ./tls_tracer -v
+sudo ./tls_tracer -f json -v
 ```
 
-**Option 2 — Docker** (any Linux with kernel 5.5+):
-
+**Docker:**
 ```bash
 docker pull ghcr.io/scgis-wales/ebpf-tls-tracer:latest
-sudo docker run --rm --privileged --pid=host ghcr.io/scgis-wales/ebpf-tls-tracer:latest -v
+sudo docker run --rm --privileged --pid=host \
+  ghcr.io/scgis-wales/ebpf-tls-tracer:latest -f json -v
 ```
 
-**Option 3 — Build from source** (see [Building from Source](#building-from-source) below).
+**Build from source:**
+```bash
+git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
+cd ebpf-tls-tracer
+make && make test
+sudo ./bin/tls_tracer -f json -v
+```
 
-## Requirements for Running (CLI)
-
-These are what you need on the **target machine** where the tool will execute:
+## Requirements
 
 | Requirement | Details |
 |---|---|
-| **OS** | Linux (x86_64) |
+| **OS** | Linux x86_64 |
 | **Kernel** | 5.5+ minimum, **6.1+ recommended** |
 | **Privileges** | Root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
-| **OpenSSL** | `libssl.so` must be installed (auto-detected) |
+| **OpenSSL** | `libssl.so` installed (auto-detected) |
 | **Runtime libs** | `libbpf`, `libelf`, `zlib` |
-| **Filesystems** | debugfs/tracefs mounted (standard on modern distros) |
+| **Kernel config** | `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`, `CONFIG_KPROBE_EVENTS`, `CONFIG_UPROBE_EVENTS`, `CONFIG_DEBUG_INFO_BTF` (enabled by default on Ubuntu, Debian, AL2023, Fedora, RHEL 9+) |
 
-The following kernel config options must be enabled (they are by default on Ubuntu, Debian, AL2023, Fedora, RHEL 9+):
-
-| Config Option | Purpose |
-|---|---|
-| `CONFIG_BPF=y` | Core BPF subsystem |
-| `CONFIG_BPF_SYSCALL=y` | `bpf()` system call |
-| `CONFIG_BPF_JIT=y` | JIT compiler for BPF programs |
-| `CONFIG_KPROBE_EVENTS=y` | kprobe-based tracing (for IP capture) |
-| `CONFIG_UPROBE_EVENTS=y` | uprobe-based tracing (for SSL hooks) |
-| `CONFIG_DEBUG_INFO_BTF=y` | BTF type info |
-
-**Verify your system:**
-
+**Verify:**
 ```bash
-uname -r                                    # Kernel version (need 5.5+)
+uname -r                                    # Need 5.5+
 ls /sys/kernel/btf/vmlinux                  # BTF support
-cat /proc/sys/net/core/bpf_jit_enable       # BPF JIT (should be 1 or 2)
+cat /proc/sys/net/core/bpf_jit_enable       # BPF JIT (1 or 2)
 ```
 
 **Install runtime dependencies:**
-
 ```bash
 # Debian/Ubuntu
 sudo apt-get install libbpf1 libelf1 zlib1g libssl3
@@ -77,61 +80,20 @@ sudo apt-get install libbpf1 libelf1 zlib1g libssl3
 sudo dnf install libbpf elfutils-libelf zlib openssl-libs
 ```
 
-## Building from Source
-
-These are what you need on the **build machine** (can be different from the target):
-
-| Package (Debian/Ubuntu) | Package (RHEL/AL2023/Fedora) | Purpose |
-|---|---|---|
-| `clang` | `clang` | BPF program compiler |
-| `llvm` | `llvm` | BPF target support |
-| `gcc` | `gcc` | User-space compiler |
-| `make` | `make` | Build system |
-| `libbpf-dev` | `libbpf-devel` | BPF user-space library (headers + .so) |
-| `libelf-dev` | `elfutils-libelf-devel` | ELF parsing |
-| `zlib1g-dev` | `zlib-devel` | Compression |
-| `linux-libc-dev` | `kernel-headers` | Kernel headers for BPF compilation |
-
-```bash
-# Debian/Ubuntu
-sudo apt-get install clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev linux-libc-dev
-
-# RHEL/AL2023/Fedora
-sudo dnf install clang llvm gcc make libbpf-devel elfutils-libelf-devel zlib-devel kernel-devel kernel-headers
-
-# Build
-make
-
-# Run tests
-make test
-
-# Install system-wide (optional)
-sudo make install
-```
-
 ## Usage
 
 ```bash
-# Trace all TLS traffic (requires root)
-sudo ./bin/tls_tracer
-
-# Filter by process ID
-sudo ./bin/tls_tracer -p 1234
-
-# Output in JSON format
-sudo ./bin/tls_tracer -f json
-
-# Hex dump of captured data
-sudo ./bin/tls_tracer -x
-
-# Filter by UID and show verbose output
-sudo ./bin/tls_tracer -u 1000 -v
-
-# Specify a custom OpenSSL library path
-sudo ./bin/tls_tracer -l /path/to/libssl.so
+sudo ./bin/tls_tracer                           # Trace all TLS traffic
+sudo ./bin/tls_tracer -f json                   # JSON output (one event per line)
+sudo ./bin/tls_tracer -p 1234                   # Filter by PID
+sudo ./bin/tls_tracer -u 1000                   # Filter by UID
+sudo ./bin/tls_tracer -x                        # Hex dump mode
+sudo ./bin/tls_tracer --quic                    # Enable QUIC/UDP detection
+sudo ./bin/tls_tracer -l /path/to/libssl.so     # Custom OpenSSL path
+sudo ./bin/tls_tracer -s 'secret=[^&]*'         # Add extra sanitization pattern
 ```
 
-### Options
+### CLI Options
 
 | Flag | Long Form | Description |
 |------|-----------|-------------|
@@ -140,178 +102,167 @@ sudo ./bin/tls_tracer -l /path/to/libssl.so
 | `-l` | `--lib PATH` | Path to libssl.so (auto-detected by default) |
 | `-f` | `--format FMT` | Output format: `text` (default) or `json` |
 | `-x` | `--hex` | Show hex dump of captured data |
-| `-d` | `--data-only` | Print only captured data (no headers) |
-| `-s` | `--sanitize REGEX` | Sanitize URLs matching REGEX (case-insensitive, repeatable) |
-| `-v` | `--verbose` | Verbose output (shows library path, probe status) |
+| `-d` | `--data-only` | Print only captured data (no metadata headers) |
+| `-s` | `--sanitize REGEX` | Add sanitization regex pattern (case-insensitive, repeatable) |
+| `-q` | `--quic` | Enable QUIC/UDP detection probe (off by default to avoid overhead) |
+| `-v` | `--verbose` | Verbose output (library path, probe status, perf buffer info) |
 | `-h` | `--help` | Show help message |
 
-### Example Output
+### Default Sanitization
 
-**Text mode (default):**
+The following HTTP headers are automatically redacted (replaced with `[REDACTED]`):
+- `Authorization`
+- `Cookie` / `Set-Cookie`
+- `X-Api-Key`
 
-```
-12:34:56     REQUEST  PID=1234   TID=1234   UID=1000 COMM=curl            ADDR=93.184.216.34:443  LEN=78
-GET /api/v1/status HTTP/1.1
-Host: example.com
-
-12:34:56     RESPONSE PID=1234   TID=1234   UID=1000 COMM=curl            ADDR=93.184.216.34:443  LEN=256
-HTTP/1.1 200 OK
-Content-Type: application/json
+Add custom patterns with `-s`:
+```bash
+sudo ./bin/tls_tracer -f json -s 'token=[^&]*' -s 'password=[^&]*'
 ```
 
-**JSON mode (`-f json`):**
+## JSON Output Format
+
+Each event is a single self-contained JSON line (NDJSON). Fields are only present when detected.
+
+### Example
 
 ```json
-{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":123456789,"pid":1234,"tid":1234,"uid":1000,"comm":"curl","direction":"REQUEST","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"transport":"tls","protocol":"https","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com"}
+{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":123456789,"pid":1234,"tid":1234,"uid":1000,"comm":"curl","direction":"REQUEST","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"conn_id":"1234:7","dst_dns":"example.com","tls_version":"1.3","tls_cipher":"TLS_AES_256_GCM_SHA384","tls_auth":"one-way","transport":"tls","protocol":"https","http_version":"2","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com","user_agent":"curl/8.5.0"}
+```
+
+### Field Reference
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | string | ISO 8601 wall-clock timestamp (microseconds) |
+| `timestamp_ns` | integer | Kernel monotonic timestamp (nanoseconds) |
+| `pid` / `tid` | integer | Process and thread IDs |
+| `uid` | integer | User ID |
+| `comm` | string | Process command name (`curl`, `java`, `node`, etc.) |
+| `direction` | string | `REQUEST` (outbound) or `RESPONSE` (inbound) |
+| `src_ip` / `src_port` | string/int | Local IP address and port |
+| `dst_ip` / `dst_port` | string/int | Remote IP address and port |
+| `data_len` | integer | Captured plaintext data length |
+| `conn_id` | string | Connection identifier (`pid:fd`) for event correlation |
+| `dst_dns` | string | Hostname from HTTP Host header (cached per connection) |
+| `tls_version` | string | TLS version: `1.0`, `1.1`, `1.2`, `1.3` |
+| `tls_cipher` | string | Negotiated cipher suite (e.g., `TLS_AES_256_GCM_SHA384`) |
+| `tls_auth` | string | `one-way` or `mtls` (mutual TLS with client cert) |
+| `transport` | string | `tls` or `udp` (for QUIC) |
+| `protocol` | string | Detected L7 protocol (see below) |
+| `http_version` | string | HTTP version: `1.0`, `1.1`, `2` |
+| `http_method` | string | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, etc. |
+| `http_path` | string | HTTP request path |
+| `http_host` | string | HTTP Host header value |
+| `http_status` | integer | HTTP response status code (200, 404, 500, etc.) |
+| `user_agent` | string | User-Agent header value |
+| `k8s_pod` | string | Kubernetes pod name |
+| `k8s_namespace` | string | Kubernetes namespace |
+| `container_id` | string | Short container ID (12 chars) |
+| `grpc_status` | integer | gRPC status code (0–16) |
+| `grpc_status_name` | string | gRPC status name (`OK`, `UNAVAILABLE`, etc.) |
+| `h2_error_code` | integer | HTTP/2 RST_STREAM/GOAWAY error code |
+| `h2_error_name` | string | HTTP/2 error name (`NO_ERROR`, `CANCEL`, etc.) |
+| `h2_frame_type` | string | HTTP/2 frame: `RST_STREAM` or `GOAWAY` |
+| `kafka_api_key` | integer | Kafka API key number |
+| `kafka_api_name` | string | Kafka operation name (`Produce`, `Fetch`, etc.) |
+| `kafka_frame_type` | string | `request` or `response` |
+| `kafka_error_code` | integer | Kafka response error code (non-zero only) |
+| `ws_close_code` | integer | WebSocket close status code |
+| `ws_close_reason` | string | WebSocket close reason (`NORMAL_CLOSURE`, etc.) |
+
+### Detected Protocols
+
+| Protocol | Detection Method |
+|---|---|
+| `https` | HTTP/1.x methods, HTTP/2 frames, or ports 443/8443 |
+| `grpc` | HTTP/2 DATA frames with gRPC framing, or ports 50051–50055 |
+| `wss` | `Upgrade: websocket` header or `101 Switching Protocols` |
+| `kafka` | Kafka wire protocol binary header, or ports 9092–9094 |
+| `smtps` | EHLO/MAIL/RCPT commands, or ports 465/587 |
+| `imaps` | IMAP greeting/commands, or port 993 |
+| `quic` | UDP traffic to port 443/8443 (requires `--quic` flag) |
+| `pop3s`, `ldaps`, `ftps`, `amqps`, `mqtts`, `xmpps`, `ircs` | Well-known TLS ports |
+
+### Event Types
+
+| Event | `event_type` | Description |
+|---|---|---|
+| TLS data | *(default)* | Captured plaintext from SSL_read/SSL_write |
+| TCP error | `tcp_error` | Connect syscall failure (ECONNREFUSED, ETIMEDOUT, etc.) |
+| TLS close | `tls_close` | Peer closed TLS connection (SSL_read returned 0) |
+| TLS error | `tls_error` | SSL_read/SSL_write returned error |
+| QUIC detected | `quic_detected` | UDP traffic to QUIC port (requires `--quic`) |
+| Lost events | `lost_events` | Perf buffer overflow (events dropped) |
+
+## Building from Source
+
+| Package (Debian/Ubuntu) | Package (RHEL/AL2023) | Purpose |
+|---|---|---|
+| `clang`, `llvm` | `clang`, `llvm` | BPF program compiler |
+| `gcc`, `make` | `gcc`, `make` | User-space compiler and build system |
+| `libbpf-dev` | `libbpf-devel` | BPF user-space library |
+| `libelf-dev` | `elfutils-libelf-devel` | ELF parsing |
+| `zlib1g-dev` | `zlib-devel` | Compression |
+| `linux-libc-dev` | `kernel-headers` | Kernel headers for BPF |
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev linux-libc-dev
+
+# AL2023/RHEL/Fedora
+sudo dnf install clang llvm gcc make libbpf-devel elfutils-libelf-devel zlib-devel kernel-devel kernel-headers
+
+make            # Build BPF program + user-space binary
+make test       # Run unit tests (62 tests)
+sudo make install   # Install to /usr/local
 ```
 
 ## Docker
-
-The container image is published to GitHub Container Registry on every push to `main`.
 
 ```bash
 # Pull from GHCR
 docker pull ghcr.io/scgis-wales/ebpf-tls-tracer:latest
 
-# Or build locally
+# Build locally
 docker build -t tls_tracer .
 
-# Run (requires --privileged for eBPF access)
+# Run (requires --privileged for eBPF)
 docker run --rm --privileged \
   -v /sys/kernel/debug:/sys/kernel/debug:ro \
   -v /sys/kernel/tracing:/sys/kernel/tracing:ro \
   -v /sys/fs/bpf:/sys/fs/bpf \
   --pid=host \
-  ghcr.io/scgis-wales/ebpf-tls-tracer:latest -v -f json
+  ghcr.io/scgis-wales/ebpf-tls-tracer:latest -f json -v
 ```
 
-## Amazon Linux 2023 (AL2023)
+## Kubernetes Deployment
 
-AL2023 ships with kernel 6.1+ and **fully supports eBPF out of the box** — no kernel recompilation or feature flags needed. BTF, uprobes, kprobes, and BPF JIT are all enabled in the stock kernel.
+TLS Tracer runs as a **DaemonSet** (one pod per node) with `hostPID: true` and `privileged: true`. eBPF hooks into the host kernel, capturing TLS traffic from **all pods and containers on the node** across all namespaces — no sidecars or application changes required.
 
-### Install on AL2023
+Events are enriched with K8s metadata (pod name, namespace, container ID) via the downward API.
 
-```bash
-sudo dnf install -y \
-  clang llvm gcc make \
-  libbpf-devel elfutils-libelf-devel zlib-devel \
-  kernel-devel-$(uname -r) kernel-headers-$(uname -r) \
-  openssl-devel bpftool
-
-git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
-cd ebpf-tls-tracer
-make && make test
-sudo ./bin/tls_tracer -v
-```
-
-### EC2 Userdata (automated setup)
-
-Use this userdata script to install and start TLS Tracer automatically on an AL2023 EC2 instance:
-
-```bash
-#!/bin/bash
-set -euo pipefail
-
-# Install build dependencies
-dnf install -y \
-  clang llvm gcc make \
-  libbpf-devel elfutils-libelf-devel zlib-devel \
-  kernel-devel-$(uname -r) kernel-headers-$(uname -r) \
-  openssl-devel bpftool git
-
-# Clone and build
-cd /opt
-git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
-cd ebpf-tls-tracer
-make && make test
-make install
-
-# Verify eBPF support
-echo "=== Kernel: $(uname -r) ==="
-ls -la /sys/kernel/btf/vmlinux && echo "BTF: OK"
-cat /proc/sys/net/core/bpf_jit_enable && echo "BPF JIT: OK"
-bpftool feature probe kernel 2>/dev/null | head -20 || true
-```
-
-### AL2023 Kernel Configuration (pre-enabled)
-
-The following are **already enabled** in AL2023's stock kernel — no action required:
-
-```
-CONFIG_BPF=y
-CONFIG_BPF_SYSCALL=y
-CONFIG_BPF_JIT=y
-CONFIG_BPF_JIT_ALWAYS_ON=y
-CONFIG_HAVE_EBPF_JIT=y
-CONFIG_DEBUG_INFO_BTF=y
-CONFIG_BPF_EVENTS=y
-CONFIG_KPROBE_EVENTS=y
-CONFIG_UPROBE_EVENTS=y
-```
-
-## Kubernetes Deployment (v1.34+)
-
-TLS Tracer runs as a **DaemonSet** to monitor outbound TLS traffic from all processes on every node. It uses eBPF at the kernel level, which means it captures TLS traffic from **all pods and containers** on the node — including pods in any namespace (e.g., `apigee`, `default`, etc.) — without requiring sidecars or application changes.
-
-### How It Works on Kubernetes
-
-- Deploys as a **DaemonSet** (one pod per node) with `hostPID: true` and `privileged: true`
-- eBPF hooks into the **host kernel's** `SSL_read`/`SSL_write` and `connect()` syscalls
-- Captures outbound TLS traffic from **all pods/containers on the node**, across all namespaces (e.g., `apigee`, `default`)
-- Automatically enriches events with **K8s metadata** (pod name, namespace, container ID) via the downward API environment variables
-- Parses **HTTP Layer 7** details (method, path, Host header) from TLS plaintext
-- Captures **source and destination IP:port** for every connection
-- Logs are output in **JSON format** to stdout, one self-contained event per line
-
-### Kubernetes Prerequisites
+### Prerequisites
 
 | Requirement | Details |
 |---|---|
-| **Kubernetes version** | 1.34+ |
-| **Node OS** | Linux with kernel 6.1+ (AL2023 recommended — ships kernel 6.12 on EKS 1.34) |
-| **Node kernel config** | eBPF, kprobes, uprobes enabled (see Prerequisites above) |
-| **Container runtime** | containerd or CRI-O with privileged container support |
-| **RBAC** | Cluster admin access to create privileged DaemonSets |
-| **OpenSSL on nodes** | `libssl.so` must be present on each node |
+| Kubernetes | 1.34+ |
+| Node OS | Linux kernel 6.1+ (AL2023 recommended) |
+| Container runtime | containerd or CRI-O with privileged container support |
+| Permissions | `privileged: true`, `hostPID: true`, `hostNetwork: true` |
+| Volumes | `/sys/kernel/debug`, `/sys/kernel/tracing`, `/sys/fs/bpf`, `/usr/lib64` |
 
-### Minimum Container Permissions
-
-The TLS Tracer container **requires** the following to function:
-
-| Permission | Why |
-|---|---|
-| `privileged: true` | eBPF program loading requires full kernel access |
-| `hostPID: true` | Must see all processes on the node to capture TLS traffic |
-| `hostNetwork: true` | Required for connect() kprobe correlation |
-| Volume: `/sys/kernel/debug` | debugfs access for uprobe/kprobe events |
-| Volume: `/sys/kernel/tracing` | tracefs access for tracing infrastructure |
-| Volume: `/sys/fs/bpf` | BPF filesystem for map pinning |
-| Volume: `/usr/lib64` (host) | Access to host's `libssl.so` for uprobe attachment |
-| PSA: `privileged` | Namespace must allow privileged pods |
-
-### Deploy with Helm (Recommended)
+### Deploy with Helm
 
 ```bash
-# Create EKS cluster with AL2023 nodes
-eksctl create cluster \
-  --name my-cluster \
-  --version 1.34 \
-  --nodegroup-name al2023-nodes \
-  --node-type m5.large \
-  --node-ami-family AmazonLinux2023
-
-# Deploy TLS Tracer (JSON output by default)
 helm install tls-tracer helm/tls-tracer \
   --namespace tls-tracer --create-namespace
 
-# Check status
 kubectl -n tls-tracer get pods -o wide
-
-# View JSON logs (all outbound TLS traffic on the node)
 kubectl -n tls-tracer logs -l app.kubernetes.io/name=tls-tracer --tail=50 -f
 ```
 
-#### Helm Values
+### Helm Values
 
 | Value | Default | Description |
 |---|---|---|
@@ -320,114 +271,48 @@ kubectl -n tls-tracer logs -l app.kubernetes.io/name=tls-tracer --tail=50 -f
 | `filterPid` | `0` | Filter by PID (0 = all) |
 | `filterUid` | `0` | Filter by UID (0 = all) |
 | `sslLibPath` | `""` | Custom libssl.so path (empty = auto-detect) |
-| `sanitizePatterns` | `["apikey=[^&]*"]` | URL sanitization regex patterns (case-insensitive) |
-| `companyPrefix` | `""` | Prefix for all resource names (e.g., `acme-`) |
-| `metadata.awsAccountId` | `""` | AWS account ID (for S3/Kinesis paths) |
-| `metadata.awsRegion` | `eu-west-1` | AWS region |
-| `metadata.clusterName` | `""` | EKS cluster name |
-| `metadata.targetNamespace` | `""` | K8s namespace being monitored |
-| `metadata.applicationName` | `""` | Application name (e.g., `apigee`) |
-| `metadata.environment` | `""` | Environment label (e.g., `production`) |
+| `sanitizePatterns` | `["apikey=[^&]*"]` | URL sanitization regex patterns |
+| `companyPrefix` | `""` | Prefix for resource names |
 | `image.repository` | `ghcr.io/scgis-wales/ebpf-tls-tracer` | Container image |
 | `image.tag` | `latest` | Image tag |
 
-#### AWS S3 Log Shipping
+### AWS Integration
 
-Ship JSON logs to S3 using Apache Hive-style directory partitioning. Uses a Python (boto3) sidecar with IRSA authentication. **Disabled by default.**
+**S3 log shipping** (disabled by default):
+```yaml
+s3:
+  enabled: true
+  bucket: "my-tls-logs"
+  prefix: "tls-tracer-logs"
+  flushIntervalSeconds: 60
+  batchSize: 1000
+```
 
-| Value | Default | Description |
-|---|---|---|
-| `s3.enabled` | `false` | Enable S3 log shipping sidecar |
-| `s3.bucket` | `""` | S3 bucket name |
-| `s3.prefix` | `tls-tracer-logs` | S3 key prefix |
-| `s3.flushIntervalSeconds` | `60` | Flush interval |
-| `s3.batchSize` | `1000` | Max records per upload |
-
-S3 path format (Apache Hive partitioning):
+S3 path uses Apache Hive partitioning:
 ```
 s3://<bucket>/<prefix>/account=<id>/region=<region>/cluster=<name>/
-  namespace=<ns>/app=<app>/env=<env>/year=YYYY/month=MM/day=DD/
-  hour=HH/<node>-<timestamp>.json
+  namespace=<ns>/app=<app>/env=<env>/year=YYYY/month=MM/day=DD/hour=HH/<file>.json
 ```
 
-#### AWS Kinesis Firehose
+**Kinesis Firehose** (disabled by default):
+```yaml
+kinesis:
+  enabled: true
+  deliveryStreamName: "tls-tracer-stream"
+  batchSize: 500
+  flushIntervalSeconds: 30
+```
 
-Forward JSON logs to Kinesis Firehose delivery stream. Uses a Python (boto3) sidecar with IRSA authentication. **Disabled by default.**
-
-| Value | Default | Description |
-|---|---|---|
-| `kinesis.enabled` | `false` | Enable Kinesis Firehose sidecar |
-| `kinesis.deliveryStreamName` | `""` | Firehose delivery stream name |
-| `kinesis.batchSize` | `500` | Records per PutRecordBatch call |
-| `kinesis.flushIntervalSeconds` | `30` | Flush interval |
-
-#### IRSA (IAM Roles for Service Accounts)
-
-Both S3 and Kinesis sidecars use IRSA for AWS authentication. Configure the IAM role ARN in the service account annotations:
-
+Both use IRSA for authentication:
 ```yaml
 serviceAccount:
   annotations:
     eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/tls-tracer-role"
 ```
 
-Required IAM permissions:
-- **S3**: `s3:PutObject`, `s3:GetBucketLocation`
-- **Kinesis**: `firehose:PutRecord`, `firehose:PutRecordBatch`
+### K8s Metadata Enrichment
 
-#### URL Sanitization
-
-Sensitive data in HTTP paths and Host headers can be automatically redacted using regex patterns. Matches are replaced with `[REDACTED]`. Patterns are case-insensitive (POSIX ERE).
-
-**CLI usage:**
-```bash
-# Redact API keys and tokens from logged URLs
-sudo ./bin/tls_tracer -f json -s 'apikey=[^&]*' -s 'token=[^&]*' -s 'password=[^&]*'
-```
-
-**Helm values:**
-```yaml
-sanitizePatterns:
-  - "apikey=[^&]*"
-  - "secret=[^&]*"
-  - "password=[^&]*"
-  - "token=[^&]*"
-  - "access_key=[^&]*"
-```
-
-Before: `GET /api/v1/data?apikey=sk_live_abc123&format=json`
-After:  `GET /api/v1/data?[REDACTED]&format=json`
-
-### JSON Log Output
-
-Each captured TLS event is a **single self-contained JSON line**:
-
-```json
-{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":1710500000000000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"REQUEST","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"transport":"tls","protocol":"https","k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com"}
-{"timestamp":"2026-03-15T10:30:00.234567Z","timestamp_ns":1710500000100000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"RESPONSE","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":256,"transport":"tls","protocol":"https","k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6"}
-{"timestamp":"2026-03-15T10:30:01.000000Z","timestamp_ns":1710500001000000,"pid":23456,"tid":23456,"uid":0,"comm":"java","direction":"REQUEST","src_ip":"10.0.5.24","src_port":38901,"dst_ip":"10.0.1.50","dst_port":8443,"data_len":142,"transport":"tls","protocol":"https","k8s_pod":"apigee-cassandra-0","k8s_namespace":"apigee","container_id":"f6e5d4c3b2a1","http_method":"POST","http_path":"/v1/organizations","http_host":"management.apigee.internal"}
-```
-
-| Field | Description |
-|---|---|
-| `timestamp` | ISO 8601 wall-clock timestamp with microseconds |
-| `timestamp_ns` | Kernel monotonic timestamp in nanoseconds |
-| `pid`/`tid` | Process and thread IDs |
-| `comm` | Process command name (e.g., `curl`, `java`, `node`, `python3`) |
-| `direction` | `REQUEST` (outbound to server) or `RESPONSE` (inbound from server) |
-| `src_ip`/`src_port` | Source (local) IP address and port |
-| `dst_ip`/`dst_port` | Destination (remote) IP address and port |
-| `transport` | Transport layer: `tls` (all captured traffic goes through SSL) |
-| `protocol` | Application protocol: `https` (HTTP detected) or `unknown` |
-| `k8s_pod` | Kubernetes pod name (from downward API `POD_NAME` or `HOSTNAME`) |
-| `k8s_namespace` | Kubernetes namespace (from downward API `POD_NAMESPACE`) |
-| `container_id` | Short container ID (from cgroup) |
-| `http_method` | HTTP method: GET, POST, PUT, DELETE, PATCH, etc. |
-| `http_path` | HTTP request path (e.g., `/api/v1/status`) |
-| `http_host` | HTTP Host header value (the DNS hostname) |
-| `data_len` | Length of captured plaintext data |
-
-K8s and HTTP fields are only present when detected. To enable K8s metadata on monitored pods, configure the downward API:
+To populate `k8s_pod` and `k8s_namespace` fields on monitored pods, configure the downward API:
 
 ```yaml
 env:
@@ -441,143 +326,103 @@ env:
         fieldPath: metadata.namespace
 ```
 
-### Deploy with kubectl (Alternative)
+### Uninstall
 
 ```bash
-kubectl apply -f deploy/kubernetes/namespace.yaml
-kubectl apply -f deploy/kubernetes/rbac.yaml
-kubectl apply -f deploy/kubernetes/daemonset.yaml
-
-kubectl -n tls-tracer get pods -o wide
-kubectl -n tls-tracer logs -l app=tls-tracer --tail=50
-```
-
-### Node Configuration via EKS Userdata
-
-If nodes need runtime libraries (usually pre-installed on AL2023):
-
-```bash
-#!/bin/bash
-dnf install -y libbpf openssl-libs bpftool
-```
-
-### What Needs to Be Configured
-
-For Kubernetes 1.34+ on Linux kernel 6.x, the following must be true on each node.
-
-**EKS 1.34 with AL2023**: The EKS-optimized AL2023 AMI ships with **kernel 6.12** (e.g., `6.12.73-95.123.amzn2023`). All eBPF features — BTF, uprobes, kprobes, BPF JIT, debugfs, tracefs, and the BPF filesystem — are **fully enabled and auto-mounted out of the box**. No kernel configuration, module loading, or filesystem mounting is required. Simply deploy the Helm chart.
-
-For non-AL2023 or custom AMIs, verify:
-
-1. **Kernel modules loaded** (usually auto-loaded on AL2023):
-   ```bash
-   lsmod | grep -E 'bpf|uprobe|kprobe'
-   ```
-
-2. **BPF filesystem mounted** (auto-mounted on AL2023):
-   ```bash
-   mount -t bpf bpf /sys/fs/bpf
-   ```
-
-3. **debugfs / tracefs mounted** (auto-mounted on AL2023):
-   ```bash
-   mount -t debugfs debugfs /sys/kernel/debug
-   mount -t tracefs tracefs /sys/kernel/tracing
-   ```
-
-4. **Privileged containers allowed** in Pod Security Admission:
-   ```yaml
-   apiVersion: v1
-   kind: Namespace
-   metadata:
-     name: tls-tracer
-     labels:
-       pod-security.kubernetes.io/enforce: privileged
-   ```
-
-### Removing
-
-```bash
-# Helm
 helm uninstall tls-tracer -n tls-tracer
+```
 
-# Or kubectl
-kubectl delete -f deploy/kubernetes/daemonset.yaml
-kubectl delete -f deploy/kubernetes/rbac.yaml
-kubectl delete -f deploy/kubernetes/namespace.yaml
+## Amazon Linux 2023
+
+AL2023 on EKS 1.34 ships with kernel 6.12 — all eBPF features (BTF, uprobes, kprobes, BPF JIT) are enabled out of the box. No kernel configuration required.
+
+```bash
+# Install and build on AL2023
+sudo dnf install -y clang llvm gcc make libbpf-devel elfutils-libelf-devel \
+  zlib-devel kernel-devel-$(uname -r) kernel-headers-$(uname -r) openssl-devel bpftool
+
+git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
+cd ebpf-tls-tracer && make && make test
+sudo ./bin/tls_tracer -f json -v
 ```
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                       User Space                         │
-│                                                          │
-│  tls_tracer (CLI)                                        │
-│    ├── Argument parsing (getopt_long)                    │
-│    ├── BPF object loading (libbpf)                       │
-│    ├── Kprobe attach → connect() for IP capture          │
-│    ├── Uprobe attach → SSL_read/SSL_write                │
-│    ├── Perf buffer polling                               │
-│    └── Event formatting (text/json) with IP:port         │
-│                                                          │
-├───────────────── perf buffer ────────────────────────────┤
-│                                                          │
-│                      Kernel Space                        │
-│                                                          │
-│  bpf_program.o (eBPF probes)                             │
-│    ├── kprobe/__sys_connect    → save sockaddr           │
-│    ├── kretprobe/__sys_connect → store IP:port in map    │
-│    ├── uprobe/SSL_read         → save buffer ptr         │
-│    ├── uretprobe/SSL_read      → capture data + IP       │
-│    ├── uprobe/SSL_write        → save buffer ptr         │
-│    └── uretprobe/SSL_write     → capture data + IP       │
-│                                                          │
-│  BPF Maps:                                               │
-│    ├── ssl_args_map   (HASH) → per-thread SSL args       │
-│    ├── conn_info_map  (HASH) → pid_tgid → remote addr   │
-│    ├── connect_args_map (HASH) → connect() args          │
-│    └── tls_events (PERF_EVENT_ARRAY) → user-space        │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        User Space                            │
+│                                                              │
+│  tls_tracer (CLI)                                            │
+│    ├── Argument parsing & config (getopt_long)               │
+│    ├── OpenSSL version validation (dlopen/dlsym)             │
+│    ├── BPF object loading (libbpf)                           │
+│    ├── Kprobe attach: connect(), tcp_set_state, udp_sendmsg  │
+│    ├── Uprobe attach: SSL_read/write, SSL_version,           │
+│    │    SSL_get_current_cipher, SSL_get_certificate          │
+│    ├── Perf buffer polling (variable-length events)          │
+│    ├── L7 protocol detection (HTTP, gRPC, Kafka, WS, ...)   │
+│    ├── K8s metadata enrichment (/proc/<pid>/environ)         │
+│    ├── DNS hostname caching (per pid:fd)                     │
+│    └── Event formatting (text/JSON) + sanitization           │
+│                                                              │
+├──────────────── perf buffer (256 pages/CPU) ─────────────────┤
+│                                                              │
+│                       Kernel Space                           │
+│                                                              │
+│  bpf_program.o (eBPF probes)                                 │
+│    ├── kprobe/__sys_connect      → save sockaddr             │
+│    ├── kretprobe/__sys_connect   → store conn_info in map    │
+│    ├── kprobe/tcp_set_state      → capture local+remote addr │
+│    ├── kprobe/udp_sendmsg        → QUIC detection (opt-in)   │
+│    ├── uprobe/SSL_read           → save buffer ptr           │
+│    ├── uretprobe/SSL_read        → capture data + enrich     │
+│    ├── uprobe/SSL_write          → save buffer ptr           │
+│    ├── uretprobe/SSL_write       → capture data + enrich     │
+│    ├── uprobe/SSL_version        → capture TLS version       │
+│    ├── uprobe/SSL_get_current_cipher → capture cipher suite  │
+│    └── uprobe/SSL_get_certificate    → detect mTLS           │
+│                                                              │
+│  BPF Maps:                                                   │
+│    ├── ssl_args_map       (HASH)     → per-thread SSL args   │
+│    ├── conn_info_map      (LRU_HASH) → pid_tgid → addresses │
+│    ├── ssl_version_map    (LRU_HASH) → SSL* → TLS version   │
+│    ├── cipher_name_map    (LRU_HASH) → SSL* → cipher name   │
+│    ├── mtls_map           (LRU_HASH) → SSL* → mTLS flag     │
+│    ├── event_buf     (PERCPU_ARRAY)  → scratch buffer        │
+│    └── tls_events    (PERF_EVENT_ARRAY) → user-space output  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### How IP Capture Works
 
-1. A **kprobe on `connect()`** saves the `sockaddr` (containing the remote IP and port) on syscall entry
-2. A **kretprobe on `connect()`** reads the saved address on successful return and stores `{pid_tgid} → {remote_ip, remote_port}` in `conn_info_map`
-3. When **SSL_read/SSL_write** fires, the uretprobe looks up `conn_info_map` by `pid_tgid` to enrich the TLS event with the connection's remote IP address and port
-
-This captures the actual IP address the connection was established to — resolving the IP behind any hostname.
+1. **`kprobe/connect()`** saves the `sockaddr` (remote IP:port) on entry
+2. **`kprobe/tcp_set_state`** fires when TCP reaches ESTABLISHED, capturing both local and remote addresses from `struct sock` (CO-RE compatible)
+3. **`kretprobe/connect()`** stores `{pid_tgid} → conn_info_t` in the map
+4. **SSL uretprobes** extract socket fd from `SSL->rbio->num` (OpenSSL internal offset) and look up `conn_info_map` to enrich TLS events with IP:port
 
 ## Project Structure
 
 ```
 ebpf-tls-tracer/
 ├── include/
-│   └── tracer.h              # Shared data structures (kernel + user space)
+│   └── tracer.h              # Shared structs (kernel + user space)
 ├── src/
-│   ├── bpf_program.c         # eBPF kernel probes (compiled to BPF bytecode)
-│   └── tls_tracer.c          # User-space CLI tool
+│   ├── bpf_program.c         # eBPF kernel probes (14 probe functions)
+│   └── tls_tracer.c          # User-space CLI (L7 parsing, K8s, output)
 ├── tests/
-│   └── test_tracer.c         # Unit tests
+│   ├── test_tracer.c         # Struct/constant tests (16 tests)
+│   └── test_helpers.c        # Helper function tests (46 tests)
+├── helm/
+│   └── tls-tracer/           # Helm chart (DaemonSet, RBAC, S3/Kinesis)
 ├── deploy/
-│   └── kubernetes/
-│       ├── namespace.yaml    # Namespace definition
-│       ├── rbac.yaml         # ServiceAccount and RBAC
-│       └── daemonset.yaml    # DaemonSet for per-node deployment
+│   └── kubernetes/           # Raw K8s manifests (alternative to Helm)
 ├── .github/
 │   └── workflows/
-│       └── build.yml         # CI: build, test, functional test, Docker publish
-├── helm/
-│   └── tls-tracer/           # Helm chart for Kubernetes deployment
-│       ├── Chart.yaml
-│       ├── values.yaml
-│       └── templates/
+│       └── build.yml         # CI: build, test, Docker publish
 ├── Dockerfile                # Multi-stage build (Debian trixie)
-├── Makefile                  # Build system
-├── LICENSE                   # MIT License
-└── README.md
+├── Makefile
+└── LICENSE                   # MIT
 ```
 
 ## License
