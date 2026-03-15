@@ -334,6 +334,78 @@ jobs:
             -H "te: trailers" \
             -X POST https://httpbin.org/post 2>/dev/null || echo "gRPC-style: failed (expected)"
 
+          # === TCP connection error tests ===
+          echo "--- TCP connection error tests ---"
+
+          # TCP connection refused: connect to a port with nothing listening
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --connect-timeout 5 --max-time 10 \
+            https://127.0.0.1:19999/should-fail 2>/dev/null \
+            && echo "TCP refused: unexpectedly succeeded" \
+            || echo "TCP refused: connection refused (expected)"
+
+          # TCP connection timeout: connect to a non-routable IP
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --connect-timeout 3 --max-time 5 \
+            https://192.0.2.1:443/should-timeout 2>/dev/null \
+            && echo "TCP timeout: unexpectedly succeeded" \
+            || echo "TCP timeout: timed out (expected)"
+
+          # === TLS error tests ===
+          echo "--- TLS error tests ---"
+
+          # TLS handshake failure: connect with wrong TLS settings
+          # Use a self-signed cert server (the kind node itself on a random port)
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --connect-timeout 5 --max-time 10 \
+            --cacert /dev/null \
+            https://httpbin.org:443/get 2>/dev/null \
+            || echo "TLS error test: completed (error expected)"
+
+          # TLS certificate verification failure
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --connect-timeout 5 --max-time 10 \
+            https://self-signed.badssl.com/ 2>/dev/null \
+            || echo "TLS cert error: verification failed (expected)"
+
+          # TLS expired certificate
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --connect-timeout 5 --max-time 10 \
+            https://expired.badssl.com/ 2>/dev/null \
+            || echo "TLS expired cert: failed (expected)"
+
+          # TLS wrong host
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --connect-timeout 5 --max-time 10 \
+            https://wrong.host.badssl.com/ 2>/dev/null \
+            || echo "TLS wrong host: failed (expected)"
+
+          # === gRPC error simulation ===
+          echo "--- gRPC status code tests ---"
+
+          # Simulate gRPC responses with grpc-status headers
+          # (These test header parsing in captured TLS data)
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --http2 --connect-timeout 10 --max-time 15 \
+            -H "content-type: application/grpc" \
+            -H "grpc-status: 0" \
+            -X POST https://httpbin.org/post 2>/dev/null \
+            || echo "gRPC OK status: failed (non-critical)"
+
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --http2 --connect-timeout 10 --max-time 15 \
+            -H "content-type: application/grpc" \
+            -H "grpc-status: 14" \
+            -X POST https://httpbin.org/post 2>/dev/null \
+            || echo "gRPC UNAVAILABLE status: failed (non-critical)"
+
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --http2 --connect-timeout 10 --max-time 15 \
+            -H "content-type: application/grpc" \
+            -H "grpc-status: 7" \
+            -X POST https://httpbin.org/post 2>/dev/null \
+            || echo "gRPC PERMISSION_DENIED status: failed (non-critical)"
+
           # === Node-level traffic (guaranteed to use node's libssl) ===
           echo "--- Node-level traffic ---"
           docker exec tls-tracer-ci-control-plane \
@@ -391,7 +463,7 @@ jobs:
             fi
 
             # Check for expected fields (required)
-            for field in timestamp pid comm direction dst_ip dst_port data_len transport protocol; do
+            for field in timestamp pid comm direction dst_ip dst_port data_len transport protocol tls_cipher; do
               if echo "${FIRST_LINE}" | grep -q "\"${field}\""; then
                 echo "Field '${field}' present in JSON"
               else
@@ -402,7 +474,7 @@ jobs:
             # Check for enriched fields (best-effort — may not appear on every event)
             echo ""
             echo "=== Checking enriched fields across all events ==="
-            for field in src_ip src_port dst_dns http_version tls_version http_method http_path http_host; do
+            for field in src_ip src_port dst_dns http_version tls_version tls_cipher http_method http_path http_host user_agent; do
               if echo "${JSON_LINES}" | grep -q "\"${field}\""; then
                 echo "Enriched field '${field}' found in events"
               else
@@ -416,6 +488,64 @@ jobs:
               echo "PASS: src_ip is populated with actual IP address"
             else
               echo "WARNING: src_ip shows '-' in all events (tcp_set_state may not have fired)"
+            fi
+
+            # Check for TCP error events
+            echo ""
+            echo "=== Checking error event types ==="
+            ALL_LOGS=$(kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer --tail=500 2>&1)
+            ALL_JSON=$(echo "${ALL_LOGS}" | grep '^{' || true)
+
+            TCP_ERRORS=$(echo "${ALL_JSON}" | grep '"event_type":"tcp_error"' | head -5 || true)
+            if [ -n "${TCP_ERRORS}" ]; then
+              echo "PASS: TCP error events captured:"
+              echo "${TCP_ERRORS}" | head -3
+            else
+              echo "Note: No TCP error events captured (connect errors may not be visible)"
+            fi
+
+            TLS_ERRORS=$(echo "${ALL_JSON}" | grep '"event_type":"tls_error"' | head -5 || true)
+            if [ -n "${TLS_ERRORS}" ]; then
+              echo "PASS: TLS error events captured:"
+              echo "${TLS_ERRORS}" | head -3
+            else
+              echo "Note: No TLS error events captured (SSL errors may not be visible)"
+            fi
+
+            # Check for gRPC status codes
+            GRPC_STATUS=$(echo "${ALL_JSON}" | grep '"grpc_status"' | head -3 || true)
+            if [ -n "${GRPC_STATUS}" ]; then
+              echo "PASS: gRPC status codes captured:"
+              echo "${GRPC_STATUS}" | head -3
+            else
+              echo "Note: No gRPC status codes captured (grpc-status header may not appear in captured data)"
+            fi
+
+            # Check for WebSocket close codes
+            WS_CLOSE=$(echo "${ALL_JSON}" | grep '"ws_close_code"' | head -3 || true)
+            if [ -n "${WS_CLOSE}" ]; then
+              echo "PASS: WebSocket close codes captured:"
+              echo "${WS_CLOSE}" | head -3
+            else
+              echo "Note: No WebSocket close codes captured (no close frames in test traffic)"
+            fi
+
+            # Check for QUIC detection events
+            QUIC_EVENTS=$(echo "${ALL_JSON}" | grep '"quic_detected"' | head -3 || true)
+            if [ -n "${QUIC_EVENTS}" ]; then
+              echo "PASS: QUIC detection events captured:"
+              echo "${QUIC_EVENTS}" | head -3
+            else
+              echo "Note: No QUIC events captured (no QUIC traffic in test)"
+            fi
+
+            # Check for TLS cipher suite
+            CIPHER_EVENTS=$(echo "${ALL_JSON}" | grep '"tls_cipher"' | head -3 || true)
+            if [ -n "${CIPHER_EVENTS}" ]; then
+              echo "PASS: TLS cipher suite captured:"
+              echo "${CIPHER_EVENTS}" | head -3
+            else
+              echo "Note: No TLS cipher suite captured (SSL_get_current_cipher may not have been called)"
             fi
           else
             echo ""

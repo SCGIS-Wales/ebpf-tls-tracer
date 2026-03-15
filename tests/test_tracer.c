@@ -79,6 +79,9 @@ static void test_event_type_constants(void)
     ASSERT_EQ(EVENT_TLS_DATA, 1, "EVENT_TLS_DATA should be 1");
     ASSERT_EQ(EVENT_TLS_HANDSHAKE, 2, "EVENT_TLS_HANDSHAKE should be 2");
     ASSERT_EQ(EVENT_CONNECT, 3, "EVENT_CONNECT should be 3");
+    ASSERT_EQ(EVENT_CONNECT_ERROR, 4, "EVENT_CONNECT_ERROR should be 4");
+    ASSERT_EQ(EVENT_TLS_ERROR, 5, "EVENT_TLS_ERROR should be 5");
+    ASSERT_EQ(EVENT_QUIC_DETECTED, 6, "EVENT_QUIC_DETECTED should be 6");
     PASS();
 }
 
@@ -117,11 +120,13 @@ static void test_zero_init(void)
     ASSERT_EQ(event.direction, 0, "direction should be 0 (READ)");
     ASSERT_EQ(event.event_type, 0, "event_type should be 0");
     ASSERT_EQ(event.addr_family, 0, "addr_family should be 0");
+    ASSERT_EQ(event.error_code, 0, "error_code should be 0");
     ASSERT_EQ(event.remote_port, 0, "remote_port should be 0");
     ASSERT_EQ(event.local_port, 0, "local_port should be 0");
     ASSERT_EQ(event.remote_addr_v4, 0, "remote_addr_v4 should be 0");
     ASSERT_EQ(event.local_addr_v4, 0, "local_addr_v4 should be 0");
     ASSERT_EQ(event.comm[0], '\0', "comm should be empty");
+    ASSERT_EQ(event.cipher[0], '\0', "cipher should be empty");
     ASSERT_EQ(event.data[0], '\0', "data should be empty");
     PASS();
 }
