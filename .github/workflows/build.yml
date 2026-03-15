@@ -38,6 +38,13 @@ jobs:
             linux-libc-dev \
             libc6-dev
 
+      - name: Audit libbpf version for CVE-2025-29481
+        run: |
+          echo "=== libbpf version check ==="
+          dpkg -l libbpf-dev 2>/dev/null | grep -E 'ii\s+libbpf' || echo "libbpf-dev not found via dpkg"
+          apt-cache policy libbpf-dev 2>/dev/null || true
+          echo "NOTE: CVE-2025-29481 affects libbpf 1.5.0. Ensure patched version is installed."
+
       - name: Build
         run: make all
 

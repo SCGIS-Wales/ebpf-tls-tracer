@@ -171,6 +171,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          securityContext:
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           resources:
             {{- toYaml .Values.s3.resources | nindent 12 }}
           volumeMounts:
@@ -208,6 +218,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          securityContext:
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           resources:
             {{- toYaml .Values.kinesis.resources | nindent 12 }}
           volumeMounts:

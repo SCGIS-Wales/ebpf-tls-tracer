@@ -27,8 +27,7 @@
 #include <bpf/bpf.h>
 #include "tracer.h"
 
-#define PERF_BUFFER_PAGES  256
-#define PERF_POLL_TIMEOUT  100
+#define RING_POLL_TIMEOUT  100
 #define MAX_PROBES         32
 #define MAX_SANITIZE_PATTERNS 32
 #define DNS_CACHE_SIZE     4096  /* max cached hostname entries (must be power of 2) */
@@ -61,7 +60,10 @@ static struct dns_cache_entry dns_cache[DNS_CACHE_SIZE];
 
 static inline __u32 dns_hash(__u32 pid, __u32 fd)
 {
-    return (pid ^ (fd * 2654435761u)) & (DNS_CACHE_SIZE - 1);
+    __u64 key = ((__u64)pid << 32) | fd;
+    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
+    return ((__u32)(key >> 32)) & (DNS_CACHE_SIZE - 1);
 }
 
 static const char *dns_cache_lookup(__u32 pid, __u32 fd)
@@ -957,20 +959,19 @@ static void print_json_string(const char *s)
     print_json_string_n(s, 0);
 }
 
-static void handle_event(void *ctx, int cpu, void *data, __u32 size)
+static int handle_event(void *ctx, void *data, size_t size)
 {
-    (void)cpu;
     struct tls_event_t *event = data;
     struct config *c = ctx;
 
     if (size < sizeof(*event) - MAX_DATA_LEN)
-        return;
+        return 0;
 
     /* Apply filters */
     if (c->filter_pid && event->pid != c->filter_pid)
-        return;
+        return 0;
     if (c->filter_uid && event->uid != c->filter_uid)
-        return;
+        return 0;
 
     __u32 data_len = event->data_len;
     if (data_len > MAX_DATA_LEN)
@@ -1042,7 +1043,7 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                    "\"error_code\":%d,\"error\":\"%s\"}\n",
                    remote_ip, event->remote_port,
                    ecode, err_desc);
-            return;
+            return 0;
         }
 
         /* Handle TLS close events (#3 fix) */
@@ -1085,7 +1086,7 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
             }
             printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
             printf("}\n");
-            return;
+            return 0;
         }
 
         /* Handle TLS error events */
@@ -1124,7 +1125,7 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                 printf(",\"tls_version\":\"%s\"", tls_ver_str);
 
             printf("}\n");
-            return;
+            return 0;
         }
 
         /* Handle QUIC detection events */
@@ -1143,7 +1144,7 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                    "\"transport\":\"udp\",\"protocol\":\"quic\"}\n",
                    local_ip, event->local_port,
                    remote_ip, event->remote_port);
-            return;
+            return 0;
         }
 
         /* K8s metadata enrichment (R-3 fix: cached per PID to avoid /proc I/O storm) */
@@ -1561,27 +1562,8 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                 printf("\n");
         }
     }
-}
 
-static void handle_lost_events(void *ctx, int cpu, unsigned long long cnt)
-{
-    (void)ctx;
-    fprintf(stderr, "WARNING: Lost %llu events on CPU %d\n", cnt, cpu);
-
-    /* R-4 fix: emit lost events as JSON so log pipelines can track data gaps */
-    if (cfg.format == FMT_JSON) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        char iso_time[64];
-        struct tm tm_buf;
-        gmtime_r(&ts.tv_sec, &tm_buf);
-        strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", &tm_buf);
-
-        printf("{\"timestamp\":\"%s.%06ldZ\","
-               "\"event_type\":\"lost_events\","
-               "\"cpu\":%d,\"lost_count\":%llu}\n",
-               iso_time, ts.tv_nsec / 1000, cpu, cnt);
-    }
+    return 0;
 }
 
 static int find_ssl_library(char *path, size_t path_len)
@@ -1746,7 +1728,7 @@ int main(int argc, char **argv)
     struct bpf_object *obj = NULL;
     struct bpf_program *prog;
     struct bpf_link *links[MAX_PROBES] = {0};
-    struct perf_buffer *pb = NULL;
+    struct ring_buffer *rb = NULL;
     int err = 0;
     int link_count = 0;
 
@@ -2092,7 +2074,7 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 10);
 
-    /* Set up perf buffer (P1/P2-PERF: 256 pages, variable-length output) */
+    /* Set up ring buffer (H-1: migrated from perf_buffer for reliability) */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");
     if (map_fd < 0) {
         fprintf(stderr, "Error: Could not find 'tls_events' map in BPF object.\n");
@@ -2100,18 +2082,16 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES,
-                          handle_event, handle_lost_events, &cfg, NULL);
-    if (!pb) {
-        fprintf(stderr, "Error: Failed to create perf buffer: %s\n",
+    rb = ring_buffer__new(map_fd, handle_event, &cfg, NULL);
+    if (!rb) {
+        fprintf(stderr, "Error: Failed to create ring buffer: %s\n",
                 strerror(errno));
         err = 1;
         goto cleanup;
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Perf buffer: %d pages (%d KB per CPU)\n",
-                PERF_BUFFER_PAGES, PERF_BUFFER_PAGES * 4);
+        fprintf(stderr, "Ring buffer: 256 KB\n");
 
     /* Print startup banner */
     if (!cfg.data_only && cfg.format == FMT_TEXT) {
@@ -2144,9 +2124,9 @@ int main(int argc, char **argv)
     /* Main event loop (#1 fix: don't mask poll errors) */
     int poll_count = 0;
     while (!exiting) {
-        int poll_err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT);
+        int poll_err = ring_buffer__poll(rb, RING_POLL_TIMEOUT);
         if (poll_err < 0 && poll_err != -EINTR) {
-            fprintf(stderr, "Error: Polling perf buffer failed: %s\n",
+            fprintf(stderr, "Error: Polling ring buffer failed: %s\n",
                     strerror(-poll_err));
             err = poll_err;
             break;
@@ -2171,8 +2151,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "\nExiting...\n");
 
 cleanup:
-    if (pb)
-        perf_buffer__free(pb);
+    if (rb)
+        ring_buffer__free(rb);
     for (int i = 0; i < link_count; i++) {
         if (links[i])
             bpf_link__destroy(links[i]);

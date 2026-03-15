@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>
 #include <linux/ptrace.h>
-#include <stddef.h>  /* offsetof() for variable-length perf output */
+#include <stddef.h>  /* offsetof() for variable-length ring buffer output */
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
@@ -55,7 +55,7 @@ struct ssl_version_args_t {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, struct ssl_args_t);
@@ -63,7 +63,7 @@ struct {
 
 /* Temporary map for SSL_version args between entry and return */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, struct ssl_version_args_t);
@@ -107,7 +107,7 @@ struct ssl_cert_args_t {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, struct ssl_cert_args_t);
@@ -119,7 +119,7 @@ struct ssl_cipher_args_t {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, struct ssl_cipher_args_t);
@@ -149,16 +149,15 @@ struct connect_args_t {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, struct connect_args_t);
 } connect_args_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(int));
-    __uint(value_size, sizeof(int));
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);  /* 256 KB ring buffer */
 } tls_events SEC(".maps");
 
 /* Per-CPU scratch buffer for tls_event_t (too large for 512-byte BPF stack).
@@ -332,7 +331,7 @@ int probe_connect_return(struct pt_regs *ctx)
             }
 
             __u64 out_size = offsetof(struct tls_event_t, data);
-            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
+            bpf_ringbuf_output(&tls_events, event, out_size, 0);
         }
         goto cleanup;
     }
@@ -540,7 +539,7 @@ int probe_udp_sendmsg(struct pt_regs *ctx)
 
     {
         __u64 out_size = offsetof(struct tls_event_t, data);
-        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
+        bpf_ringbuf_output(&tls_events, event, out_size, 0);
     }
     return 0;
 }
@@ -817,7 +816,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
             __u64 out_size = offsetof(struct tls_event_t, data);
-            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, err_event, out_size);
+            bpf_ringbuf_output(&tls_events, err_event, out_size, 0);
         }
         goto cleanup;
     }
@@ -848,7 +847,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
 
     if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
         __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
-        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
+        bpf_ringbuf_output(&tls_events, event, out_size, 0);
     }
 
 cleanup:
@@ -912,7 +911,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
             __u64 out_size = offsetof(struct tls_event_t, data);
-            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, err_event, out_size);
+            bpf_ringbuf_output(&tls_events, err_event, out_size, 0);
         }
         goto cleanup;
     }
@@ -943,7 +942,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
 
     if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
         __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
-        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, out_size);
+        bpf_ringbuf_output(&tls_events, event, out_size, 0);
     }
 
 cleanup:
