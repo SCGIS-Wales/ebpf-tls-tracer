@@ -1,0 +1,14 @@
+{{- /* S7 fix: Create namespace with PSA labels so --create-namespace works
+     correctly on clusters with Pod Security Admission enforcement.
+     Without these labels, privileged DaemonSet pods are rejected. */ -}}
+{{- if .Values.createNamespace | default false }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+{{- end }}

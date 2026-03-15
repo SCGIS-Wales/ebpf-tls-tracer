@@ -28,8 +28,8 @@ COPY Makefile .
 RUN make all && make test
 
 # --- Runtime stage ---
-# Python 3.14 on Debian trixie — gives us Python + pip out of the box
-FROM python:3.14-slim-trixie
+# A5 fix: use stable Python 3.12 instead of pre-release 3.14
+FROM python:3.12-slim-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive
 

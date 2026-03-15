@@ -82,6 +82,7 @@ static void test_event_type_constants(void)
     ASSERT_EQ(EVENT_CONNECT_ERROR, 4, "EVENT_CONNECT_ERROR should be 4");
     ASSERT_EQ(EVENT_TLS_ERROR, 5, "EVENT_TLS_ERROR should be 5");
     ASSERT_EQ(EVENT_QUIC_DETECTED, 6, "EVENT_QUIC_DETECTED should be 6");
+    ASSERT_EQ(EVENT_TLS_CLOSE, 7, "EVENT_TLS_CLOSE should be 7");  /* L1 fix */
     PASS();
 }
 

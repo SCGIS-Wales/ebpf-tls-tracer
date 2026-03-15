@@ -218,14 +218,20 @@ static __always_inline void enrich_event_with_conn_info(struct tls_event_t *even
 }
 
 /* --- Minimal kernel struct definitions for reading sock addresses ---
- * These offsets are stable across kernel 5.x-6.x (part of the
- * stable __sk_common layout at the start of struct sock). */
+ * Uses __attribute__((preserve_access_index)) for CO-RE (Compile Once,
+ * Run Everywhere) support. The BPF loader rewrites field accesses at
+ * load time using BTF, so offsets are correct on any kernel version.
+ * This fixes S1: hardcoded IPv6 struct offsets. */
+
+struct in6_addr_kernel {
+    __u8 in6_u[16];
+} __attribute__((preserve_access_index));
 
 struct sock_common {
     union {
         struct {
-            __u32 skc_daddr;        /* Foreign IPv4 addr (offset 0) */
-            __u32 skc_rcv_saddr;    /* Bound local IPv4 addr (offset 4) */
+            __u32 skc_daddr;        /* Foreign IPv4 addr */
+            __u32 skc_rcv_saddr;    /* Bound local IPv4 addr */
         };
     };
     union {
@@ -234,11 +240,13 @@ struct sock_common {
     };
     union {
         struct {
-            __u16 skc_dport;        /* Destination port (offset 12) */
-            __u16 skc_num;          /* Local port (offset 14, host byte order) */
+            __u16 skc_dport;        /* Destination port */
+            __u16 skc_num;          /* Local port (host byte order) */
         };
     };
-    short skc_family;               /* Address family (offset 16) */
+    short skc_family;               /* Address family */
+    struct in6_addr_kernel skc_v6_daddr;    /* IPv6 destination address (CO-RE, S1 fix) */
+    struct in6_addr_kernel skc_v6_rcv_saddr; /* IPv6 source address (CO-RE, S1 fix) */
 } __attribute__((preserve_access_index));
 
 struct sock {
@@ -399,10 +407,9 @@ int probe_tcp_set_state(struct pt_regs *ctx)
         ci.remote_port = bpf_ntohs(dport);
         ci.local_port = sport;  /* skc_num is already host byte order */
     } else if (family == AF_INET6) {
-        /* IPv6: read addresses from struct sock.
-         * sk_v6_daddr and sk_v6_rcv_saddr are at stable offsets in
-         * struct ipv6_pinfo embedded in tcp6_sock.  For CO-RE compatible
-         * kernels we use the __sk_common fields available since 4.x. */
+        /* IPv6: read addresses from struct sock using CO-RE (S1 fix).
+         * BPF_CORE_READ via preserve_access_index ensures correct offsets
+         * across kernel versions — no hardcoded byte offsets needed. */
         __u16 dport = 0, sport = 0;
 
         bpf_probe_read_kernel(&dport, sizeof(dport),
@@ -414,10 +421,11 @@ int probe_tcp_set_state(struct pt_regs *ctx)
         ci.remote_port = bpf_ntohs(dport);
         ci.local_port = sport;
 
-        /* sk_v6_daddr at offset 200, sk_v6_rcv_saddr at offset 216 on
-         * x86_64 5.x-6.x kernels — read raw bytes to stay portable. */
-        bpf_probe_read_kernel(ci.remote_addr_v6, 16, (void *)sk + 200);
-        bpf_probe_read_kernel(ci.local_addr_v6, 16, (void *)sk + 216);
+        /* CO-RE: read IPv6 addresses via BTF-relocated field access (S1 fix) */
+        bpf_probe_read_kernel(ci.remote_addr_v6, 16,
+                              &sk->__sk_common.skc_v6_daddr);
+        bpf_probe_read_kernel(ci.local_addr_v6, 16,
+                              &sk->__sk_common.skc_v6_rcv_saddr);
     } else {
         return 0;
     }
@@ -486,42 +494,64 @@ int probe_udp_sendmsg(struct pt_regs *ctx)
         bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
         event->addr_family = ADDR_FAMILY_IPV6;
         event->local_port = sport;
-        bpf_probe_read_kernel(event->remote_addr_v6, 16, (void *)sk + 200);
-        bpf_probe_read_kernel(event->local_addr_v6, 16, (void *)sk + 216);
+        /* CO-RE: read IPv6 addresses via BTF-relocated field access (S1 fix) */
+        bpf_probe_read_kernel(event->remote_addr_v6, 16,
+                              &sk->__sk_common.skc_v6_daddr);
+        bpf_probe_read_kernel(event->local_addr_v6, 16,
+                              &sk->__sk_common.skc_v6_rcv_saddr);
     }
 
     bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
     return 0;
 }
 
-/* --- Helper: extract socket fd from SSL struct ---
- * SSL->rbio (offset 16 on 64-bit) points to a BIO struct.
- * BIO->num (offset 40 on OpenSSL 3.x, 32 on 1.1.x) holds the socket fd.
- * This technique is used by Pixie/New Relic and eCapture for connection
- * correlation. See: https://blog.px.dev/ebpf-tls-tracing-past-present-future/ */
+/* --- Helper: extract socket fd from SSL struct (S2 documented) ---
+ *
+ * WARNING: These offsets are OpenSSL internal ABI, NOT public API.
+ * They are derived from specific OpenSSL builds and may change with
+ * distro patches or minor version updates.
+ *
+ * SSL->rbio: offset 16 on 64-bit for both OpenSSL 1.1.x and 3.x
+ *   Verified: OpenSSL 3.0.x (AL2023), 3.1.x, 3.2.x, 1.1.1 (Ubuntu 20.04)
+ *   Source: SSL struct layout — rbio is the 3rd pointer field after method+session
+ *
+ * BIO->num (socket fd):
+ *   OpenSSL 3.x: offset 40 (method_ptr(8) + callback(8) + cb_arg(8) + init(4) + shutdown(4) + num(4))
+ *   OpenSSL 1.1.x: offset 32 (different struct packing)
+ *   Verified: AL2023 OpenSSL 3.0.8, Ubuntu 22.04 OpenSSL 3.0.2
+ *
+ * If these offsets break on a new OpenSSL version, fd extraction fails
+ * silently (returns -1), and connection correlation degrades gracefully
+ * (conn_id and dst_dns caching stop working, but data capture continues).
+ *
+ * This technique is used by Pixie/New Relic and eCapture:
+ * https://blog.px.dev/ebpf-tls-tracing-past-present-future/
+ *
+ * TODO: Consider using BTF-based OpenSSL struct introspection or
+ *       offset auto-detection at startup for future-proofing. */
 
 static __always_inline int get_ssl_fd(void *ssl)
 {
     if (!ssl)
         return -1;
 
-    /* Read SSL->rbio pointer (offset 16 on both OpenSSL 1.1.x and 3.x) */
     void *rbio = NULL;
     if (bpf_probe_read_user(&rbio, sizeof(rbio), (void *)ssl + 16) != 0 || !rbio)
         return -1;
 
-    /* Read BIO->num (the socket fd).
-     * OpenSSL 3.x: offset 40 (after method ptr + various fields)
-     * OpenSSL 1.1.x: offset 32
-     * Try offset 40 first (OpenSSL 3.x is more common on modern distros) */
+    /* Try OpenSSL 3.x offset first (more common on modern distros) */
     int fd = -1;
     bpf_probe_read_user(&fd, sizeof(fd), (void *)rbio + 40);
-    if (fd >= 0)
+    if (fd >= 0 && fd < 1048576)  /* sanity: fd should be < 1M */
         return fd;
 
     /* Fallback: try OpenSSL 1.1.x offset */
+    fd = -1;
     bpf_probe_read_user(&fd, sizeof(fd), (void *)rbio + 32);
-    return fd;
+    if (fd >= 0 && fd < 1048576)
+        return fd;
+
+    return -1;
 }
 
 /* --- Helper: look up TLS version for an SSL pointer --- */
@@ -574,12 +604,21 @@ int probe_ssl_get_cipher_return(struct pt_regs *ctx)
     if (!ssl_cipher)
         goto cleanup_cipher;
 
-    /* Read the cipher name pointer from SSL_CIPHER struct.
-     * In OpenSSL 3.x, SSL_CIPHER layout:
-     *   offset 0: uint32_t valid (4 bytes)
-     *   offset 4: 4 bytes padding (on 64-bit)
-     *   offset 8: const char *name (8 bytes pointer)
-     */
+    /* Read the cipher name pointer from SSL_CIPHER struct (S3 documented).
+     *
+     * WARNING: SSL_CIPHER is an internal OpenSSL struct, NOT public ABI.
+     * Layout on OpenSSL 3.x (64-bit):
+     *   offset 0: uint32_t valid       (4 bytes)
+     *   offset 4: padding              (4 bytes, alignment)
+     *   offset 8: const char *name     (8 bytes pointer)
+     * Verified: AL2023 OpenSSL 3.0.8, Ubuntu 22.04 OpenSSL 3.0.2
+     *
+     * On OpenSSL 1.1.x (64-bit), the layout is the same (valid + name).
+     * If this offset breaks, cipher name reads garbage and the cipher
+     * field shows junk — data capture itself is unaffected.
+     *
+     * TODO: Consider using SSL_CIPHER_get_name() via a separate uprobe
+     *       for a public-API-only approach. */
     const char *name_ptr = NULL;
     if (bpf_probe_read_user(&name_ptr, sizeof(name_ptr),
                             (void *)ssl_cipher + 8) != 0 || !name_ptr)

@@ -14,6 +14,7 @@ Resilience:
   - Exponential backoff on S3 upload failures (up to 5 retries)
   - Graceful shutdown flushes remaining batch
   - Handles log rotation (file shrinks or inode changes)
+  - R10 fix: tracks file inode to detect tee restarts
 """
 
 import os
@@ -25,10 +26,31 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError, BotoCoreError
 
+
+def _parse_int_env(name, default, min_val=1, max_val=None):
+    """S8 fix: parse integer env var with validation and bounds checking."""
+    raw = os.environ.get(name, str(default))
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"[s3-shipper] ERROR: {name}={raw!r} is not a valid integer, "
+              f"using default {default}", file=sys.stderr, flush=True)
+        return default
+    if val < min_val:
+        print(f"[s3-shipper] WARN: {name}={val} below minimum {min_val}, "
+              f"clamping", file=sys.stderr, flush=True)
+        return min_val
+    if max_val is not None and val > max_val:
+        print(f"[s3-shipper] WARN: {name}={val} above maximum {max_val}, "
+              f"clamping", file=sys.stderr, flush=True)
+        return max_val
+    return val
+
+
 BUCKET = os.environ.get("S3_BUCKET", "")
 PREFIX = os.environ.get("S3_PREFIX", "tls-tracer-logs")
-FLUSH_INTERVAL = int(os.environ.get("FLUSH_INTERVAL", "60"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1000"))
+FLUSH_INTERVAL = _parse_int_env("FLUSH_INTERVAL", 60, min_val=1, max_val=3600)
+BATCH_SIZE = _parse_int_env("BATCH_SIZE", 1000, min_val=1, max_val=100000)
 AWS_REGION = os.environ.get("AWS_REGION", "eu-west-1")
 ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID", "unknown")
 CLUSTER = os.environ.get("CLUSTER_NAME", "unknown")
@@ -37,7 +59,7 @@ APP_NAME = os.environ.get("APP_NAME", "unknown")
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "unknown")
 NODE_NAME = os.environ.get("NODE_NAME", "unknown")
 MAX_RETRIES = 5
-MAX_LINE_LEN = 65536  # Skip lines larger than 64KB to prevent memory exhaustion (S6)
+MAX_LINE_LEN = 65536  # Skip lines larger than 64KB to prevent memory exhaustion
 LOG_FILE = "/var/log/tls-tracer/events.json"
 
 running = True
@@ -106,10 +128,11 @@ def flush_batch(s3_client, batch):
 
     log("ERROR", f"Failed to upload after {MAX_RETRIES} attempts, "
         f"writing {len(batch)} records to dead-letter file")
-    # Write failed batch to local dead-letter file to prevent data loss (R10)
+    # S9 fix: use restrictive permissions (0o600) on dead-letter file
     try:
         dlq_path = "/var/log/tls-tracer/dead-letter.json"
-        with open(dlq_path, "a") as dlq:
+        fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as dlq:
             dlq.write(body)
         log("INFO", f"Wrote {len(batch)} records to {dlq_path}")
     except Exception as dlq_err:
@@ -117,20 +140,29 @@ def flush_batch(s3_client, batch):
     return False
 
 
-def tail_file(path, offset):
-    """Read new lines from file starting at offset. Returns (lines, new_offset).
+def tail_file(path, offset, last_inode):
+    """Read new lines from file starting at offset. Returns (lines, new_offset, inode).
 
-    Handles log rotation: if the file is smaller than offset, resets to 0.
+    Handles log rotation: if file inode changes or file shrinks, resets offset.
+    R10 fix: track inode to detect tee restarts (new file = new inode).
     """
     lines = []
     try:
-        size = os.path.getsize(path)
+        stat = os.stat(path)
+        current_inode = stat.st_ino
+        size = stat.st_size
+
+        # R10: inode changed means tee restarted and created a new file
+        if last_inode is not None and current_inode != last_inode:
+            log("INFO", "Log file inode changed (tee restart), resetting offset")
+            offset = 0
+
         if size < offset:
-            log("INFO", "Log file rotated, resetting offset")
+            log("INFO", "Log file rotated/truncated, resetting offset")
             offset = 0
 
         if size == offset:
-            return lines, offset
+            return lines, offset, current_inode
 
         with open(path, "r") as f:
             f.seek(offset)
@@ -142,12 +174,12 @@ def tail_file(path, offset):
                         continue
                     lines.append(stripped)
             new_offset = f.tell()
-            return lines, new_offset
+            return lines, new_offset, current_inode
     except FileNotFoundError:
-        return lines, 0
+        return lines, 0, None
     except Exception as e:
         log("WARN", f"Read error: {e}")
-        return lines, offset
+        return lines, offset, last_inode
 
 
 def main():
@@ -159,11 +191,12 @@ def main():
     batch = []
     last_flush = time.time()
     offset = 0
+    last_inode = None
 
     log("INFO", f"Tailing {LOG_FILE}, shipping to s3://{BUCKET}/{PREFIX}/...")
 
     while running:
-        new_lines, offset = tail_file(LOG_FILE, offset)
+        new_lines, offset, last_inode = tail_file(LOG_FILE, offset, last_inode)
         batch.extend(new_lines)
 
         now = time.time()

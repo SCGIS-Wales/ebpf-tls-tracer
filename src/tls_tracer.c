@@ -1528,8 +1528,9 @@ int main(int argc, char **argv)
         switch (opt) {
         case 'p': {
             char *endp;
+            errno = 0;  /* C7 fix: reset errno before strtoul for overflow detection */
             unsigned long val = strtoul(optarg, &endp, 10);
-            if (*endp != '\0' || val == 0 || val > UINT_MAX) {
+            if (*endp != '\0' || val == 0 || val > UINT_MAX || errno == ERANGE) {
                 fprintf(stderr, "Error: Invalid PID '%s'\n", optarg);
                 return 1;
             }
@@ -1538,8 +1539,9 @@ int main(int argc, char **argv)
         }
         case 'u': {
             char *endp;
+            errno = 0;  /* C7 fix */
             unsigned long val = strtoul(optarg, &endp, 10);
-            if (*endp != '\0' || val > UINT_MAX) {
+            if (*endp != '\0' || val > UINT_MAX || errno == ERANGE) {
                 fprintf(stderr, "Error: Invalid UID '%s'\n", optarg);
                 return 1;
             }
@@ -1605,19 +1607,46 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "Using SSL library: %s\n", cfg.ssl_lib);
 
-    /* Set up signal handlers */
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
+    /* Set up signal handlers (R6 fix: use sigaction for reliable signal handling).
+     * signal() has undefined behavior on some systems — the handler may be reset
+     * to SIG_DFL after first invocation. sigaction() is POSIX-recommended. */
+    struct sigaction sa = {0};
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* No SA_RESTART: we want poll() to return -EINTR */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
-    /* Open and load BPF object.
-     * Search order: installed path first, then CWD fallback for development.
-     * Using an absolute path prevents loading a malicious .o from CWD (S5 fix). */
+    /* R7 fix: ignore SIGPIPE so stdout writes don't kill the process
+     * when piped through tee or when the reader closes the pipe. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Open and load BPF object (S5 fix: no CWD fallback).
+     * Search trusted system paths first, then the directory containing
+     * the executable itself (safe: attacker can't control /proc/self/exe).
+     * CWD is NOT searched to prevent loading a malicious bpf_program.o
+     * placed in an attacker-controlled directory. */
     const char *bpf_obj_paths[] = {
         "/usr/local/lib/tls_tracer/bpf_program.o",
         "/opt/tls_tracer/bpf_program.o",
-        "bpf_program.o",
         NULL,
     };
+    /* Also try the directory of the executable itself (for development) */
+    char exe_dir_bpf[PATH_MAX + 16] = {0};
+    {
+        char exe_path[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (len > 0 && len < (ssize_t)(sizeof(exe_path) - 16)) {
+            exe_path[len] = '\0';
+            /* Strip executable name, keep directory */
+            char *slash = strrchr(exe_path, '/');
+            if (slash) {
+                *slash = '\0';
+                snprintf(exe_dir_bpf, sizeof(exe_dir_bpf),
+                         "%s/bpf_program.o", exe_path);
+            }
+        }
+    }
     const char *bpf_obj_path = NULL;
     for (int i = 0; bpf_obj_paths[i]; i++) {
         if (access(bpf_obj_paths[i], R_OK) == 0) {
@@ -1625,6 +1654,9 @@ int main(int argc, char **argv)
             break;
         }
     }
+    /* Fallback: check next to the executable (e.g., bin/bpf_program.o) */
+    if (!bpf_obj_path && exe_dir_bpf[0] && access(exe_dir_bpf, R_OK) == 0)
+        bpf_obj_path = exe_dir_bpf;
     if (!bpf_obj_path) {
         fprintf(stderr, "Error: Cannot find bpf_program.o in any search path\n");
         return 1;
@@ -1772,15 +1804,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "... Press Ctrl+C to stop.\n");
     }
 
-    /* Touch health file to signal readiness */
-    /* Use a dedicated path for health file to prevent spoofing via /tmp (S4 fix).
-     * Falls back to /tmp if the directory doesn't exist (e.g., local dev). */
+    /* Touch health file to signal readiness (S4 fix: no /tmp fallback).
+     * /var/run/tls-tracer is provided via emptyDir in K8s or must be
+     * pre-created for local dev. Falling back to /tmp would allow a local
+     * attacker to create a symlink and trick root into overwriting files. */
     const char *health_file = "/var/run/tls-tracer/healthy";
     if (access("/var/run/tls-tracer", F_OK) != 0) {
-        if (mkdir("/var/run/tls-tracer", 0755) != 0)
-            health_file = "/tmp/tls_tracer_healthy";  /* fallback */
+        if (mkdir("/var/run/tls-tracer", 0755) != 0) {
+            fprintf(stderr, "Warning: Cannot create /var/run/tls-tracer: %s "
+                    "(health file disabled)\n", strerror(errno));
+            health_file = NULL;  /* disable health file rather than fall back to /tmp */
+        }
     }
-    FILE *hf = fopen(health_file, "w");
+    FILE *hf = health_file ? fopen(health_file, "w") : NULL;
     if (hf) {
         fprintf(hf, "ready\n");
         fclose(hf);
@@ -1798,7 +1834,7 @@ int main(int argc, char **argv)
         }
 
         /* Update health file every ~10 seconds (100ms poll * 100) */
-        if (++poll_count >= 100) {
+        if (health_file && ++poll_count >= 100) {
             poll_count = 0;
             hf = fopen(health_file, "w");
             if (hf) {
@@ -1809,7 +1845,8 @@ int main(int argc, char **argv)
     }
 
     /* Remove health file on shutdown */
-    unlink(health_file);
+    if (health_file)
+        unlink(health_file);
 
     if (cfg.verbose)
         fprintf(stderr, "\nExiting...\n");
