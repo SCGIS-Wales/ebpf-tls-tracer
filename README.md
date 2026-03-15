@@ -19,7 +19,7 @@ Each captured event includes the **remote IP address** (IPv4 or IPv6) and **port
 
 **Option 1 — Pre-built binary** (x86_64 Linux):
 
-Download from [GitHub Releases](https://github.com/SCGIS-Wales/ebpf_tls_cli/releases), then:
+Download from [GitHub Releases](https://github.com/SCGIS-Wales/ebpf-tls-tracer/releases), then:
 
 ```bash
 tar xzf tls_tracer-linux-x86_64.tar.gz
@@ -29,8 +29,8 @@ sudo ./tls_tracer -v
 **Option 2 — Docker** (any Linux with kernel 5.5+):
 
 ```bash
-docker pull ghcr.io/scgis-wales/ebpf_tls_cli:latest
-sudo docker run --rm --privileged --pid=host ghcr.io/scgis-wales/ebpf_tls_cli:latest -v
+docker pull ghcr.io/scgis-wales/ebpf-tls-tracer:latest
+sudo docker run --rm --privileged --pid=host ghcr.io/scgis-wales/ebpf-tls-tracer:latest -v
 ```
 
 **Option 3 — Build from source** (see [Building from Source](#building-from-source) below).
@@ -171,7 +171,7 @@ The container image is published to GitHub Container Registry on every push to `
 
 ```bash
 # Pull from GHCR
-docker pull ghcr.io/scgis-wales/ebpf_tls_cli:latest
+docker pull ghcr.io/scgis-wales/ebpf-tls-tracer:latest
 
 # Or build locally
 docker build -t tls_tracer .
@@ -182,7 +182,7 @@ docker run --rm --privileged \
   -v /sys/kernel/tracing:/sys/kernel/tracing:ro \
   -v /sys/fs/bpf:/sys/fs/bpf \
   --pid=host \
-  ghcr.io/scgis-wales/ebpf_tls_cli:latest -v -f json
+  ghcr.io/scgis-wales/ebpf-tls-tracer:latest -v -f json
 ```
 
 ## Amazon Linux 2023 (AL2023)
@@ -198,8 +198,8 @@ sudo dnf install -y \
   kernel-devel-$(uname -r) kernel-headers-$(uname -r) \
   openssl-devel bpftool
 
-git clone https://github.com/SCGIS-Wales/ebpf_tls_cli.git
-cd ebpf_tls_cli
+git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
+cd ebpf-tls-tracer
 make && make test
 sudo ./bin/tls_tracer -v
 ```
@@ -221,8 +221,8 @@ dnf install -y \
 
 # Clone and build
 cd /opt
-git clone https://github.com/SCGIS-Wales/ebpf_tls_cli.git
-cd ebpf_tls_cli
+git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
+cd ebpf-tls-tracer
 make && make test
 make install
 
@@ -328,7 +328,7 @@ kubectl -n tls-tracer logs -l app.kubernetes.io/name=tls-tracer --tail=50 -f
 | `metadata.targetNamespace` | `""` | K8s namespace being monitored |
 | `metadata.applicationName` | `""` | Application name (e.g., `apigee`) |
 | `metadata.environment` | `""` | Environment label (e.g., `production`) |
-| `image.repository` | `ghcr.io/scgis-wales/ebpf_tls_cli` | Container image |
+| `image.repository` | `ghcr.io/scgis-wales/ebpf-tls-tracer` | Container image |
 | `image.tag` | `latest` | Image tag |
 
 #### AWS S3 Log Shipping
@@ -553,7 +553,7 @@ This captures the actual IP address the connection was established to — resolv
 ## Project Structure
 
 ```
-ebpf_tls_cli/
+ebpf-tls-tracer/
 ├── include/
 │   └── tracer.h              # Shared data structures (kernel + user space)
 ├── src/

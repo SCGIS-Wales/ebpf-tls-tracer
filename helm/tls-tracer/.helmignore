@@ -1,0 +1,9 @@
+# L4 fix: prevent stray files from being included in helm package
+.git
+.gitignore
+.DS_Store
+*.swp
+*.swo
+*~
+__pycache__
+*.pyc
