@@ -17,6 +17,7 @@ spec:
       labels:
         app: tls-tracer
     spec:
+      serviceAccountName: tls-tracer
       hostPID: true
       hostNetwork: true
       containers:

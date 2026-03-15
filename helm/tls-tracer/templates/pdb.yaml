@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "tls-tracer.selectorLabels" . | nindent 6 }}
