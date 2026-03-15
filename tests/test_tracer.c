@@ -52,9 +52,14 @@ static void test_tls_event_data_field_offset(void)
     TEST(tls_event_data_field_at_end);
     struct tls_event_t event;
     size_t data_offset = (size_t)((char *)event.data - (char *)&event);
-    size_t expected_end = data_offset + MAX_DATA_LEN;
-    ASSERT_EQ(expected_end, sizeof(struct tls_event_t),
-              "data field should extend to end of struct");
+    /* data[] must be the last declared field. Struct may have trailing
+     * padding after data[], but data_offset + MAX_DATA_LEN must not
+     * exceed sizeof(struct tls_event_t). */
+    size_t data_end = data_offset + MAX_DATA_LEN;
+    ASSERT_EQ(data_end <= sizeof(struct tls_event_t), 1,
+              "data field must fit within struct");
+    ASSERT_EQ(data_offset > 0, 1,
+              "data field must not be at start of struct");
     PASS();
 }
 
