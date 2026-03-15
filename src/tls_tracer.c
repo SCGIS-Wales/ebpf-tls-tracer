@@ -3,7 +3,8 @@
 // tls_tracer - eBPF-based TLS traffic interceptor
 //
 // Attaches uprobes to OpenSSL's SSL_read/SSL_write to capture
-// plaintext data flowing through TLS connections.
+// plaintext data flowing through TLS connections, along with
+// the remote IP address and port of each connection.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,14 +15,14 @@
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
+#include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "tracer.h"
 
-#define DEFAULT_SSL_LIB    "/usr/lib/x86_64-linux-gnu/libssl.so.3"
-#define ALT_SSL_LIB        "/usr/lib/x86_64-linux-gnu/libssl.so.1.1"
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
+#define MAX_PROBES         8
 
 static volatile sig_atomic_t exiting = 0;
 
@@ -54,6 +55,7 @@ static struct config cfg = {
 
 static void sig_handler(int signo)
 {
+    (void)signo;
     exiting = 1;
 }
 
@@ -62,16 +64,33 @@ static const char *direction_str(int dir)
     return dir == DIRECTION_READ ? "READ" : "WRITE";
 }
 
+static void format_addr(const struct tls_event_t *event, char *buf, size_t buflen)
+{
+    if (event->addr_family == ADDR_FAMILY_IPV4 && event->remote_addr_v4 != 0) {
+        struct in_addr addr = { .s_addr = event->remote_addr_v4 };
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr, ip, sizeof(ip));
+        snprintf(buf, buflen, "%s:%u", ip, event->remote_port);
+    } else if (event->addr_family == ADDR_FAMILY_IPV6) {
+        char ip[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, event->remote_addr_v6, ip, sizeof(ip));
+        snprintf(buf, buflen, "[%s]:%u", ip, event->remote_port);
+    } else {
+        snprintf(buf, buflen, "-");
+    }
+}
+
 static void print_hex_dump(const char *data, __u32 len)
 {
     for (__u32 i = 0; i < len; i += 16) {
         printf("  %04x: ", i);
-        for (__u32 j = 0; j < 16 && (i + j) < len; j++)
+        __u32 remaining = (len - i < 16) ? len - i : 16;
+        for (__u32 j = 0; j < remaining; j++)
             printf("%02x ", (unsigned char)data[i + j]);
-        for (__u32 j = len - i; j < 16 && (i + len - i) < len + 16; j++)
+        for (__u32 j = remaining; j < 16; j++)
             printf("   ");
         printf(" ");
-        for (__u32 j = 0; j < 16 && (i + j) < len; j++) {
+        for (__u32 j = 0; j < remaining; j++) {
             char c = data[i + j];
             printf("%c", isprint((unsigned char)c) ? c : '.');
         }
@@ -106,13 +125,18 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
     if (data_len > MAX_DATA_LEN)
         data_len = MAX_DATA_LEN;
 
+    char addr_buf[128];
+    format_addr(event, addr_buf, sizeof(addr_buf));
+
     if (c->format == FMT_JSON) {
         printf("{\"timestamp_ns\":%llu,\"pid\":%u,\"tid\":%u,\"uid\":%u,"
-               "\"comm\":\"%.*s\",\"direction\":\"%s\",\"data_len\":%u",
+               "\"comm\":\"%.*s\",\"direction\":\"%s\","
+               "\"remote_addr\":\"%s\",\"data_len\":%u",
                (unsigned long long)event->timestamp_ns,
                event->pid, event->tid, event->uid,
                MAX_COMM_LEN, event->comm,
                direction_str(event->direction),
+               addr_buf,
                data_len);
 
         if (!c->data_only) {
@@ -130,11 +154,12 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
             char timebuf[64];
             strftime(timebuf, sizeof(timebuf), "%H:%M:%S", tm);
 
-            printf("%-12s %-6s PID=%-6u TID=%-6u UID=%-4u COMM=%-15.*s LEN=%u\n",
+            printf("%-12s %-6s PID=%-6u TID=%-6u UID=%-4u COMM=%-15.*s ADDR=%-21s LEN=%u\n",
                    timebuf,
                    direction_str(event->direction),
                    event->pid, event->tid, event->uid,
                    MAX_COMM_LEN, event->comm,
+                   addr_buf,
                    data_len);
         }
 
@@ -154,22 +179,25 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
 
 static void handle_lost_events(void *ctx, int cpu, __u64 cnt)
 {
+    (void)ctx;
     fprintf(stderr, "WARNING: Lost %llu events on CPU %d\n",
             (unsigned long long)cnt, cpu);
 }
 
 static int find_ssl_library(char *path, size_t path_len)
 {
-    /* Check common OpenSSL library locations */
     const char *candidates[] = {
+        /* Debian/Ubuntu */
         "/usr/lib/x86_64-linux-gnu/libssl.so.3",
         "/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
+        /* RHEL/AL2023/Fedora */
         "/usr/lib64/libssl.so.3",
         "/usr/lib64/libssl.so.1.1",
+        /* Generic */
         "/usr/lib/libssl.so.3",
         "/usr/lib/libssl.so.1.1",
         "/lib/x86_64-linux-gnu/libssl.so.3",
-        "/lib/x86_64-linux-gnu/libssl.so.1.1",
+        "/lib64/libssl.so.3",
         NULL,
     };
 
@@ -188,7 +216,8 @@ static void usage(const char *prog)
         "Usage: %s [OPTIONS]\n"
         "\n"
         "eBPF-based TLS traffic interceptor. Captures plaintext data\n"
-        "from SSL_read/SSL_write calls in OpenSSL.\n"
+        "from SSL_read/SSL_write calls in OpenSSL, along with the\n"
+        "remote IP address and port of each connection.\n"
         "\n"
         "Options:\n"
         "  -p, --pid PID          Filter by process ID\n"
@@ -214,7 +243,7 @@ int main(int argc, char **argv)
 {
     struct bpf_object *obj = NULL;
     struct bpf_program *prog;
-    struct bpf_link *links[4] = {};
+    struct bpf_link *links[MAX_PROBES] = {};
     struct perf_buffer *pb = NULL;
     int err = 0;
     int link_count = 0;
@@ -301,7 +330,7 @@ int main(int argc, char **argv)
 
     /* Open and load BPF object */
     obj = bpf_object__open_file("bpf_program.o", NULL);
-    if (!obj || libbpf_get_error(obj)) {
+    if (!obj) {
         fprintf(stderr, "Error: Failed to open BPF object file: %s\n",
                 strerror(errno));
         return 1;
@@ -317,8 +346,36 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "BPF object loaded successfully.\n");
 
+    /* Attach kprobes for connection tracking (connect syscall) */
+    const char *kprobe_names[] = {
+        "probe_connect_enter",
+        "probe_connect_return",
+    };
+
+    for (int i = 0; i < 2; i++) {
+        prog = bpf_object__find_program_by_name(obj, kprobe_names[i]);
+        if (!prog) {
+            if (cfg.verbose)
+                fprintf(stderr, "Note: kprobe '%s' not found, IP tracking may be limited.\n",
+                        kprobe_names[i]);
+            continue;
+        }
+
+        links[link_count] = bpf_program__attach(prog);
+        if (!links[link_count] || libbpf_get_error(links[link_count])) {
+            links[link_count] = NULL;
+            if (cfg.verbose)
+                fprintf(stderr, "Warning: Could not attach kprobe '%s': IP tracking may be limited.\n",
+                        kprobe_names[i]);
+            continue;
+        }
+        link_count++;
+        if (cfg.verbose)
+            fprintf(stderr, "Attached kprobe: %s\n", kprobe_names[i]);
+    }
+
     /* Attach uprobes to SSL functions */
-    const char *probe_names[] = {
+    const char *uprobe_names[] = {
         "probe_ssl_read_enter",
         "probe_ssl_read_return",
         "probe_ssl_write_enter",
@@ -332,24 +389,25 @@ int main(int argc, char **argv)
         "SSL_write",
     };
 
+    int uprobe_count = 0;
     for (int i = 0; i < 4; i++) {
-        prog = bpf_object__find_program_by_name(obj, probe_names[i]);
+        prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
         if (!prog) {
             fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
-                    probe_names[i]);
+                    uprobe_names[i]);
             err = 1;
             goto cleanup;
         }
 
-        DECLARE_LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
+        LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
             .retprobe = is_retprobe[i],
+            .func_name = func_names[i],
         );
 
         links[link_count] = bpf_program__attach_uprobe_opts(
             prog, -1, cfg.ssl_lib, 0, &uprobe_opts);
 
         if (!links[link_count] || libbpf_get_error(links[link_count])) {
-            /* Try resolving by function name using bpf_program__attach_uprobe */
             links[link_count] = NULL;
             fprintf(stderr, "Warning: Could not attach uprobe for %s (%s). "
                     "Ensure libssl has debug symbols or is not stripped.\n",
@@ -357,17 +415,18 @@ int main(int argc, char **argv)
             continue;
         }
         link_count++;
+        uprobe_count++;
     }
 
-    if (link_count == 0) {
-        fprintf(stderr, "Error: Could not attach any probes. "
-                "Check that the SSL library path is correct.\n");
+    if (uprobe_count == 0) {
+        fprintf(stderr, "Error: Could not attach any SSL probes. "
+                "Check that the SSL library path is correct and has symbols.\n");
         err = 1;
         goto cleanup;
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d probes.\n", link_count, 4);
+        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 4);
 
     /* Set up perf buffer */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");
@@ -377,13 +436,9 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    struct perf_buffer_opts pb_opts = {
-        .sz = sizeof(pb_opts),
-    };
-
     pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES, handle_event,
                           handle_lost_events, &cfg, NULL);
-    if (!pb || libbpf_get_error(pb)) {
+    if (!pb) {
         fprintf(stderr, "Error: Failed to create perf buffer: %s\n",
                 strerror(errno));
         err = 1;
