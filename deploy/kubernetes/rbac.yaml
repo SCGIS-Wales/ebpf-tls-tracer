@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tls-tracer
+  namespace: tls-tracer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tls-tracer
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tls-tracer
+subjects:
+  - kind: ServiceAccount
+    name: tls-tracer
+    namespace: tls-tracer
+roleRef:
+  kind: ClusterRole
+  name: tls-tracer
+  apiGroup: rbac.authorization.k8s.io

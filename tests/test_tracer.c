@@ -43,7 +43,6 @@ static int tests_passed = 0;
 static void test_tls_event_struct_size(void)
 {
     TEST(tls_event_struct_size);
-    /* Struct must be large enough to hold all fields + MAX_DATA_LEN data */
     assert(sizeof(struct tls_event_t) >= MAX_DATA_LEN);
     PASS();
 }
@@ -51,7 +50,6 @@ static void test_tls_event_struct_size(void)
 static void test_tls_event_data_field_offset(void)
 {
     TEST(tls_event_data_field_at_end);
-    /* data[] should be the last field so perf events can truncate */
     struct tls_event_t event;
     size_t data_offset = (size_t)((char *)event.data - (char *)&event);
     size_t expected_end = data_offset + MAX_DATA_LEN;
@@ -75,6 +73,15 @@ static void test_event_type_constants(void)
     TEST(event_type_constants);
     ASSERT_EQ(EVENT_TLS_DATA, 1, "EVENT_TLS_DATA should be 1");
     ASSERT_EQ(EVENT_TLS_HANDSHAKE, 2, "EVENT_TLS_HANDSHAKE should be 2");
+    ASSERT_EQ(EVENT_CONNECT, 3, "EVENT_CONNECT should be 3");
+    PASS();
+}
+
+static void test_addr_family_constants(void)
+{
+    TEST(addr_family_constants);
+    ASSERT_EQ(ADDR_FAMILY_IPV4, 2, "ADDR_FAMILY_IPV4 should be 2 (AF_INET)");
+    ASSERT_EQ(ADDR_FAMILY_IPV6, 10, "ADDR_FAMILY_IPV6 should be 10 (AF_INET6)");
     PASS();
 }
 
@@ -104,6 +111,10 @@ static void test_zero_init(void)
     ASSERT_EQ(event.tls_version, 0, "tls_version should be 0");
     ASSERT_EQ(event.direction, 0, "direction should be 0 (READ)");
     ASSERT_EQ(event.event_type, 0, "event_type should be 0");
+    ASSERT_EQ(event.addr_family, 0, "addr_family should be 0");
+    ASSERT_EQ(event.remote_port, 0, "remote_port should be 0");
+    ASSERT_EQ(event.local_port, 0, "local_port should be 0");
+    ASSERT_EQ(event.remote_addr_v4, 0, "remote_addr_v4 should be 0");
     ASSERT_EQ(event.comm[0], '\0', "comm should be empty");
     ASSERT_EQ(event.data[0], '\0', "data should be empty");
     PASS();
@@ -121,6 +132,9 @@ static void test_field_assignment(void)
     event.data_len = 5;
     event.direction = DIRECTION_WRITE;
     event.event_type = EVENT_TLS_DATA;
+    event.addr_family = ADDR_FAMILY_IPV4;
+    event.remote_addr_v4 = 0x0100007f;  /* 127.0.0.1 in network byte order */
+    event.remote_port = 443;
     strncpy(event.comm, "test_proc", MAX_COMM_LEN);
     memcpy(event.data, "hello", 5);
 
@@ -131,8 +145,59 @@ static void test_field_assignment(void)
     ASSERT_EQ(event.data_len, 5U, "data_len");
     ASSERT_EQ(event.direction, DIRECTION_WRITE, "direction");
     ASSERT_EQ(event.event_type, EVENT_TLS_DATA, "event_type");
+    ASSERT_EQ(event.addr_family, ADDR_FAMILY_IPV4, "addr_family");
+    ASSERT_EQ(event.remote_addr_v4, 0x0100007fU, "remote_addr_v4");
+    ASSERT_EQ(event.remote_port, 443, "remote_port");
     ASSERT_STR_EQ(event.comm, "test_proc", "comm");
     ASSERT_EQ(memcmp(event.data, "hello", 5), 0, "data content");
+    PASS();
+}
+
+/* --- Test: IP address fields --- */
+
+static void test_ipv6_address(void)
+{
+    TEST(ipv6_address_storage);
+    struct tls_event_t event = {};
+    event.addr_family = ADDR_FAMILY_IPV6;
+    /* ::1 (loopback) */
+    memset(event.remote_addr_v6, 0, 16);
+    event.remote_addr_v6[15] = 1;
+    event.remote_port = 8443;
+
+    ASSERT_EQ(event.addr_family, ADDR_FAMILY_IPV6, "addr_family");
+    ASSERT_EQ(event.remote_addr_v6[15], 1, "last byte of ::1");
+    ASSERT_EQ(event.remote_addr_v6[0], 0, "first byte of ::1");
+    ASSERT_EQ(event.remote_port, 8443, "port");
+    PASS();
+}
+
+static void test_conn_info_struct(void)
+{
+    TEST(conn_info_struct);
+    struct conn_info_t ci = {};
+    ci.addr_family = ADDR_FAMILY_IPV4;
+    ci.remote_addr_v4 = 0x08080808;  /* 8.8.8.8 */
+    ci.remote_port = 443;
+    ci.local_port = 54321;
+
+    ASSERT_EQ(ci.addr_family, ADDR_FAMILY_IPV4, "addr_family");
+    ASSERT_EQ(ci.remote_addr_v4, 0x08080808U, "remote_addr");
+    ASSERT_EQ(ci.remote_port, 443, "remote_port");
+    ASSERT_EQ(ci.local_port, 54321, "local_port");
+    PASS();
+}
+
+static void test_conn_key_struct(void)
+{
+    TEST(conn_key_struct);
+    struct conn_key_t key = {};
+    key.pid = 1234;
+    key.fd = 5;
+
+    ASSERT_EQ(key.pid, 1234U, "pid");
+    ASSERT_EQ(key.fd, 5U, "fd");
+    ASSERT_EQ(sizeof(struct conn_key_t), 8, "conn_key_t should be 8 bytes");
     PASS();
 }
 
@@ -167,10 +232,35 @@ static void test_comm_max_length(void)
 static void test_max_data_len_power_of_2(void)
 {
     TEST(max_data_len_is_power_of_2);
-    /* BPF programs use (len & (MAX_DATA_LEN - 1)) for bounds checking.
-     * This only works correctly if MAX_DATA_LEN is a power of 2. */
     int is_power_of_2 = (MAX_DATA_LEN > 0) && ((MAX_DATA_LEN & (MAX_DATA_LEN - 1)) == 0);
     ASSERT_EQ(is_power_of_2, 1, "MAX_DATA_LEN must be a power of 2 for BPF masking");
+    PASS();
+}
+
+/* --- Test: union overlap correctness --- */
+
+static void test_addr_union_overlap(void)
+{
+    TEST(addr_union_ipv4_ipv6_overlap);
+    struct tls_event_t event = {};
+
+    /* Set IPv4 address */
+    event.remote_addr_v4 = 0xAABBCCDD;
+    /* Verify it shows up at the start of the v6 array (same memory) */
+    ASSERT_EQ(event.remote_addr_v6[0] != 0 || event.remote_addr_v6[1] != 0 ||
+              event.remote_addr_v6[2] != 0 || event.remote_addr_v6[3] != 0,
+              1, "v4 and v6 should share memory via union");
+    PASS();
+}
+
+static void test_conn_info_union_overlap(void)
+{
+    TEST(conn_info_union_overlap);
+    struct conn_info_t ci = {};
+    ci.remote_addr_v4 = 0x12345678;
+    ASSERT_EQ(ci.remote_addr_v6[0] != 0 || ci.remote_addr_v6[1] != 0 ||
+              ci.remote_addr_v6[2] != 0 || ci.remote_addr_v6[3] != 0,
+              1, "conn_info v4 and v6 should share memory");
     PASS();
 }
 
@@ -182,12 +272,18 @@ int main(void)
     test_tls_event_data_field_offset();
     test_direction_constants();
     test_event_type_constants();
+    test_addr_family_constants();
     test_max_constants();
     test_zero_init();
     test_field_assignment();
+    test_ipv6_address();
+    test_conn_info_struct();
+    test_conn_key_struct();
     test_max_data_fill();
     test_comm_max_length();
     test_max_data_len_power_of_2();
+    test_addr_union_overlap();
+    test_conn_info_union_overlap();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
 

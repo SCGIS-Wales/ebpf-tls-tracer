@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tls-tracer
+  namespace: tls-tracer
+  labels:
+    app: tls-tracer
+spec:
+  selector:
+    matchLabels:
+      app: tls-tracer
+  template:
+    metadata:
+      labels:
+        app: tls-tracer
+    spec:
+      hostPID: true
+      hostNetwork: true
+      containers:
+        - name: tls-tracer
+          image: ghcr.io/scgis-wales/ebpf_tls_cli:latest
+          args: ["-f", "json", "-v"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: sys-kernel-debug
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            - name: sys-kernel-tracing
+              mountPath: /sys/kernel/tracing
+              readOnly: true
+            - name: sys-fs-bpf
+              mountPath: /sys/fs/bpf
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: usr-src
+              mountPath: /usr/src
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      tolerations:
+        - operator: Exists
+      volumes:
+        - name: sys-kernel-debug
+          hostPath:
+            path: /sys/kernel/debug
+        - name: sys-kernel-tracing
+          hostPath:
+            path: /sys/kernel/tracing
+        - name: sys-fs-bpf
+          hostPath:
+            path: /sys/fs/bpf
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: usr-src
+          hostPath:
+            path: /usr/src
