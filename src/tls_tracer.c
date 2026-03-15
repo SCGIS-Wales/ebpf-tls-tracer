@@ -1040,8 +1040,10 @@ static int handle_event(void *ctx, void *data, size_t size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
-            if (c->host_ip[0])
-                printf(",\"host_ip\":\"%s\"", c->host_ip);
+            if (c->host_ip[0]) {
+                printf(",\"host_ip\":");
+                print_json_string(c->host_ip);
+            }
             printf(",\"event_type\":\"tcp_error\","
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"error_code\":%d,\"error\":\"%s\"}\n",
@@ -1067,8 +1069,10 @@ static int handle_event(void *ctx, void *data, size_t size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
-            if (c->host_ip[0])
-                printf(",\"host_ip\":\"%s\"", c->host_ip);
+            if (c->host_ip[0]) {
+                printf(",\"host_ip\":");
+                print_json_string(c->host_ip);
+            }
             printf(",\"event_type\":\"tls_close\","
                    "\"direction\":\"%s\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
@@ -1110,8 +1114,10 @@ static int handle_event(void *ctx, void *data, size_t size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
-            if (c->host_ip[0])
-                printf(",\"host_ip\":\"%s\"", c->host_ip);
+            if (c->host_ip[0]) {
+                printf(",\"host_ip\":");
+                print_json_string(c->host_ip);
+            }
             printf(",\"event_type\":\"tls_error\","
                    "\"direction\":\"%s\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
@@ -1140,8 +1146,10 @@ static int handle_event(void *ctx, void *data, size_t size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
-            if (c->host_ip[0])
-                printf(",\"host_ip\":\"%s\"", c->host_ip);
+            if (c->host_ip[0]) {
+                printf(",\"host_ip\":");
+                print_json_string(c->host_ip);
+            }
             printf(",\"event_type\":\"quic_detected\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -1177,8 +1185,10 @@ static int handle_event(void *ctx, void *data, size_t size)
                (unsigned long long)event->timestamp_ns,
                event->pid, event->tid, event->uid);
         print_json_string_n(event->comm, MAX_COMM_LEN);
-        if (c->host_ip[0])
-            printf(",\"host_ip\":\"%s\"", c->host_ip);
+        if (c->host_ip[0]) {
+            printf(",\"host_ip\":");
+            print_json_string(c->host_ip);
+        }
         printf(",\"direction\":\"%s\","
                "\"src_ip\":\"%s\",\"src_port\":%u,"
                "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -1411,8 +1421,10 @@ static int handle_event(void *ctx, void *data, size_t size)
         /* HTTP version: from request line or inferred from HTTP/2 detection */
         if (is_http2)
             printf(",\"http_version\":\"2\"");
-        else if (http.version[0])
-            printf(",\"http_version\":\"%s\"", http.version);
+        else if (http.version[0]) {
+            printf(",\"http_version\":");
+            print_json_string(http.version);
+        }
 
         /* #6 fix: HTTP response status code */
         if (http.status_code > 0)
@@ -2139,7 +2151,7 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Ring buffer: 256 KB\n");
+        fprintf(stderr, "Ring buffer: 4 MB\n");
 
     /* Print startup banner */
     if (!cfg.data_only && cfg.format == FMT_TEXT) {
@@ -2211,6 +2223,10 @@ cleanup:
     }
     if (obj)
         bpf_object__close(obj);
+
+    /* Free compiled regex patterns to avoid resource leaks */
+    for (int i = 0; i < cfg.sanitize_count; i++)
+        regfree(&cfg.sanitize[i].regex);
 
     /* #2 fix: POSIX convention — exit with 128+signum on signal termination */
     if (exit_signal)
