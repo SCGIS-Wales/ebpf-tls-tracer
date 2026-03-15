@@ -107,7 +107,8 @@ static void print_printable(const char *data, __u32 len)
     }
 }
 
-static void handle_event(void *ctx, int cpu, void *data, __u32 size)
+static void handle_event(void *ctx, int cpu __attribute__((unused)),
+                         void *data, __u32 size)
 {
     struct tls_event_t *event = data;
     struct config *c = ctx;
@@ -177,11 +178,10 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
     fflush(stdout);
 }
 
-static void handle_lost_events(void *ctx, int cpu, __u64 cnt)
+static void handle_lost_events(void *ctx, int cpu, unsigned long long cnt)
 {
     (void)ctx;
-    fprintf(stderr, "WARNING: Lost %llu events on CPU %d\n",
-            (unsigned long long)cnt, cpu);
+    fprintf(stderr, "WARNING: Lost %llu events on CPU %d\n", cnt, cpu);
 }
 
 static int find_ssl_library(char *path, size_t path_len)
@@ -243,7 +243,7 @@ int main(int argc, char **argv)
 {
     struct bpf_object *obj = NULL;
     struct bpf_program *prog;
-    struct bpf_link *links[MAX_PROBES] = {};
+    struct bpf_link *links[MAX_PROBES] = {0};
     struct perf_buffer *pb = NULL;
     int err = 0;
     int link_count = 0;

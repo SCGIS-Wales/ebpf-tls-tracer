@@ -24,7 +24,7 @@ BPF_CFLAGS := -O2 -g -target bpf \
               -Wall -Werror
 
 # User-space compilation flags
-CFLAGS     := -O2 -g -Wall -Wextra -Wpedantic \
+CFLAGS     := -O2 -g -Wall -Wextra -Werror \
               -I$(INCLUDE_DIR)
 LDFLAGS    := -lbpf -lelf -lz
 
