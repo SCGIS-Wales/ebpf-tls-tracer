@@ -1,3 +1,17 @@
+# Quick-start manifest for deploying tls-tracer WITHOUT Helm.
+#
+# Use this for:
+#   - Quick evaluation on kind/minikube/k3s clusters
+#   - CI/CD pipelines that don't have Helm installed
+#   - Environments where Helm is not permitted
+#
+# For production deployments, use the Helm chart instead:
+#   helm install tls-tracer ./helm/tls-tracer -n tls-tracer --create-namespace
+#
+# The Helm chart provides: S3/Kinesis log shipping, IRSA integration,
+# configurable sanitization patterns, PodDisruptionBudget, and templated
+# resource names with company prefix support.
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
