@@ -3,14 +3,15 @@
 {{- end }}
 
 {{- define "tls-tracer.fullname" -}}
+{{- $prefix := default "" .Values.companyPrefix }}
 {{- if .Values.fullnameOverride }}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- printf "%s%s" $prefix .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
 {{- $name := default .Chart.Name .Values.nameOverride }}
 {{- if contains $name .Release.Name }}
-{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- printf "%s%s" $prefix .Release.Name | trunc 63 | trimSuffix "-" }}
 {{- else }}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- printf "%s%s-%s" $prefix .Release.Name $name | trunc 63 | trimSuffix "-" }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -29,6 +30,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{- define "tls-tracer.serviceAccountName" -}}
+{{- $prefix := default "" .Values.companyPrefix }}
 {{- if .Values.serviceAccount.create }}
 {{- default (include "tls-tracer.fullname" .) .Values.serviceAccount.name }}
 {{- else }}

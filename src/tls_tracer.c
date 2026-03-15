@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
+#include <regex.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -22,7 +23,8 @@
 
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
-#define MAX_PROBES         8
+#define MAX_PROBES         16
+#define MAX_SANITIZE_PATTERNS 32
 
 static volatile sig_atomic_t exiting = 0;
 
@@ -30,6 +32,12 @@ static volatile sig_atomic_t exiting = 0;
 enum output_fmt {
     FMT_TEXT,
     FMT_JSON,
+};
+
+/* Compiled sanitization regex patterns */
+struct sanitize_pattern {
+    regex_t regex;
+    char    original[256];  /* original pattern string for debugging */
 };
 
 /* Runtime configuration */
@@ -41,16 +49,19 @@ struct config {
     int             hex_dump;
     int             data_only;
     int             verbose;
+    struct sanitize_pattern sanitize[MAX_SANITIZE_PATTERNS];
+    int             sanitize_count;
 };
 
 static struct config cfg = {
-    .format     = FMT_TEXT,
-    .ssl_lib    = "",
-    .filter_pid = 0,
-    .filter_uid = 0,
-    .hex_dump   = 0,
-    .data_only  = 0,
-    .verbose    = 0,
+    .format          = FMT_TEXT,
+    .ssl_lib         = "",
+    .filter_pid      = 0,
+    .filter_uid      = 0,
+    .hex_dump        = 0,
+    .data_only       = 0,
+    .verbose         = 0,
+    .sanitize_count  = 0,
 };
 
 static void sig_handler(int signo)
@@ -59,9 +70,65 @@ static void sig_handler(int signo)
     exiting = 1;
 }
 
+/* Add a sanitization regex pattern (case-insensitive) */
+static int add_sanitize_pattern(const char *pattern)
+{
+    if (cfg.sanitize_count >= MAX_SANITIZE_PATTERNS) {
+        fprintf(stderr, "Error: Too many sanitize patterns (max %d)\n",
+                MAX_SANITIZE_PATTERNS);
+        return -1;
+    }
+    struct sanitize_pattern *sp = &cfg.sanitize[cfg.sanitize_count];
+    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE);
+    if (ret != 0) {
+        char errbuf[128];
+        regerror(ret, &sp->regex, errbuf, sizeof(errbuf));
+        fprintf(stderr, "Error: Invalid sanitize pattern '%s': %s\n",
+                pattern, errbuf);
+        return -1;
+    }
+    snprintf(sp->original, sizeof(sp->original), "%s", pattern);
+    cfg.sanitize_count++;
+    return 0;
+}
+
+/* Apply sanitization patterns to a string, replacing matches with [REDACTED] */
+static void sanitize_string(char *str, size_t len)
+{
+    if (cfg.sanitize_count == 0 || !str || !str[0])
+        return;
+
+    for (int i = 0; i < cfg.sanitize_count; i++) {
+        regmatch_t match;
+        char *p = str;
+        while (regexec(&cfg.sanitize[i].regex, p, 1, &match, 0) == 0) {
+            size_t match_start = (size_t)(p - str) + (size_t)match.rm_so;
+            size_t match_len = (size_t)(match.rm_eo - match.rm_so);
+            const char *redacted = "[REDACTED]";
+            size_t redacted_len = 10;
+
+            if (match_len == 0)
+                break;
+
+            /* Calculate new length */
+            size_t current_len = strlen(str);
+            if (current_len - match_len + redacted_len >= len)
+                break;  /* Not enough space */
+
+            /* Shift remainder and insert [REDACTED] */
+            memmove(str + match_start + redacted_len,
+                    str + match_start + match_len,
+                    current_len - match_start - match_len + 1);
+            memcpy(str + match_start, redacted, redacted_len);
+
+            p = str + match_start + redacted_len;
+        }
+    }
+}
+
 static const char *direction_str(int dir)
 {
-    return dir == DIRECTION_READ ? "READ" : "WRITE";
+    return dir == DIRECTION_READ ? "RESPONSE" : "REQUEST";
 }
 
 static void format_addr(const struct tls_event_t *event, char *buf, size_t buflen)
@@ -241,13 +308,151 @@ struct http_info {
     char method[16];
     char path[512];
     char host[256];
+    char user_agent[256]; /* User-Agent header value */
+    char version[16];   /* "1.0", "1.1", or "2" */
+    int  websocket;     /* 1 if Upgrade: websocket detected */
+    int  grpc_status;   /* gRPC status code (-1 = not present, 0-16 = code) */
 };
+
+/* Kafka wire protocol detection: check if data matches Kafka request header.
+ * Kafka request header: message_size(4) + api_key(2) + api_version(2) + correlation_id(4) + client_id_len(2)
+ * Minimum 14 bytes. */
+static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
+{
+    if (len < 14)
+        return 0;
+
+    /* Read message_size (4 bytes, big-endian) */
+    __u32 msg_size = ((unsigned char)data[0] << 24) |
+                     ((unsigned char)data[1] << 16) |
+                     ((unsigned char)data[2] << 8) |
+                     (unsigned char)data[3];
+
+    /* Sanity: 4 < msg_size < 100MB, and msg_size + 4 should be close to data len */
+    if (msg_size <= 4 || msg_size > 104857600)
+        return 0;
+
+    /* Read api_key (2 bytes, big-endian, signed) */
+    int ak = (int)(short)(((unsigned char)data[4] << 8) |
+                          (unsigned char)data[5]);
+    if (ak < 0 || ak > 74)
+        return 0;
+
+    /* Read api_version (2 bytes) */
+    int av = (int)(short)(((unsigned char)data[6] << 8) |
+                          (unsigned char)data[7]);
+    if (av < 0 || av > 20)
+        return 0;
+
+    /* Read correlation_id (4 bytes) — must be >= 0 */
+    int corr_id = (int)(((unsigned char)data[8] << 24) |
+                        ((unsigned char)data[9] << 16) |
+                        ((unsigned char)data[10] << 8) |
+                        (unsigned char)data[11]);
+    if (corr_id < 0)
+        return 0;
+
+    /* Read client_id_length (2 bytes, -1 for null) */
+    int cid_len = (int)(short)(((unsigned char)data[12] << 8) |
+                               (unsigned char)data[13]);
+    if (cid_len < -1 || cid_len > 1024)
+        return 0;
+
+    /* If client_id_length > 0, verify there's enough data */
+    if (cid_len > 0 && len < (unsigned)(14 + cid_len))
+        return 0;
+
+    *api_key = (int)ak;
+    return 1;
+}
+
+static const char *kafka_api_key_name(int api_key)
+{
+    switch (api_key) {
+    case 0: return "Produce";
+    case 1: return "Fetch";
+    case 2: return "ListOffsets";
+    case 3: return "Metadata";
+    case 8: return "OffsetCommit";
+    case 9: return "OffsetFetch";
+    case 10: return "FindCoordinator";
+    case 11: return "JoinGroup";
+    case 12: return "Heartbeat";
+    case 13: return "LeaveGroup";
+    case 14: return "SyncGroup";
+    case 17: return "SaslHandshake";
+    case 18: return "ApiVersions";
+    case 19: return "CreateTopics";
+    case 20: return "DeleteTopics";
+    case 22: return "InitProducerId";
+    case 36: return "SaslAuthenticate";
+    default: return NULL;
+    }
+}
+
+/* WebSocket frame parsing: extract close code from close frame (opcode 0x8) */
+static int parse_websocket_close_code(const char *data, __u32 len)
+{
+    if (len < 2)
+        return -1;
+
+    __u8 opcode = (unsigned char)data[0] & 0x0F;
+    if (opcode != 0x08)  /* Close frame */
+        return -1;
+
+    __u8 mask_bit = ((unsigned char)data[1] & 0x80) ? 1 : 0;
+    __u8 payload_len = (unsigned char)data[1] & 0x7F;
+
+    if (payload_len < 2)
+        return -1;  /* No close code in payload */
+
+    int offset = 2;
+    __u8 masking_key[4] = {0};
+    if (mask_bit) {
+        if (len < (unsigned)(offset + 4))
+            return -1;
+        for (int i = 0; i < 4; i++)
+            masking_key[i] = (unsigned char)data[offset + i];
+        offset += 4;
+    }
+
+    if (len < (unsigned)(offset + 2))
+        return -1;
+
+    __u16 code;
+    if (mask_bit) {
+        __u8 b0 = (unsigned char)data[offset] ^ masking_key[0];
+        __u8 b1 = (unsigned char)data[offset + 1] ^ masking_key[1];
+        code = (b0 << 8) | b1;
+    } else {
+        code = ((unsigned char)data[offset] << 8) |
+               (unsigned char)data[offset + 1];
+    }
+
+    return (int)code;
+}
 
 static void parse_http_info(const char *data, __u32 len, struct http_info *info)
 {
     memset(info, 0, sizeof(*info));
+    info->grpc_status = -1;  /* -1 = not present */
     if (len < 4)
         return;
+
+    /* Check for HTTP response line: "HTTP/1.1 200 OK\r\n" */
+    if (len >= 8 && strncmp(data, "HTTP/", 5) == 0) {
+        const char *ver_start = data + 5;
+        const char *ver_end = ver_start;
+        const char *data_end = data + len;
+        while (ver_end < data_end && *ver_end != ' ' && *ver_end != '\r')
+            ver_end++;
+        size_t ver_len = (size_t)(ver_end - ver_start);
+        if (ver_len > 0 && ver_len < sizeof(info->version)) {
+            strncpy(info->version, ver_start, ver_len);
+            info->version[ver_len] = '\0';
+        }
+        /* Responses don't have method/path, but may have headers below */
+    }
 
     /* Check if data starts with an HTTP method */
     const char *methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ",
@@ -277,22 +482,78 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
         }
     }
 
-    if (!found)
+    /* Extract HTTP version from request line if we found a method */
+    if (found) {
+        const char *http_ver = NULL;
+        const char *s = data;
+        const char *s_end = data + len;
+        /* Scan for "HTTP/" in the request line (before first \r\n) */
+        for (; s < s_end - 8; s++) {
+            if (*s == '\r' || *s == '\n')
+                break;
+            if (strncmp(s, "HTTP/", 5) == 0) {
+                http_ver = s + 5;
+                break;
+            }
+        }
+        if (http_ver) {
+            const char *ver_end = http_ver;
+            while (ver_end < s_end && *ver_end != '\r' && *ver_end != '\n' && *ver_end != ' ')
+                ver_end++;
+            size_t ver_len = (size_t)(ver_end - http_ver);
+            if (ver_len >= sizeof(info->version))
+                ver_len = sizeof(info->version) - 1;
+            strncpy(info->version, http_ver, ver_len);
+            info->version[ver_len] = '\0';
+        }
+    }
+
+    /* For responses (HTTP/x.x status line), we still parse headers below */
+    if (!found && !info->version[0])
         return;
 
-    /* Extract Host header */
-    const char *host_hdr = NULL;
+    /* Scan headers for Host and Upgrade: websocket */
     const char *p = data;
     const char *end = data + len;
+    const char *host_hdr = NULL;
     while (p < end - 6) {
-        if ((*p == '\n' || p == data) &&
-            (strncasecmp(p + (p == data ? 0 : 1), "Host:", 5) == 0 ||
-             strncasecmp(p + (p == data ? 0 : 1), "host:", 5) == 0)) {
-            host_hdr = p + (p == data ? 5 : 6);
-            /* Skip whitespace */
-            while (host_hdr < end && (*host_hdr == ' ' || *host_hdr == '\t'))
-                host_hdr++;
-            break;
+        if (*p == '\n' || p == data) {
+            const char *hdr = p + (p == data ? 0 : 1);
+            size_t remaining = (size_t)(end - hdr);
+
+            if (remaining >= 5 && strncasecmp(hdr, "Host:", 5) == 0) {
+                host_hdr = hdr + 5;
+                while (host_hdr < end && (*host_hdr == ' ' || *host_hdr == '\t'))
+                    host_hdr++;
+            } else if (remaining >= 11 && strncasecmp(hdr, "User-Agent:", 11) == 0) {
+                const char *val = hdr + 11;
+                while (val < end && (*val == ' ' || *val == '\t'))
+                    val++;
+                const char *val_end = val;
+                while (val_end < end && *val_end != '\r' && *val_end != '\n')
+                    val_end++;
+                size_t ua_len = (size_t)(val_end - val);
+                if (ua_len >= sizeof(info->user_agent))
+                    ua_len = sizeof(info->user_agent) - 1;
+                strncpy(info->user_agent, val, ua_len);
+                info->user_agent[ua_len] = '\0';
+            } else if (remaining >= 8 && strncasecmp(hdr, "Upgrade:", 8) == 0) {
+                const char *val = hdr + 8;
+                while (val < end && (*val == ' ' || *val == '\t'))
+                    val++;
+                if ((size_t)(end - val) >= 9 && strncasecmp(val, "websocket", 9) == 0)
+                    info->websocket = 1;
+            } else if (remaining >= 12 && strncasecmp(hdr, "grpc-status:", 12) == 0) {
+                const char *val = hdr + 12;
+                while (val < end && (*val == ' ' || *val == '\t'))
+                    val++;
+                if (val < end && *val >= '0' && *val <= '9') {
+                    int code = *val - '0';
+                    if (val + 1 < end && *(val + 1) >= '0' && *(val + 1) <= '9')
+                        code = code * 10 + (*(val + 1) - '0');
+                    info->grpc_status = code;
+                }
+            }
         }
         p++;
     }
@@ -377,15 +638,113 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         struct tm *tm = gmtime(&ts.tv_sec);
         strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", tm);
 
+        /* Handle TCP connect error events */
+        if (event->event_type == EVENT_CONNECT_ERROR) {
+            const char *err_desc = "unknown";
+            int ecode = (int)event->error_code;
+            switch (ecode) {
+            case 2:   err_desc = "no_such_file"; break;       /* ENOENT */
+            case 13:  err_desc = "permission_denied"; break;  /* EACCES */
+            case 22:  err_desc = "invalid_argument"; break;   /* EINVAL */
+            case 97:  err_desc = "address_family_not_supported"; break; /* EAFNOSUPPORT */
+            case 98:  err_desc = "address_already_in_use"; break; /* EADDRINUSE */
+            case 99:  err_desc = "address_not_available"; break;  /* EADDRNOTAVAIL */
+            case 100: err_desc = "network_down"; break;       /* ENETDOWN */
+            case 101: err_desc = "network_unreachable"; break;/* ENETUNREACH */
+            case 104: err_desc = "connection_reset"; break;   /* ECONNRESET */
+            case 106: err_desc = "already_connected"; break;  /* EISCONN */
+            case 110: err_desc = "connection_timed_out"; break;/* ETIMEDOUT */
+            case 111: err_desc = "connection_refused"; break; /* ECONNREFUSED */
+            case 112: err_desc = "host_down"; break;          /* EHOSTDOWN */
+            case 113: err_desc = "no_route_to_host"; break;   /* EHOSTUNREACH */
+            case 114: err_desc = "already_in_progress"; break;/* EALREADY */
+            case 115: err_desc = "in_progress"; break;        /* EINPROGRESS */
+            default: break;
+            }
+
+            printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+                   "\"pid\":%u,\"tid\":%u,"
+                   "\"comm\":\"%.*s\",\"event_type\":\"tcp_error\","
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"error_code\":%d,\"error\":\"%s\"}\n",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid,
+                   MAX_COMM_LEN, event->comm,
+                   remote_ip, event->remote_port,
+                   ecode, err_desc);
+            fflush(stdout);
+            return;
+        }
+
+        /* Handle TLS error events */
+        if (event->event_type == EVENT_TLS_ERROR) {
+            const char *tls_ver_str = NULL;
+            switch (event->tls_version) {
+            case 0x0301: tls_ver_str = "1.0"; break;
+            case 0x0302: tls_ver_str = "1.1"; break;
+            case 0x0303: tls_ver_str = "1.2"; break;
+            case 0x0304: tls_ver_str = "1.3"; break;
+            default: break;
+            }
+
+            printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+                   "\"pid\":%u,\"tid\":%u,"
+                   "\"comm\":\"%.*s\",\"event_type\":\"tls_error\","
+                   "\"direction\":\"%s\","
+                   "\"src_ip\":\"%s\",\"src_port\":%u,"
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"ssl_return_code\":%d",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid,
+                   MAX_COMM_LEN, event->comm,
+                   direction_str(event->direction),
+                   local_ip, event->local_port,
+                   remote_ip, event->remote_port,
+                   (int)event->error_code);
+
+            if (tls_ver_str)
+                printf(",\"tls_version\":\"%s\"", tls_ver_str);
+
+            printf("}\n");
+            fflush(stdout);
+            return;
+        }
+
+        /* Handle QUIC detection events */
+        if (event->event_type == EVENT_QUIC_DETECTED) {
+            printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+                   "\"pid\":%u,\"tid\":%u,"
+                   "\"comm\":\"%.*s\",\"event_type\":\"quic_detected\","
+                   "\"src_ip\":\"%s\",\"src_port\":%u,"
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"transport\":\"udp\",\"protocol\":\"quic\"}\n",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid,
+                   MAX_COMM_LEN, event->comm,
+                   local_ip, event->local_port,
+                   remote_ip, event->remote_port);
+            fflush(stdout);
+            return;
+        }
+
         /* K8s metadata enrichment */
         struct k8s_meta meta;
         get_k8s_meta((pid_t)event->pid, &meta);
 
-        /* HTTP Layer 7 parsing (only for WRITE direction) */
+        /* HTTP Layer 7 parsing (both directions — WRITE for requests, READ for responses) */
         struct http_info http;
         memset(&http, 0, sizeof(http));
-        if (event->direction == DIRECTION_WRITE && data_len > 0)
+        if (data_len > 0)
             parse_http_info(event->data, data_len, &http);
+
+        /* Apply sanitization patterns to HTTP fields */
+        if (http.path[0])
+            sanitize_string(http.path, sizeof(http.path));
+        if (http.host[0])
+            sanitize_string(http.host, sizeof(http.host));
 
         /* Emit one self-contained JSON event */
         printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
@@ -403,6 +762,12 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
                remote_ip, event->remote_port,
                data_len);
 
+        /* DNS / hostname from HTTP Host header (best-effort) */
+        if (http.host[0]) {
+            printf(",\"dst_dns\":");
+            print_json_string(http.host);
+        }
+
         /* K8s fields (only if populated) */
         if (meta.pod_name[0]) {
             printf(",\"k8s_pod\":");
@@ -417,7 +782,176 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             print_json_string(meta.container_id);
         }
 
-        /* HTTP Layer 7 fields (only if HTTP detected) */
+        /* Protocol detection: data signatures first, then well-known ports */
+        const char *l7_proto = "unknown";
+        int is_http2 = 0;
+
+        /* 1. Detect HTTP/2 connection preface (client→server first write)
+         * RFC 7540 §3.5: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" */
+        if (data_len >= 24 && strncmp(event->data, "PRI * HTTP/2.0", 14) == 0)
+            is_http2 = 1;
+
+        /* 2. Detect HTTP/2 frames by validating the 9-byte frame header.
+         * Format: length(3) + type(1) + flags(1) + stream_id(4)
+         * Valid frame types: 0x00(DATA) - 0x09(CONTINUATION) per RFC 7540 §6.
+         * To avoid false positives, we require:
+         *   - Frame length consistent with captured data (frame_len + 9 <= data_len * 2)
+         *   - SETTINGS(0x04) or HEADERS(0x01) frame types (most common first frames)
+         *   - Reserved bit in stream ID must be 0 */
+        if (!is_http2 && data_len >= 18) {  /* Need enough data to reduce false positives */
+            __u8 frame_type = (unsigned char)event->data[3];
+            /* Stream ID: top bit is reserved (must be 0) */
+            __u8 stream_id_top = (unsigned char)event->data[5];
+            __u32 frame_len = ((unsigned char)event->data[0] << 16) |
+                              ((unsigned char)event->data[1] << 8) |
+                              (unsigned char)event->data[2];
+            /* Only match SETTINGS(4), HEADERS(1), WINDOW_UPDATE(8) as first frames */
+            if ((frame_type == 0x04 || frame_type == 0x01 || frame_type == 0x08) &&
+                (stream_id_top & 0x80) == 0 &&
+                frame_len > 0 && frame_len <= 16384)
+                is_http2 = 1;
+        }
+
+        /* 3. Classify HTTP/2 traffic: gRPC vs plain HTTPS.
+         * gRPC uses HTTP/2 exclusively, typically on ports 443, 8443, or
+         * 50051-50055 (default grpc ports). Also check for gRPC message
+         * framing in DATA frames: compressed_flag(1) + msg_length(4). */
+        if (is_http2) {
+            /* gRPC detection heuristics:
+             * a) Well-known gRPC ports (50051-50055)
+             * b) HTTP/2 DATA frame (type=0x0) with gRPC length-prefixed message
+             * c) Check for gRPC content-type in HEADERS via HPACK
+             *    (te: trailers is gRPC-specific) */
+            __u16 port = event->remote_port;
+            if (port >= 50051 && port <= 50055) {
+                l7_proto = "grpc";
+            } else if (data_len >= 14 && (unsigned char)event->data[3] == 0x00) {
+                /* DATA frame: check if payload starts with gRPC message framing
+                 * (compressed_flag byte 0x00 or 0x01 + 4-byte big-endian length) */
+                __u8 grpc_compress = (unsigned char)event->data[9];
+                if (grpc_compress <= 1) {
+                    __u32 grpc_msg_len = ((unsigned char)event->data[10] << 24) |
+                                         ((unsigned char)event->data[11] << 16) |
+                                         ((unsigned char)event->data[12] << 8) |
+                                         (unsigned char)event->data[13];
+                    __u32 frame_len = ((unsigned char)event->data[0] << 16) |
+                                      ((unsigned char)event->data[1] << 8) |
+                                      (unsigned char)event->data[2];
+                    /* gRPC message length should be <= frame payload length - 5 */
+                    if (grpc_msg_len > 0 && grpc_msg_len <= frame_len)
+                        l7_proto = "grpc";
+                }
+            }
+            if (strcmp(l7_proto, "unknown") == 0)
+                l7_proto = "https";  /* HTTP/2 but not gRPC → HTTPS */
+        }
+
+        /* 4. Detect WebSocket upgrade (RFC 6455 over TLS = wss://)
+         * Request:  "Upgrade: websocket" header
+         * Response: "HTTP/1.1 101 Switching Protocols" */
+        if (strcmp(l7_proto, "unknown") == 0 || strcmp(l7_proto, "https") == 0) {
+            if (http.websocket)
+                l7_proto = "wss";
+            else if (data_len >= 12 && strncmp(event->data, "HTTP/1.1 101", 12) == 0)
+                l7_proto = "wss";
+        }
+
+        /* 5. Detect by HTTP/1.x data content */
+        if (strcmp(l7_proto, "unknown") == 0) {
+            if (http.method[0])
+                l7_proto = "https";
+            else if (data_len >= 5 && strncmp(event->data, "HTTP/", 5) == 0)
+                l7_proto = "https";
+        }
+
+        /* 6. Detect SMTP over TLS */
+        if (strcmp(l7_proto, "unknown") == 0 && data_len >= 4 && (
+            strncmp(event->data, "EHLO", 4) == 0 ||
+            strncmp(event->data, "MAIL", 4) == 0 ||
+            strncmp(event->data, "RCPT", 4) == 0 ||
+            strncmp(event->data, "220 ", 4) == 0 ||
+            strncmp(event->data, "250 ", 4) == 0))
+            l7_proto = "smtps";
+
+        /* 7. Detect IMAP over TLS */
+        if (strcmp(l7_proto, "unknown") == 0 && data_len >= 4 && (
+            strncmp(event->data, "* OK", 4) == 0 ||
+            (event->data[0] >= 'A' && event->data[0] <= 'Z' &&
+             data_len >= 6 && strstr(event->data, "LOGIN") != NULL)))
+            l7_proto = "imaps";
+
+        /* 8. Detect Kafka wire protocol (binary header structure) */
+        int kafka_api_key = -1;
+        if (strcmp(l7_proto, "unknown") == 0 &&
+            detect_kafka_protocol(event->data, data_len, &kafka_api_key))
+            l7_proto = "kafka";
+
+        /* 9. Fall back to well-known TLS port numbers (RFC/IANA assignments) */
+        if (strcmp(l7_proto, "unknown") == 0) {
+            __u16 port = event->remote_port;
+            switch (port) {
+            case 443:  l7_proto = "https";  break;  /* RFC 2818 */
+            case 8443: l7_proto = "https";  break;  /* Alt HTTPS */
+            case 465:  l7_proto = "smtps";  break;  /* RFC 8314 */
+            case 587:  l7_proto = "smtps";  break;  /* SMTP submission + STARTTLS */
+            case 993:  l7_proto = "imaps";  break;  /* RFC 8314 */
+            case 995:  l7_proto = "pop3s";  break;  /* RFC 8314 */
+            case 636:  l7_proto = "ldaps";  break;  /* RFC 4513 */
+            case 989:
+            case 990:  l7_proto = "ftps";   break;  /* RFC 4217 */
+            case 5223: l7_proto = "xmpps";  break;  /* XMPP over TLS */
+            case 6697: l7_proto = "ircs";   break;  /* IRC over TLS */
+            case 5671: l7_proto = "amqps";  break;  /* AMQP over TLS */
+            case 8883: l7_proto = "mqtts";  break;  /* MQTT over TLS */
+            case 9200:
+            case 9243: l7_proto = "https";  break;  /* Elasticsearch */
+            case 27017: l7_proto = "mongodb+srv"; break; /* MongoDB TLS */
+            /* Kafka TLS ports (Confluent Cloud / self-hosted) */
+            case 9092:
+            case 9093:
+            case 9094: l7_proto = "kafka";  break;
+            /* gRPC default ports (no IANA assignment, de facto standard) */
+            case 50051:
+            case 50052:
+            case 50053:
+            case 50054:
+            case 50055: l7_proto = "grpc"; break;
+            default: break;
+            }
+        }
+        /* TLS version: 0x0303=TLS1.2, 0x0304=TLS1.3 */
+        const char *tls_ver_str = NULL;
+        switch (event->tls_version) {
+        case 0x0301: tls_ver_str = "1.0"; break;
+        case 0x0302: tls_ver_str = "1.1"; break;
+        case 0x0303: tls_ver_str = "1.2"; break;
+        case 0x0304: tls_ver_str = "1.3"; break;
+        default: break;
+        }
+        if (tls_ver_str)
+            printf(",\"tls_version\":\"%s\"", tls_ver_str);
+
+        /* TLS cipher suite name (from SSL_get_current_cipher uprobe) */
+        if (event->cipher[0]) {
+            printf(",\"tls_cipher\":");
+            /* Ensure null-terminated for safety */
+            char cipher_safe[MAX_CIPHER_LEN + 1];
+            memcpy(cipher_safe, event->cipher, MAX_CIPHER_LEN);
+            cipher_safe[MAX_CIPHER_LEN] = '\0';
+            print_json_string(cipher_safe);
+        }
+
+        /* TLS authentication mode: one-way or mutual (mTLS) */
+        printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
+
+        printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
+
+        /* HTTP version: from request line or inferred from HTTP/2 detection */
+        if (is_http2)
+            printf(",\"http_version\":\"2\"");
+        else if (http.version[0])
+            printf(",\"http_version\":\"%s\"", http.version);
+
         if (http.method[0]) {
             printf(",\"http_method\":\"%s\"", http.method);
             if (http.path[0]) {
@@ -430,12 +964,80 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
         }
 
-        if (!c->data_only) {
-            printf(",\"data\":\"");
-            for (__u32 i = 0; i < data_len; i++)
-                printf("\\x%02x", (unsigned char)event->data[i]);
-            printf("\"");
+        /* User-Agent header */
+        if (http.user_agent[0]) {
+            printf(",\"user_agent\":");
+            print_json_string(http.user_agent);
         }
+
+        /* gRPC status code from grpc-status header (0-16) */
+        if (http.grpc_status >= 0) {
+            const char *grpc_desc = "unknown";
+            switch (http.grpc_status) {
+            case 0:  grpc_desc = "OK"; break;
+            case 1:  grpc_desc = "CANCELLED"; break;
+            case 2:  grpc_desc = "UNKNOWN"; break;
+            case 3:  grpc_desc = "INVALID_ARGUMENT"; break;
+            case 4:  grpc_desc = "DEADLINE_EXCEEDED"; break;
+            case 5:  grpc_desc = "NOT_FOUND"; break;
+            case 6:  grpc_desc = "ALREADY_EXISTS"; break;
+            case 7:  grpc_desc = "PERMISSION_DENIED"; break;
+            case 8:  grpc_desc = "RESOURCE_EXHAUSTED"; break;
+            case 9:  grpc_desc = "FAILED_PRECONDITION"; break;
+            case 10: grpc_desc = "ABORTED"; break;
+            case 11: grpc_desc = "OUT_OF_RANGE"; break;
+            case 12: grpc_desc = "UNIMPLEMENTED"; break;
+            case 13: grpc_desc = "INTERNAL"; break;
+            case 14: grpc_desc = "UNAVAILABLE"; break;
+            case 15: grpc_desc = "DATA_LOSS"; break;
+            case 16: grpc_desc = "UNAUTHENTICATED"; break;
+            default: break;
+            }
+            printf(",\"grpc_status\":%d,\"grpc_status_name\":\"%s\"",
+                   http.grpc_status, grpc_desc);
+        }
+
+        /* Kafka API key detection */
+        if (kafka_api_key >= 0) {
+            const char *api_name = kafka_api_key_name(kafka_api_key);
+            printf(",\"kafka_api_key\":%d", kafka_api_key);
+            if (api_name)
+                printf(",\"kafka_api_name\":\"%s\"", api_name);
+        }
+
+        /* WebSocket close code detection */
+        if (strcmp(l7_proto, "wss") == 0 || strcmp(l7_proto, "unknown") == 0) {
+            int ws_close = parse_websocket_close_code(event->data, data_len);
+            if (ws_close >= 0) {
+                const char *ws_desc = "unknown";
+                switch (ws_close) {
+                case 1000: ws_desc = "NORMAL_CLOSURE"; break;
+                case 1001: ws_desc = "GOING_AWAY"; break;
+                case 1002: ws_desc = "PROTOCOL_ERROR"; break;
+                case 1003: ws_desc = "UNSUPPORTED_DATA"; break;
+                case 1005: ws_desc = "NO_STATUS_RECEIVED"; break;
+                case 1006: ws_desc = "ABNORMAL_CLOSURE"; break;
+                case 1007: ws_desc = "INVALID_FRAME_PAYLOAD_DATA"; break;
+                case 1008: ws_desc = "POLICY_VIOLATION"; break;
+                case 1009: ws_desc = "MESSAGE_TOO_BIG"; break;
+                case 1010: ws_desc = "MANDATORY_EXTENSION"; break;
+                case 1011: ws_desc = "INTERNAL_ERROR"; break;
+                case 1012: ws_desc = "SERVICE_RESTART"; break;
+                case 1013: ws_desc = "TRY_AGAIN_LATER"; break;
+                case 1014: ws_desc = "BAD_GATEWAY"; break;
+                case 1015: ws_desc = "TLS_HANDSHAKE"; break;
+                default:
+                    if (ws_close >= 3000 && ws_close <= 3999)
+                        ws_desc = "REGISTERED";
+                    else if (ws_close >= 4000 && ws_close <= 4999)
+                        ws_desc = "PRIVATE";
+                    break;
+                }
+                printf(",\"ws_close_code\":%d,\"ws_close_reason\":\"%s\"",
+                       ws_close, ws_desc);
+            }
+        }
+
         printf("}\n");
     } else {
         if (!c->data_only) {
@@ -516,6 +1118,7 @@ static void usage(const char *prog)
         "  -f, --format FMT       Output format: text (default) or json\n"
         "  -x, --hex              Show hex dump of captured data\n"
         "  -d, --data-only        Print only captured data (no headers)\n"
+        "  -s, --sanitize REGEX   Sanitize URLs matching REGEX (case-insensitive, repeatable)\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help message\n"
         "\n"
@@ -524,9 +1127,10 @@ static void usage(const char *prog)
         "  %s -p 1234             Trace TLS traffic for PID 1234\n"
         "  %s -f json             Output in JSON format\n"
         "  %s -x -p 1234          Hex dump of TLS data for PID 1234\n"
+        "  %s -s 'apikey=[^&]*'   Redact API keys from logged URLs\n"
         "\n"
         "Requires root privileges (or CAP_BPF + CAP_PERFMON).\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
@@ -545,13 +1149,14 @@ int main(int argc, char **argv)
         {"format",    required_argument, NULL, 'f'},
         {"hex",       no_argument,       NULL, 'x'},
         {"data-only", no_argument,       NULL, 'd'},
+        {"sanitize",  required_argument, NULL, 's'},
         {"verbose",   no_argument,       NULL, 'v'},
         {"help",      no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xdvh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p':
             cfg.filter_pid = (__u32)atoi(optarg);
@@ -577,6 +1182,10 @@ int main(int argc, char **argv)
             break;
         case 'd':
             cfg.data_only = 1;
+            break;
+        case 's':
+            if (add_sanitize_pattern(optarg) != 0)
+                return 1;
             break;
         case 'v':
             cfg.verbose = 1;
@@ -636,13 +1245,15 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "BPF object loaded successfully.\n");
 
-    /* Attach kprobes for connection tracking (connect syscall) */
+    /* Attach kprobes for connection tracking (connect syscall + tcp_set_state) */
     const char *kprobe_names[] = {
         "probe_connect_enter",
         "probe_connect_return",
+        "probe_tcp_set_state",
+        "probe_udp_sendmsg",
     };
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         prog = bpf_object__find_program_by_name(obj, kprobe_names[i]);
         if (!prog) {
             if (cfg.verbose)
@@ -670,17 +1281,29 @@ int main(int argc, char **argv)
         "probe_ssl_read_return",
         "probe_ssl_write_enter",
         "probe_ssl_write_return",
+        "probe_ssl_version_enter",
+        "probe_ssl_version_return",
+        "probe_ssl_get_cipher_enter",
+        "probe_ssl_get_cipher_return",
+        "probe_ssl_get_cert_enter",
+        "probe_ssl_get_cert_return",
     };
-    int is_retprobe[] = {0, 1, 0, 1};
+    int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
     const char *func_names[] = {
         "SSL_read",
         "SSL_read",
         "SSL_write",
         "SSL_write",
+        "SSL_version",
+        "SSL_version",
+        "SSL_get_current_cipher",
+        "SSL_get_current_cipher",
+        "SSL_get_certificate",
+        "SSL_get_certificate",
     };
 
     int uprobe_count = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 10; i++) {
         prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
         if (!prog) {
             fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
@@ -716,7 +1339,7 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 4);
+        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 10);
 
     /* Set up perf buffer */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");
@@ -745,7 +1368,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "... Press Ctrl+C to stop.\n");
     }
 
+    /* Touch health file to signal readiness */
+    const char *health_file = "/tmp/tls_tracer_healthy";
+    FILE *hf = fopen(health_file, "w");
+    if (hf) {
+        fprintf(hf, "ready\n");
+        fclose(hf);
+    }
+
     /* Main event loop */
+    int poll_count = 0;
     while (!exiting) {
         err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT);
         if (err < 0 && err != -EINTR) {
@@ -754,7 +1386,20 @@ int main(int argc, char **argv)
             break;
         }
         err = 0;
+
+        /* Update health file every ~10 seconds (100ms poll * 100) */
+        if (++poll_count >= 100) {
+            poll_count = 0;
+            hf = fopen(health_file, "w");
+            if (hf) {
+                fprintf(hf, "%ld\n", (long)time(NULL));
+                fclose(hf);
+            }
+        }
     }
+
+    /* Remove health file on shutdown */
+    unlink(health_file);
 
     if (cfg.verbose)
         fprintf(stderr, "\nExiting...\n");

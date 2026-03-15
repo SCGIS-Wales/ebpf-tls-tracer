@@ -1,0 +1,13 @@
+{{- if .Values.kinesis.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}-kinesis-shipper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+data:
+  # Script is baked into the container image at /opt/tls_tracer/scripts/kinesis_shipper.py
+  # This ConfigMap exists for label/metadata consistency only
+  _note: "kinesis_shipper.py is embedded in the container image"
+{{- end }}

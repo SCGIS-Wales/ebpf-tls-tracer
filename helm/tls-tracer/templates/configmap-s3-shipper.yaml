@@ -1,0 +1,13 @@
+{{- if .Values.s3.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}-s3-shipper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+data:
+  # Script is baked into the container image at /opt/tls_tracer/scripts/s3_shipper.py
+  # This ConfigMap exists for label/metadata consistency only
+  _note: "s3_shipper.py is embedded in the container image"
+{{- end }}
