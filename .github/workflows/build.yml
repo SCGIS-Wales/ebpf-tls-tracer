@@ -111,7 +111,7 @@ jobs:
           cd release && tar czf ../tls_tracer-linux-${ARCH}.tar.gz *
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v4
         with:
           name: tls_tracer-linux-amd64
           path: tls_tracer-linux-*.tar.gz
@@ -217,12 +217,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      # H-5 fix: Test against K8s 1.34 (matches Helm chart kubeVersion: ">=1.34.0-0")
-      - name: Create kind cluster (Kubernetes v1.34)
+      # Use K8s v1.35 for CI. The Helm chart supports >=1.34 but kindest/node:v1.34.x
+      # has glibc < 2.38 which is incompatible with our Debian trixie-compiled binary
+      # when the host-ssl volume mount (/usr/lib/x86_64-linux-gnu) replaces the
+      # container's libc with the node's older version.
+      - name: Create kind cluster (Kubernetes v1.35)
         uses: helm/kind-action@v1
         with:
           cluster_name: tls-tracer-ci
-          node_image: kindest/node:v1.34.0
+          node_image: kindest/node:v1.35.0
           wait: 60s
 
       - name: Verify Kubernetes version
@@ -393,6 +396,20 @@ jobs:
 
           # Give the tracer time to attach probes and create health file
           sleep 5
+
+          # Verify the pod hasn't crashed after starting
+          RESTART_COUNT=$(kubectl get pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer \
+            -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+          if [ "${RESTART_COUNT}" -gt 0 ]; then
+            echo "ERROR: tls-tracer pod crashed (${RESTART_COUNT} restarts)"
+            echo "=== Pod description ==="
+            kubectl describe pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer
+            echo "=== Previous container logs ==="
+            kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer --previous 2>&1 || true
+            echo "=== Current container logs ==="
+            kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer 2>&1 || true
+            exit 1
+          fi
 
           # Show logs so far
           echo "=== Early tracer logs ==="
@@ -622,10 +639,21 @@ jobs:
           echo "=== TLS Tracer stderr ==="
           kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer --tail=50 2>&1 || true
 
-          # Check that the tracer pod is running
+          # Check that the tracer pod is running (not CrashLoopBackOff)
           RUNNING=$(kubectl get pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer \
             -o jsonpath='{.items[0].status.phase}')
-          if [ "${RUNNING}" = "Running" ]; then
+          CONTAINER_STATE=$(kubectl get pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer \
+            -o jsonpath='{.items[0].status.containerStatuses[0].state}' 2>/dev/null || echo "unknown")
+          RESTART_COUNT=$(kubectl get pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer \
+            -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+          echo "Pod phase: ${RUNNING}, container state: ${CONTAINER_STATE}, restarts: ${RESTART_COUNT}"
+
+          if [ "${RESTART_COUNT}" -gt 0 ]; then
+            echo "ERROR: Tracer pod has restarted ${RESTART_COUNT} times (CrashLoopBackOff)"
+            kubectl describe pods -n tls-tracer -l app.kubernetes.io/name=tls-tracer
+            kubectl logs -n tls-tracer -l app.kubernetes.io/name=tls-tracer --previous 2>&1 || true
+            ERRORS=$((ERRORS + 1))
+          elif [ "${RUNNING}" = "Running" ]; then
             echo "TLS tracer pod is running"
           else
             echo "ERROR: TLS tracer pod is not running (status: ${RUNNING})"
@@ -816,9 +844,10 @@ jobs:
             echo "${ALL_JSON}" | head -50 | grep -oP '"[a-z_]+":' | sort -u | sed 's/[":]*//g; s/^/  - /' || echo "  (field extraction unavailable)"
           else
             echo ""
-            echo "WARNING: No JSON events captured"
-            echo "This can happen in CI if the kind node's libssl path differs."
-            echo "The test still validates that the tracer deploys and runs correctly."
+            echo "ERROR: No JSON events captured"
+            echo "The tracer must capture at least one TLS event during integration testing."
+            echo "Check if the tracer is running, if libssl path is correct, or if the pod crashed."
+            ERRORS=$((ERRORS + 1))
           fi
 
           echo ""
@@ -826,7 +855,7 @@ jobs:
             echo "FAILED: ${ERRORS} error(s) detected"
             exit 1
           fi
-          echo "Integration test passed: tls-tracer deployed and running on K8s 1.34+"
+          echo "Integration test passed: tls-tracer deployed and running on K8s"
 
   # ---------- Auto-tag on merge to main ----------
 
@@ -901,7 +930,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@v4
         with:
           name: tls_tracer-linux-amd64
 
