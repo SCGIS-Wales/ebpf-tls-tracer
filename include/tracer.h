@@ -1,7 +1,9 @@
 #ifndef TRACER_H
 #define TRACER_H
 
-#ifdef __KERNEL__
+/* BPF programs use linux/types.h; user-space uses stdint.h typedefs.
+ * clang with -target bpf defines __bpf__ automatically. */
+#if defined(__KERNEL__) || defined(__bpf__)
 #include <linux/types.h>
 #else
 #include <stdint.h>
