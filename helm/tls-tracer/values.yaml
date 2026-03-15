@@ -81,6 +81,10 @@ s3:
   #   cluster=<name>/namespace=<ns>/app=<app>/year=YYYY/month=MM/day=DD/
   #   hour=HH/<hostname>-<timestamp>.json
   prefix: "tls-tracer-logs"
+  # IAM role ARN for S3 sidecar (overrides the service account role).
+  # If empty, the sidecar inherits the service account's IRSA role.
+  # The role must trust the same OIDC provider and service account.
+  roleArn: ""
   # Flush interval in seconds
   flushIntervalSeconds: 60
   # Maximum batch size (lines) before flush
@@ -104,6 +108,10 @@ kinesis:
   deliveryStreamName: ""
   # AWS region for Kinesis (defaults to metadata.awsRegion)
   region: ""
+  # IAM role ARN for Kinesis sidecar (overrides the service account role).
+  # If empty, the sidecar inherits the service account's IRSA role.
+  # The role must trust the same OIDC provider and service account.
+  roleArn: ""
   # Batch size (number of records per PutRecordBatch call)
   batchSize: 500
   # Flush interval in seconds
@@ -126,8 +134,13 @@ serviceAccount:
     # For IRSA (IAM Roles for Service Accounts), set:
     # eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/tls-tracer-role"
     #
-    # Required IAM permissions:
-    #   S3:  s3:PutObject, s3:GetBucketLocation
+    # This is the default role for the pod. If you need separate roles for
+    # S3 and Kinesis sidecars, set s3.roleArn and kinesis.roleArn above.
+    # Each role's trust policy must allow the same OIDC provider + this
+    # service account (the IRSA webhook injects the shared OIDC token).
+    #
+    # Required IAM permissions (if using a single combined role):
+    #   S3:      s3:PutObject, s3:GetBucketLocation
     #   Kinesis: firehose:PutRecord, firehose:PutRecordBatch
 
 # --- 7. Pod Configuration ---
