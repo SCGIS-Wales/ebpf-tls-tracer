@@ -651,6 +651,24 @@ static void test_kafka_negative_correlation_id(void)
     PASS();
 }
 
+/* Issue 3 fix: correlation_id must be > 0 (not just >= 0) to reduce
+ * false positives from HTTP/2 binary frames. */
+static void test_kafka_zero_correlation_id(void)
+{
+    TEST(kafka_reject_zero_corr_id);
+    unsigned char data[14] = {
+        0x00, 0x00, 0x00, 0x20,
+        0x00, 0x00,              /* api_key = 0 (Produce) */
+        0x00, 0x01,              /* api_version = 1 */
+        0x00, 0x00, 0x00, 0x00,  /* correlation_id = 0 */
+        0x00, 0x05,              /* client_id_len = 5 */
+    };
+    int api_key = -1;
+    ASSERT_EQ(detect_kafka_protocol((char *)data, sizeof(data), &api_key), 0,
+              "should reject zero correlation_id (HTTP/2 false positive guard)");
+    PASS();
+}
+
 static void test_kafka_response_valid(void)
 {
     TEST(kafka_detect_valid_response);
@@ -928,6 +946,7 @@ int main(void)
     test_kafka_invalid_api_key();
     test_kafka_too_short();
     test_kafka_negative_correlation_id();
+    test_kafka_zero_correlation_id();
     test_kafka_response_valid();
     test_kafka_response_too_short();
     test_kafka_response_huge_msg_size();

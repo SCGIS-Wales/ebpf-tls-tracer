@@ -124,13 +124,19 @@ struct {
     __type(value, struct ssl_cipher_args_t);
 } ssl_cipher_args_map SEC(".maps");
 
-/* Connection info map: keyed by pid_tgid, stores remote addr/port.
+/* Connection info map: keyed by {pid, fd}, stores remote addr/port.
  * Populated by connect/accept kprobes, read by SSL uprobes.
- * Uses LRU hash to auto-evict stale entries from exited processes. */
+ * Uses LRU hash to auto-evict stale entries from exited processes.
+ *
+ * Previously keyed by pid_tgid (__u64), which fails in containerized
+ * environments because tcp_set_state fires in softirq/kernel thread
+ * context where bpf_get_current_pid_tgid() returns a different value.
+ * Keying by {pid, fd} ensures the SSL uprobes (which always run in
+ * process context and extract fd via get_ssl_fd()) can find the entry. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u64);
+    __type(key, struct conn_key_t);
     __type(value, struct conn_info_t);
 } conn_info_map SEC(".maps");
 
@@ -138,6 +144,7 @@ struct {
 struct connect_args_t {
     struct sockaddr *addr;
     int addrlen;
+    int fd;  /* socket fd from first arg to __sys_connect */
 };
 
 struct {
@@ -198,9 +205,11 @@ static __always_inline struct tls_event_t *get_event_buf(void)
 
 /* --- Helper: populate event with connection info if available --- */
 
-static __always_inline void enrich_event_with_conn_info(struct tls_event_t *event, __u64 pid_tgid)
+static __always_inline void enrich_event_with_conn_info(struct tls_event_t *event,
+                                                         __u32 pid, __u32 fd)
 {
-    struct conn_info_t *ci = bpf_map_lookup_elem(&conn_info_map, &pid_tgid);
+    struct conn_key_t key = { .pid = pid, .fd = fd };
+    struct conn_info_t *ci = bpf_map_lookup_elem(&conn_info_map, &key);
     if (!ci)
         return;
 
@@ -264,6 +273,7 @@ int probe_connect_enter(struct pt_regs *ctx)
     __u64 id = bpf_get_current_pid_tgid();
     struct connect_args_t args = {};
 
+    args.fd = (int)PT_REGS_PARM1(ctx);  /* first arg to connect(fd, addr, addrlen) */
     args.addr = (struct sockaddr *)PT_REGS_PARM2(ctx);
     args.addrlen = (int)PT_REGS_PARM3(ctx);
 
@@ -326,10 +336,18 @@ int probe_connect_return(struct pt_regs *ctx)
         goto cleanup;
     }
 
+    /* Build conn_key from {pid, fd} instead of pid_tgid.
+     * This ensures SSL uprobes (which extract fd via get_ssl_fd()) can
+     * always find the entry, even in containerized environments where
+     * tcp_set_state fires in a different thread context. */
+    __u32 conn_pid = id >> 32;
+    __u32 conn_fd = (__u32)args->fd;
+    struct conn_key_t conn_key = { .pid = conn_pid, .fd = conn_fd };
+
     /* Check if tcp_set_state already populated a complete entry with local
      * address.  If so, don't overwrite — the tcp_set_state entry is more
-     * complete (has both local + remote).  This fixes the src_ip race. */
-    struct conn_info_t *existing = bpf_map_lookup_elem(&conn_info_map, &id);
+     * complete (has both local + remote). */
+    struct conn_info_t *existing = bpf_map_lookup_elem(&conn_info_map, &conn_key);
     if (existing && existing->local_port != 0)
         goto cleanup;
 
@@ -353,7 +371,7 @@ int probe_connect_return(struct pt_regs *ctx)
         goto cleanup;
     }
 
-    bpf_map_update_elem(&conn_info_map, &id, &ci, BPF_ANY);
+    bpf_map_update_elem(&conn_info_map, &conn_key, &ci, BPF_ANY);
 
 cleanup:
     bpf_map_delete_elem(&connect_args_map, &id);
@@ -366,7 +384,14 @@ cleanup:
  * transitions state. When state == TCP_ESTABLISHED, struct sock has all
  * addressing info populated. This fires DURING connect() — before the
  * connect kretprobe — so we create/populate conn_info_t directly from
- * struct sock rather than relying on a prior connect_return entry. */
+ * struct sock rather than relying on a prior connect_return entry.
+ *
+ * To build the conn_key_t {pid, fd}, we look up the connect_args_map
+ * (which stores the fd from the connect() syscall entry). If we're in
+ * the same thread context as connect (bare metal), this works perfectly.
+ * In containerized environments where tcp_set_state fires in softirq,
+ * bpf_get_current_pid_tgid() returns a different value, so the lookup
+ * fails and we skip — connect_return will still populate remote addr. */
 
 SEC("kprobe/tcp_set_state")
 int probe_tcp_set_state(struct pt_regs *ctx)
@@ -380,6 +405,17 @@ int probe_tcp_set_state(struct pt_regs *ctx)
         return 0;
 
     __u64 id = bpf_get_current_pid_tgid();
+
+    /* Look up the connect_args_map to get the fd.
+     * This only succeeds when tcp_set_state fires in the same thread
+     * context as connect() (i.e., in process context, not softirq). */
+    struct connect_args_t *c_args = bpf_map_lookup_elem(&connect_args_map, &id);
+    if (!c_args)
+        return 0;  /* Can't determine fd — skip (connect_return will handle it) */
+
+    __u32 pid = id >> 32;
+    __u32 fd = (__u32)c_args->fd;
+    struct conn_key_t key = { .pid = pid, .fd = fd };
 
     /* Read address family */
     short family = 0;
@@ -430,7 +466,7 @@ int probe_tcp_set_state(struct pt_regs *ctx)
         return 0;
     }
 
-    bpf_map_update_elem(&conn_info_map, &id, &ci, BPF_ANY);
+    bpf_map_update_elem(&conn_info_map, &key, &ci, BPF_ANY);
     return 0;
 }
 
@@ -748,7 +784,16 @@ int probe_ssl_read_return(struct pt_regs *ctx)
     int ssl_fd = get_ssl_fd(args->ssl);
 
     if (ret <= 0) {
-        /* SSL_read returns: 0 = peer closed connection, <0 = error.
+        /* Issue 2 fix: SSL_read returning -1 typically means
+         * SSL_ERROR_WANT_READ/WANT_WRITE — normal non-blocking I/O retry
+         * signals, not actual errors. The BPF probe can't call SSL_get_error()
+         * to distinguish, so we suppress -1 entirely. Real errors will surface
+         * as ret==0 (clean shutdown) or on the next call that returns a
+         * different error code. */
+        if (ret == -1)
+            goto cleanup;
+
+        /* SSL_read returns: 0 = peer closed connection, <0 = actual error.
          * Emit EVENT_TLS_CLOSE for ret==0, EVENT_TLS_ERROR for ret<0 (#3 fix). */
         struct tls_event_t *err_event = get_event_buf();
         if (err_event) {
@@ -763,7 +808,8 @@ int probe_ssl_read_return(struct pt_regs *ctx)
             err_event->tls_version = get_tls_version(args->ssl);
             err_event->data_len = 0;
             bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
-            enrich_event_with_conn_info(err_event, id);
+            enrich_event_with_conn_info(err_event, id >> 32,
+                                        ssl_fd >= 0 ? (__u32)ssl_fd : 0);
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
             bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
@@ -786,7 +832,8 @@ int probe_ssl_read_return(struct pt_regs *ctx)
     event->tls_version = get_tls_version(args->ssl);
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
-    enrich_event_with_conn_info(event, id);
+    enrich_event_with_conn_info(event, id >> 32,
+                                ssl_fd >= 0 ? (__u32)ssl_fd : 0);
     enrich_event_with_cipher(event, args->ssl);
     event->is_mtls = get_mtls_status(args->ssl);
 
@@ -836,7 +883,11 @@ int probe_ssl_write_return(struct pt_regs *ctx)
     int ssl_fd = get_ssl_fd(args->ssl);
 
     if (ret <= 0) {
-        /* SSL_write returns: 0 = connection closed, <0 = error (#3 fix) */
+        /* Issue 2 fix: suppress SSL_ERROR_WANT_READ/WANT_WRITE (-1) noise */
+        if (ret == -1)
+            goto cleanup;
+
+        /* SSL_write returns: 0 = connection closed, <0 = actual error (#3 fix) */
         struct tls_event_t *err_event = get_event_buf();
         if (err_event) {
             err_event->timestamp_ns = bpf_ktime_get_ns();
@@ -850,7 +901,8 @@ int probe_ssl_write_return(struct pt_regs *ctx)
             err_event->tls_version = get_tls_version(args->ssl);
             err_event->data_len = 0;
             bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
-            enrich_event_with_conn_info(err_event, id);
+            enrich_event_with_conn_info(err_event, id >> 32,
+                                        ssl_fd >= 0 ? (__u32)ssl_fd : 0);
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
             bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
@@ -873,7 +925,8 @@ int probe_ssl_write_return(struct pt_regs *ctx)
     event->tls_version = get_tls_version(args->ssl);
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
-    enrich_event_with_conn_info(event, id);
+    enrich_event_with_conn_info(event, id >> 32,
+                                ssl_fd >= 0 ? (__u32)ssl_fd : 0);
     enrich_event_with_cipher(event, args->ssl);
     event->is_mtls = get_mtls_status(args->ssl);
 
