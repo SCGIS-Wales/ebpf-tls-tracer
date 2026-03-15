@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
+#include <regex.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -23,6 +24,7 @@
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
 #define MAX_PROBES         8
+#define MAX_SANITIZE_PATTERNS 32
 
 static volatile sig_atomic_t exiting = 0;
 
@@ -30,6 +32,12 @@ static volatile sig_atomic_t exiting = 0;
 enum output_fmt {
     FMT_TEXT,
     FMT_JSON,
+};
+
+/* Compiled sanitization regex patterns */
+struct sanitize_pattern {
+    regex_t regex;
+    char    original[256];  /* original pattern string for debugging */
 };
 
 /* Runtime configuration */
@@ -41,16 +49,19 @@ struct config {
     int             hex_dump;
     int             data_only;
     int             verbose;
+    struct sanitize_pattern sanitize[MAX_SANITIZE_PATTERNS];
+    int             sanitize_count;
 };
 
 static struct config cfg = {
-    .format     = FMT_TEXT,
-    .ssl_lib    = "",
-    .filter_pid = 0,
-    .filter_uid = 0,
-    .hex_dump   = 0,
-    .data_only  = 0,
-    .verbose    = 0,
+    .format          = FMT_TEXT,
+    .ssl_lib         = "",
+    .filter_pid      = 0,
+    .filter_uid      = 0,
+    .hex_dump        = 0,
+    .data_only       = 0,
+    .verbose         = 0,
+    .sanitize_count  = 0,
 };
 
 static void sig_handler(int signo)
@@ -59,9 +70,65 @@ static void sig_handler(int signo)
     exiting = 1;
 }
 
+/* Add a sanitization regex pattern (case-insensitive) */
+static int add_sanitize_pattern(const char *pattern)
+{
+    if (cfg.sanitize_count >= MAX_SANITIZE_PATTERNS) {
+        fprintf(stderr, "Error: Too many sanitize patterns (max %d)\n",
+                MAX_SANITIZE_PATTERNS);
+        return -1;
+    }
+    struct sanitize_pattern *sp = &cfg.sanitize[cfg.sanitize_count];
+    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE);
+    if (ret != 0) {
+        char errbuf[128];
+        regerror(ret, &sp->regex, errbuf, sizeof(errbuf));
+        fprintf(stderr, "Error: Invalid sanitize pattern '%s': %s\n",
+                pattern, errbuf);
+        return -1;
+    }
+    snprintf(sp->original, sizeof(sp->original), "%s", pattern);
+    cfg.sanitize_count++;
+    return 0;
+}
+
+/* Apply sanitization patterns to a string, replacing matches with [REDACTED] */
+static void sanitize_string(char *str, size_t len)
+{
+    if (cfg.sanitize_count == 0 || !str || !str[0])
+        return;
+
+    for (int i = 0; i < cfg.sanitize_count; i++) {
+        regmatch_t match;
+        char *p = str;
+        while (regexec(&cfg.sanitize[i].regex, p, 1, &match, 0) == 0) {
+            size_t match_start = (size_t)(p - str) + (size_t)match.rm_so;
+            size_t match_len = (size_t)(match.rm_eo - match.rm_so);
+            const char *redacted = "[REDACTED]";
+            size_t redacted_len = 10;
+
+            if (match_len == 0)
+                break;
+
+            /* Calculate new length */
+            size_t current_len = strlen(str);
+            if (current_len - match_len + redacted_len >= len)
+                break;  /* Not enough space */
+
+            /* Shift remainder and insert [REDACTED] */
+            memmove(str + match_start + redacted_len,
+                    str + match_start + match_len,
+                    current_len - match_start - match_len + 1);
+            memcpy(str + match_start, redacted, redacted_len);
+
+            p = str + match_start + redacted_len;
+        }
+    }
+}
+
 static const char *direction_str(int dir)
 {
-    return dir == DIRECTION_READ ? "READ" : "WRITE";
+    return dir == DIRECTION_READ ? "RESPONSE" : "REQUEST";
 }
 
 static void format_addr(const struct tls_event_t *event, char *buf, size_t buflen)
@@ -387,6 +454,12 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         if (event->direction == DIRECTION_WRITE && data_len > 0)
             parse_http_info(event->data, data_len, &http);
 
+        /* Apply sanitization patterns to HTTP fields */
+        if (http.path[0])
+            sanitize_string(http.path, sizeof(http.path));
+        if (http.host[0])
+            sanitize_string(http.host, sizeof(http.host));
+
         /* Emit one self-contained JSON event */
         printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
                "\"pid\":%u,\"tid\":%u,\"uid\":%u,"
@@ -417,7 +490,17 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             print_json_string(meta.container_id);
         }
 
-        /* HTTP Layer 7 fields (only if HTTP detected) */
+        /* Protocol and Layer 7 fields */
+        const char *l7_proto = "unknown";
+        if (http.method[0])
+            l7_proto = "https";
+        else if (data_len > 0 && event->direction == DIRECTION_READ) {
+            /* Check if response starts with "HTTP/" */
+            if (data_len >= 5 && strncmp(event->data, "HTTP/", 5) == 0)
+                l7_proto = "https";
+        }
+        printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
+
         if (http.method[0]) {
             printf(",\"http_method\":\"%s\"", http.method);
             if (http.path[0]) {
@@ -430,12 +513,6 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
         }
 
-        if (!c->data_only) {
-            printf(",\"data\":\"");
-            for (__u32 i = 0; i < data_len; i++)
-                printf("\\x%02x", (unsigned char)event->data[i]);
-            printf("\"");
-        }
         printf("}\n");
     } else {
         if (!c->data_only) {
@@ -516,6 +593,7 @@ static void usage(const char *prog)
         "  -f, --format FMT       Output format: text (default) or json\n"
         "  -x, --hex              Show hex dump of captured data\n"
         "  -d, --data-only        Print only captured data (no headers)\n"
+        "  -s, --sanitize REGEX   Sanitize URLs matching REGEX (case-insensitive, repeatable)\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help message\n"
         "\n"
@@ -524,9 +602,10 @@ static void usage(const char *prog)
         "  %s -p 1234             Trace TLS traffic for PID 1234\n"
         "  %s -f json             Output in JSON format\n"
         "  %s -x -p 1234          Hex dump of TLS data for PID 1234\n"
+        "  %s -s 'apikey=[^&]*'   Redact API keys from logged URLs\n"
         "\n"
         "Requires root privileges (or CAP_BPF + CAP_PERFMON).\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
@@ -545,13 +624,14 @@ int main(int argc, char **argv)
         {"format",    required_argument, NULL, 'f'},
         {"hex",       no_argument,       NULL, 'x'},
         {"data-only", no_argument,       NULL, 'd'},
+        {"sanitize",  required_argument, NULL, 's'},
         {"verbose",   no_argument,       NULL, 'v'},
         {"help",      no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xdvh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p':
             cfg.filter_pid = (__u32)atoi(optarg);
@@ -577,6 +657,10 @@ int main(int argc, char **argv)
             break;
         case 'd':
             cfg.data_only = 1;
+            break;
+        case 's':
+            if (add_sanitize_pattern(optarg) != 0)
+                return 1;
             break;
         case 'v':
             cfg.verbose = 1;
@@ -745,7 +829,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "... Press Ctrl+C to stop.\n");
     }
 
+    /* Touch health file to signal readiness */
+    const char *health_file = "/tmp/tls_tracer_healthy";
+    FILE *hf = fopen(health_file, "w");
+    if (hf) {
+        fprintf(hf, "ready\n");
+        fclose(hf);
+    }
+
     /* Main event loop */
+    int poll_count = 0;
     while (!exiting) {
         err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT);
         if (err < 0 && err != -EINTR) {
@@ -754,7 +847,20 @@ int main(int argc, char **argv)
             break;
         }
         err = 0;
+
+        /* Update health file every ~10 seconds (100ms poll * 100) */
+        if (++poll_count >= 100) {
+            poll_count = 0;
+            hf = fopen(health_file, "w");
+            if (hf) {
+                fprintf(hf, "%ld\n", (long)time(NULL));
+                fclose(hf);
+            }
+        }
     }
+
+    /* Remove health file on shutdown */
+    unlink(health_file);
 
     if (cfg.verbose)
         fprintf(stderr, "\nExiting...\n");

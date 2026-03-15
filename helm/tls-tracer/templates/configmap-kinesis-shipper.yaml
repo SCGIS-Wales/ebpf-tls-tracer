@@ -1,0 +1,128 @@
+{{- if .Values.kinesis.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}-kinesis-shipper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+data:
+  kinesis_shipper.py: |
+    #!/usr/bin/env python3
+    """Kinesis Firehose shipper for TLS Tracer.
+
+    Reads JSON log lines and forwards them to an AWS Kinesis Firehose
+    delivery stream using PutRecordBatch.
+
+    Uses IRSA for authentication (no explicit credentials needed).
+    """
+
+    import os
+    import sys
+    import json
+    import time
+    import signal
+
+    import boto3
+
+    STREAM = os.environ.get("DELIVERY_STREAM", "")
+    AWS_REGION = os.environ.get("AWS_REGION", "eu-west-1")
+    FLUSH_INTERVAL = int(os.environ.get("FLUSH_INTERVAL", "30"))
+    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500"))
+    CLUSTER = os.environ.get("CLUSTER_NAME", "unknown")
+    NAMESPACE = os.environ.get("TARGET_NAMESPACE", "unknown")
+    APP_NAME = os.environ.get("APP_NAME", "unknown")
+    ENVIRONMENT = os.environ.get("ENVIRONMENT", "unknown")
+    NODE_NAME = os.environ.get("NODE_NAME", "unknown")
+
+    running = True
+
+
+    def signal_handler(signum, frame):
+        global running
+        running = False
+
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+
+    def enrich_record(line):
+        """Add cluster/namespace/node metadata to each JSON record."""
+        try:
+            record = json.loads(line)
+            record.setdefault("cluster_name", CLUSTER)
+            record.setdefault("target_namespace", NAMESPACE)
+            record.setdefault("app_name", APP_NAME)
+            record.setdefault("environment", ENVIRONMENT)
+            record.setdefault("node_name", NODE_NAME)
+            return json.dumps(record, separators=(",", ":"))
+        except json.JSONDecodeError:
+            return line
+
+
+    def flush_batch(firehose, batch):
+        """Send a batch of records to Kinesis Firehose."""
+        if not batch or not STREAM:
+            return
+        records = [{"Data": (enrich_record(line) + "\n").encode("utf-8")} for line in batch]
+        try:
+            # Firehose PutRecordBatch max 500 records per call
+            for i in range(0, len(records), 500):
+                chunk = records[i : i + 500]
+                resp = firehose.put_record_batch(
+                    DeliveryStreamName=STREAM, Records=chunk
+                )
+                failed = resp.get("FailedPutCount", 0)
+                if failed > 0:
+                    print(
+                        f"[kinesis-shipper] WARNING: {failed}/{len(chunk)} records failed",
+                        file=sys.stderr,
+                    )
+            print(
+                f"[kinesis-shipper] Sent {len(records)} records to {STREAM}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"[kinesis-shipper] ERROR: {e}", file=sys.stderr)
+
+
+    def main():
+        if not STREAM:
+            print("[kinesis-shipper] ERROR: DELIVERY_STREAM not set", file=sys.stderr)
+            sys.exit(1)
+
+        firehose = boto3.client("firehose", region_name=AWS_REGION)
+        batch = []
+        last_flush = time.time()
+
+        log_file = "/var/log/tls-tracer/events.json"
+        print(f"[kinesis-shipper] Watching {log_file} for JSON events", file=sys.stderr)
+
+        while running:
+            try:
+                if os.path.exists(log_file):
+                    with open(log_file, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                batch.append(line)
+                    open(log_file, "w").close()
+            except Exception as e:
+                print(f"[kinesis-shipper] Read error: {e}", file=sys.stderr)
+
+            now = time.time()
+            if len(batch) >= BATCH_SIZE or (now - last_flush >= FLUSH_INTERVAL and batch):
+                flush_batch(firehose, batch)
+                batch = []
+                last_flush = now
+
+            time.sleep(1)
+
+        if batch:
+            flush_batch(firehose, batch)
+
+
+    if __name__ == "__main__":
+        main()
+{{- end }}

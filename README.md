@@ -141,6 +141,7 @@ sudo ./bin/tls_tracer -l /path/to/libssl.so
 | `-f` | `--format FMT` | Output format: `text` (default) or `json` |
 | `-x` | `--hex` | Show hex dump of captured data |
 | `-d` | `--data-only` | Print only captured data (no headers) |
+| `-s` | `--sanitize REGEX` | Sanitize URLs matching REGEX (case-insensitive, repeatable) |
 | `-v` | `--verbose` | Verbose output (shows library path, probe status) |
 | `-h` | `--help` | Show help message |
 
@@ -149,11 +150,11 @@ sudo ./bin/tls_tracer -l /path/to/libssl.so
 **Text mode (default):**
 
 ```
-12:34:56     WRITE  PID=1234   TID=1234   UID=1000 COMM=curl            ADDR=93.184.216.34:443  LEN=78
+12:34:56     REQUEST  PID=1234   TID=1234   UID=1000 COMM=curl            ADDR=93.184.216.34:443  LEN=78
 GET /api/v1/status HTTP/1.1
 Host: example.com
 
-12:34:56     READ   PID=1234   TID=1234   UID=1000 COMM=curl            ADDR=93.184.216.34:443  LEN=256
+12:34:56     RESPONSE PID=1234   TID=1234   UID=1000 COMM=curl            ADDR=93.184.216.34:443  LEN=256
 HTTP/1.1 200 OK
 Content-Type: application/json
 ```
@@ -161,7 +162,7 @@ Content-Type: application/json
 **JSON mode (`-f json`):**
 
 ```json
-{"timestamp_ns":123456789,"pid":1234,"tid":1234,"uid":1000,"comm":"curl","direction":"WRITE","remote_addr":"93.184.216.34:443","data_len":78,"data":"..."}
+{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":123456789,"pid":1234,"tid":1234,"uid":1000,"comm":"curl","direction":"REQUEST","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"transport":"tls","protocol":"https","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com"}
 ```
 
 ## Docker
@@ -267,7 +268,7 @@ TLS Tracer runs as a **DaemonSet** to monitor outbound TLS traffic from all proc
 | Requirement | Details |
 |---|---|
 | **Kubernetes version** | 1.34+ |
-| **Node OS** | Linux with kernel 6.1+ (AL2023 recommended) |
+| **Node OS** | Linux with kernel 6.1+ (AL2023 recommended — ships kernel 6.12 on EKS 1.34) |
 | **Node kernel config** | eBPF, kprobes, uprobes enabled (see Prerequisites above) |
 | **Container runtime** | containerd or CRI-O with privileged container support |
 | **RBAC** | Cluster admin access to create privileged DaemonSets |
@@ -319,20 +320,93 @@ kubectl -n tls-tracer logs -l app.kubernetes.io/name=tls-tracer --tail=50 -f
 | `filterPid` | `0` | Filter by PID (0 = all) |
 | `filterUid` | `0` | Filter by UID (0 = all) |
 | `sslLibPath` | `""` | Custom libssl.so path (empty = auto-detect) |
+| `sanitizePatterns` | `["apikey=[^&]*"]` | URL sanitization regex patterns (case-insensitive) |
+| `companyPrefix` | `""` | Prefix for all resource names (e.g., `acme-`) |
+| `metadata.awsAccountId` | `""` | AWS account ID (for S3/Kinesis paths) |
+| `metadata.awsRegion` | `eu-west-1` | AWS region |
+| `metadata.clusterName` | `""` | EKS cluster name |
+| `metadata.targetNamespace` | `""` | K8s namespace being monitored |
+| `metadata.applicationName` | `""` | Application name (e.g., `apigee`) |
+| `metadata.environment` | `""` | Environment label (e.g., `production`) |
 | `image.repository` | `ghcr.io/scgis-wales/ebpf_tls_cli` | Container image |
 | `image.tag` | `latest` | Image tag |
 
-### JSON Log Output
+#### AWS S3 Log Shipping
 
-When deployed with `-f json` (the Helm chart default), each captured TLS event is a **single self-contained JSON line** with all context:
+Ship JSON logs to S3 using Apache Hive-style directory partitioning. Uses a Python (boto3) sidecar with IRSA authentication. **Disabled by default.**
 
-```json
-{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":1710500000000000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"WRITE","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com","data":"\\x47\\x45\\x54..."}
-{"timestamp":"2026-03-15T10:30:00.234567Z","timestamp_ns":1710500000100000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"READ","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":256,"k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6","data":"\\x48\\x54\\x54\\x50..."}
-{"timestamp":"2026-03-15T10:30:01.000000Z","timestamp_ns":1710500001000000,"pid":23456,"tid":23456,"uid":0,"comm":"java","direction":"WRITE","src_ip":"10.0.5.24","src_port":38901,"dst_ip":"10.0.1.50","dst_port":8443,"data_len":142,"k8s_pod":"apigee-cassandra-0","k8s_namespace":"apigee","container_id":"f6e5d4c3b2a1","http_method":"POST","http_path":"/v1/organizations","http_host":"management.apigee.internal","data":"\\x50\\x4f\\x53\\x54..."}
+| Value | Default | Description |
+|---|---|---|
+| `s3.enabled` | `false` | Enable S3 log shipping sidecar |
+| `s3.bucket` | `""` | S3 bucket name |
+| `s3.prefix` | `tls-tracer-logs` | S3 key prefix |
+| `s3.flushIntervalSeconds` | `60` | Flush interval |
+| `s3.batchSize` | `1000` | Max records per upload |
+
+S3 path format (Apache Hive partitioning):
+```
+s3://<bucket>/<prefix>/account=<id>/region=<region>/cluster=<name>/
+  namespace=<ns>/app=<app>/env=<env>/year=YYYY/month=MM/day=DD/
+  hour=HH/<node>-<timestamp>.json
 ```
 
-Each JSON event contains:
+#### AWS Kinesis Firehose
+
+Forward JSON logs to Kinesis Firehose delivery stream. Uses a Python (boto3) sidecar with IRSA authentication. **Disabled by default.**
+
+| Value | Default | Description |
+|---|---|---|
+| `kinesis.enabled` | `false` | Enable Kinesis Firehose sidecar |
+| `kinesis.deliveryStreamName` | `""` | Firehose delivery stream name |
+| `kinesis.batchSize` | `500` | Records per PutRecordBatch call |
+| `kinesis.flushIntervalSeconds` | `30` | Flush interval |
+
+#### IRSA (IAM Roles for Service Accounts)
+
+Both S3 and Kinesis sidecars use IRSA for AWS authentication. Configure the IAM role ARN in the service account annotations:
+
+```yaml
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/tls-tracer-role"
+```
+
+Required IAM permissions:
+- **S3**: `s3:PutObject`, `s3:GetBucketLocation`
+- **Kinesis**: `firehose:PutRecord`, `firehose:PutRecordBatch`
+
+#### URL Sanitization
+
+Sensitive data in HTTP paths and Host headers can be automatically redacted using regex patterns. Matches are replaced with `[REDACTED]`. Patterns are case-insensitive (POSIX ERE).
+
+**CLI usage:**
+```bash
+# Redact API keys and tokens from logged URLs
+sudo ./bin/tls_tracer -f json -s 'apikey=[^&]*' -s 'token=[^&]*' -s 'password=[^&]*'
+```
+
+**Helm values:**
+```yaml
+sanitizePatterns:
+  - "apikey=[^&]*"
+  - "secret=[^&]*"
+  - "password=[^&]*"
+  - "token=[^&]*"
+  - "access_key=[^&]*"
+```
+
+Before: `GET /api/v1/data?apikey=sk_live_abc123&format=json`
+After:  `GET /api/v1/data?[REDACTED]&format=json`
+
+### JSON Log Output
+
+Each captured TLS event is a **single self-contained JSON line**:
+
+```json
+{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":1710500000000000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"REQUEST","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"transport":"tls","protocol":"https","k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com"}
+{"timestamp":"2026-03-15T10:30:00.234567Z","timestamp_ns":1710500000100000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"RESPONSE","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":256,"transport":"tls","protocol":"https","k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6"}
+{"timestamp":"2026-03-15T10:30:01.000000Z","timestamp_ns":1710500001000000,"pid":23456,"tid":23456,"uid":0,"comm":"java","direction":"REQUEST","src_ip":"10.0.5.24","src_port":38901,"dst_ip":"10.0.1.50","dst_port":8443,"data_len":142,"transport":"tls","protocol":"https","k8s_pod":"apigee-cassandra-0","k8s_namespace":"apigee","container_id":"f6e5d4c3b2a1","http_method":"POST","http_path":"/v1/organizations","http_host":"management.apigee.internal"}
+```
 
 | Field | Description |
 |---|---|
@@ -340,19 +414,20 @@ Each JSON event contains:
 | `timestamp_ns` | Kernel monotonic timestamp in nanoseconds |
 | `pid`/`tid` | Process and thread IDs |
 | `comm` | Process command name (e.g., `curl`, `java`, `node`, `python3`) |
-| `direction` | `WRITE` (outbound request) or `READ` (inbound response) |
+| `direction` | `REQUEST` (outbound to server) or `RESPONSE` (inbound from server) |
 | `src_ip`/`src_port` | Source (local) IP address and port |
 | `dst_ip`/`dst_port` | Destination (remote) IP address and port |
+| `transport` | Transport layer: `tls` (all captured traffic goes through SSL) |
+| `protocol` | Application protocol: `https` (HTTP detected) or `unknown` |
 | `k8s_pod` | Kubernetes pod name (from downward API `POD_NAME` or `HOSTNAME`) |
 | `k8s_namespace` | Kubernetes namespace (from downward API `POD_NAMESPACE`) |
 | `container_id` | Short container ID (from cgroup) |
-| `http_method` | HTTP method if detected: GET, POST, PUT, DELETE, etc. |
+| `http_method` | HTTP method: GET, POST, PUT, DELETE, PATCH, etc. |
 | `http_path` | HTTP request path (e.g., `/api/v1/status`) |
 | `http_host` | HTTP Host header value (the DNS hostname) |
 | `data_len` | Length of captured plaintext data |
-| `data` | Hex-encoded plaintext TLS data |
 
-K8s metadata fields (`k8s_pod`, `k8s_namespace`, `container_id`) and HTTP fields (`http_method`, `http_path`, `http_host`) are only present when detected. To enable K8s metadata, configure the downward API in your pod spec:
+K8s and HTTP fields are only present when detected. To enable K8s metadata on monitored pods, configure the downward API:
 
 ```yaml
 env:
@@ -388,19 +463,23 @@ dnf install -y libbpf openssl-libs bpftool
 
 ### What Needs to Be Configured
 
-For Kubernetes 1.34+ on Linux kernel 6.x, the following must be true on each node:
+For Kubernetes 1.34+ on Linux kernel 6.x, the following must be true on each node.
 
-1. **Kernel modules loaded** (usually auto-loaded):
+**EKS 1.34 with AL2023**: The EKS-optimized AL2023 AMI ships with **kernel 6.12** (e.g., `6.12.73-95.123.amzn2023`). All eBPF features — BTF, uprobes, kprobes, BPF JIT, debugfs, tracefs, and the BPF filesystem — are **fully enabled and auto-mounted out of the box**. No kernel configuration, module loading, or filesystem mounting is required. Simply deploy the Helm chart.
+
+For non-AL2023 or custom AMIs, verify:
+
+1. **Kernel modules loaded** (usually auto-loaded on AL2023):
    ```bash
    lsmod | grep -E 'bpf|uprobe|kprobe'
    ```
 
-2. **BPF filesystem mounted** (auto-mounted on modern distros):
+2. **BPF filesystem mounted** (auto-mounted on AL2023):
    ```bash
    mount -t bpf bpf /sys/fs/bpf
    ```
 
-3. **debugfs / tracefs mounted** (required for uprobe events):
+3. **debugfs / tracefs mounted** (auto-mounted on AL2023):
    ```bash
    mount -t debugfs debugfs /sys/kernel/debug
    mount -t tracefs tracefs /sys/kernel/tracing
