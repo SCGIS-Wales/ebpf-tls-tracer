@@ -26,40 +26,57 @@
 
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
-#define MAX_PROBES         16
+#define MAX_PROBES         32
 #define MAX_SANITIZE_PATTERNS 32
-#define DNS_CACHE_SIZE     4096  /* max cached hostname entries */
+#define DNS_CACHE_SIZE     4096  /* max cached hostname entries (must be power of 2) */
 #define DNS_CACHE_TTL      300   /* seconds before expiry */
+#define K8S_CACHE_SIZE     256   /* max cached PID→k8s_meta entries (must be power of 2) */
+#define K8S_CACHE_TTL      60    /* seconds before re-reading /proc */
 
 static volatile sig_atomic_t exiting = 0;
 static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+signum (#2 fix) */
 
 /* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
+ * R-1 fix: Uses open-addressing hash table for O(1) lookup instead of O(n)
+ * linear scan. Key is hash(pid, fd). Slot states: EMPTY/OCCUPIED/DELETED.
  * When a Host: header is parsed, the hostname is stored here.
  * Subsequent events on the same connection inherit the cached hostname
  * even if they don't contain an HTTP Host header. */
+#define DNS_SLOT_EMPTY    0
+#define DNS_SLOT_OCCUPIED 1
+#define DNS_SLOT_DELETED  2
+
 struct dns_cache_entry {
-    __u32 pid;
-    __u32 fd;
+    __u32  pid;
+    __u32  fd;
     time_t last_seen;
     char   hostname[256];
+    __u8   state;
 };
 
 static struct dns_cache_entry dns_cache[DNS_CACHE_SIZE];
-static int dns_cache_count = 0;
+
+static inline __u32 dns_hash(__u32 pid, __u32 fd)
+{
+    return (pid ^ (fd * 2654435761u)) & (DNS_CACHE_SIZE - 1);
+}
 
 static const char *dns_cache_lookup(__u32 pid, __u32 fd)
 {
     time_t now = time(NULL);
-    for (int i = 0; i < dns_cache_count; i++) {
-        if (dns_cache[i].pid == pid && dns_cache[i].fd == fd) {
-            if (now - dns_cache[i].last_seen > DNS_CACHE_TTL) {
-                /* Expired — evict by swapping with last entry */
-                dns_cache[i] = dns_cache[--dns_cache_count];
+    __u32 idx = dns_hash(pid, fd);
+    for (__u32 i = 0; i < DNS_CACHE_SIZE; i++) {
+        __u32 slot = (idx + i) & (DNS_CACHE_SIZE - 1);
+        if (dns_cache[slot].state == DNS_SLOT_EMPTY)
+            return NULL;
+        if (dns_cache[slot].state == DNS_SLOT_OCCUPIED &&
+            dns_cache[slot].pid == pid && dns_cache[slot].fd == fd) {
+            if (now - dns_cache[slot].last_seen > DNS_CACHE_TTL) {
+                dns_cache[slot].state = DNS_SLOT_DELETED;
                 return NULL;
             }
-            dns_cache[i].last_seen = now;
-            return dns_cache[i].hostname;
+            dns_cache[slot].last_seen = now;
+            return dns_cache[slot].hostname;
         }
     }
     return NULL;
@@ -71,41 +88,46 @@ static void dns_cache_store(__u32 pid, __u32 fd, const char *hostname)
         return;
 
     time_t now = time(NULL);
+    __u32 idx = dns_hash(pid, fd);
+    __u32 first_avail = UINT32_MAX;
 
-    /* Update existing entry */
-    for (int i = 0; i < dns_cache_count; i++) {
-        if (dns_cache[i].pid == pid && dns_cache[i].fd == fd) {
-            snprintf(dns_cache[i].hostname, sizeof(dns_cache[i].hostname), "%s", hostname);
-            dns_cache[i].last_seen = now;
+    for (__u32 i = 0; i < DNS_CACHE_SIZE; i++) {
+        __u32 slot = (idx + i) & (DNS_CACHE_SIZE - 1);
+        if (dns_cache[slot].state == DNS_SLOT_EMPTY) {
+            __u32 target = (first_avail != UINT32_MAX) ? first_avail : slot;
+            dns_cache[target].pid = pid;
+            dns_cache[target].fd = fd;
+            dns_cache[target].last_seen = now;
+            dns_cache[target].state = DNS_SLOT_OCCUPIED;
+            snprintf(dns_cache[target].hostname,
+                     sizeof(dns_cache[target].hostname), "%s", hostname);
             return;
         }
-    }
-
-    /* Evict expired entries first */
-    for (int i = 0; i < dns_cache_count; ) {
-        if (now - dns_cache[i].last_seen > DNS_CACHE_TTL) {
-            dns_cache[i] = dns_cache[--dns_cache_count];
-        } else {
-            i++;
+        if (dns_cache[slot].state == DNS_SLOT_DELETED && first_avail == UINT32_MAX)
+            first_avail = slot;
+        if (dns_cache[slot].state == DNS_SLOT_OCCUPIED &&
+            dns_cache[slot].pid == pid && dns_cache[slot].fd == fd) {
+            dns_cache[slot].last_seen = now;
+            snprintf(dns_cache[slot].hostname,
+                     sizeof(dns_cache[slot].hostname), "%s", hostname);
+            return;
+        }
+        /* Opportunistically evict expired entries */
+        if (dns_cache[slot].state == DNS_SLOT_OCCUPIED &&
+            now - dns_cache[slot].last_seen > DNS_CACHE_TTL) {
+            dns_cache[slot].state = DNS_SLOT_DELETED;
+            if (first_avail == UINT32_MAX)
+                first_avail = slot;
         }
     }
-
-    /* Add new entry (evict oldest if full) */
-    int slot;
-    if (dns_cache_count < DNS_CACHE_SIZE) {
-        slot = dns_cache_count++;
-    } else {
-        /* Find and evict the oldest entry */
-        slot = 0;
-        for (int i = 1; i < DNS_CACHE_SIZE; i++) {
-            if (dns_cache[i].last_seen < dns_cache[slot].last_seen)
-                slot = i;
-        }
-    }
-    dns_cache[slot].pid = pid;
-    dns_cache[slot].fd = fd;
-    dns_cache[slot].last_seen = now;
-    snprintf(dns_cache[slot].hostname, sizeof(dns_cache[slot].hostname), "%s", hostname);
+    /* Table full — use first available or overwrite hash index */
+    __u32 target = (first_avail != UINT32_MAX) ? first_avail : idx;
+    dns_cache[target].pid = pid;
+    dns_cache[target].fd = fd;
+    dns_cache[target].last_seen = now;
+    dns_cache[target].state = DNS_SLOT_OCCUPIED;
+    snprintf(dns_cache[target].hostname,
+             sizeof(dns_cache[target].hostname), "%s", hostname);
 }
 
 /* Output format */
@@ -380,6 +402,72 @@ static void get_k8s_meta(pid_t pid, struct k8s_meta *meta)
 
     read_proc_env(pid, "POD_NAMESPACE", meta->pod_namespace, sizeof(meta->pod_namespace));
     read_container_id(pid, meta->container_id, sizeof(meta->container_id));
+}
+
+/* --- R-3 fix: K8s metadata cache per PID ---
+ * Avoids reading /proc/<pid>/environ and /proc/<pid>/cgroup on every
+ * single TLS event. Pod metadata doesn't change during a process's lifetime,
+ * so we cache it with a TTL for safety (handles PID reuse). */
+struct k8s_cache_entry {
+    pid_t  pid;
+    time_t last_seen;
+    struct k8s_meta meta;
+    __u8   valid;
+};
+
+static struct k8s_cache_entry k8s_cache[K8S_CACHE_SIZE];
+
+static inline __u32 k8s_hash(pid_t pid)
+{
+    return ((__u32)pid * 2654435761u) & (K8S_CACHE_SIZE - 1);
+}
+
+static int k8s_cache_lookup(pid_t pid, struct k8s_meta *out)
+{
+    time_t now = time(NULL);
+    __u32 idx = k8s_hash(pid);
+    for (__u32 i = 0; i < K8S_CACHE_SIZE; i++) {
+        __u32 slot = (idx + i) & (K8S_CACHE_SIZE - 1);
+        if (!k8s_cache[slot].valid)
+            return 0;
+        if (k8s_cache[slot].pid == pid) {
+            if (now - k8s_cache[slot].last_seen > K8S_CACHE_TTL) {
+                k8s_cache[slot].valid = 0;
+                return 0;
+            }
+            *out = k8s_cache[slot].meta;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void k8s_cache_store(pid_t pid, const struct k8s_meta *meta)
+{
+    time_t now = time(NULL);
+    __u32 idx = k8s_hash(pid);
+    for (__u32 i = 0; i < K8S_CACHE_SIZE; i++) {
+        __u32 slot = (idx + i) & (K8S_CACHE_SIZE - 1);
+        if (!k8s_cache[slot].valid || k8s_cache[slot].pid == pid) {
+            k8s_cache[slot].pid = pid;
+            k8s_cache[slot].last_seen = now;
+            k8s_cache[slot].meta = *meta;
+            k8s_cache[slot].valid = 1;
+            return;
+        }
+        if (now - k8s_cache[slot].last_seen > K8S_CACHE_TTL) {
+            k8s_cache[slot].pid = pid;
+            k8s_cache[slot].last_seen = now;
+            k8s_cache[slot].meta = *meta;
+            k8s_cache[slot].valid = 1;
+            return;
+        }
+    }
+    /* Table full — overwrite hash index */
+    k8s_cache[idx].pid = pid;
+    k8s_cache[idx].last_seen = now;
+    k8s_cache[idx].meta = *meta;
+    k8s_cache[idx].valid = 1;
 }
 
 /* --- HTTP Layer 7 parsing --- */
@@ -847,7 +935,7 @@ static void print_json_string_n(const char *s, size_t maxlen)
             if (isprint((unsigned char)*s))
                 putchar(*s);
             else
-                printf("\\x%02x", (unsigned char)*s);
+                printf("\\u%04x", (unsigned char)*s);
         }
     }
     putchar('"');
@@ -932,10 +1020,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
                    iso_time, ts.tv_nsec / 1000,
                    (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid);
+                   event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
             printf(",\"event_type\":\"tcp_error\","
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -958,10 +1046,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
                    iso_time, ts.tv_nsec / 1000,
                    (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid);
+                   event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
             printf(",\"event_type\":\"tls_close\","
                    "\"direction\":\"%s\","
@@ -1000,10 +1088,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
                    iso_time, ts.tv_nsec / 1000,
                    (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid);
+                   event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
             printf(",\"event_type\":\"tls_error\","
                    "\"direction\":\"%s\","
@@ -1029,10 +1117,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         /* Handle QUIC detection events */
         if (event->event_type == EVENT_QUIC_DETECTED) {
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
                    iso_time, ts.tv_nsec / 1000,
                    (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid);
+                   event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
             printf(",\"event_type\":\"quic_detected\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
@@ -1044,9 +1132,12 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             return;
         }
 
-        /* K8s metadata enrichment */
+        /* K8s metadata enrichment (R-3 fix: cached per PID to avoid /proc I/O storm) */
         struct k8s_meta meta;
-        get_k8s_meta((pid_t)event->pid, &meta);
+        if (!k8s_cache_lookup((pid_t)event->pid, &meta)) {
+            get_k8s_meta((pid_t)event->pid, &meta);
+            k8s_cache_store((pid_t)event->pid, &meta);
+        }
 
         /* HTTP Layer 7 parsing (both directions — WRITE for requests, READ for responses) */
         struct http_info http;
@@ -1210,9 +1301,18 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
 
         /* 8. Detect Kafka wire protocol (binary header structure) */
         int kafka_api_key = -1;
+        int is_kafka_response = 0;
         if (strcmp(l7_proto, "unknown") == 0 &&
             detect_kafka_protocol(event->data, data_len, &kafka_api_key))
             l7_proto = "kafka";
+
+        /* J-4 fix: Kafka response detection must happen BEFORE protocol is printed.
+         * Previously this was dead code because l7_proto was already emitted. */
+        if (kafka_api_key < 0 && strcmp(l7_proto, "unknown") == 0 &&
+            detect_kafka_response(event->data, data_len)) {
+            l7_proto = "kafka";
+            is_kafka_response = 1;
+        }
 
         /* 9. Fall back to well-known TLS port numbers (RFC/IANA assignments) */
         if (strcmp(l7_proto, "unknown") == 0) {
@@ -1359,10 +1459,8 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             printf(",\"kafka_frame_type\":\"request\"");
         }
 
-        /* #9 fix: Kafka response frame detection */
-        if (kafka_api_key < 0 && strcmp(l7_proto, "unknown") == 0 &&
-            detect_kafka_response(event->data, data_len)) {
-            l7_proto = "kafka";
+        /* Kafka response frame details (J-4 fix: detection moved before protocol print) */
+        if (is_kafka_response) {
             printf(",\"kafka_frame_type\":\"response\"");
             if (data_len >= 10) {
                 int k_err = (int)(short)(((unsigned char)event->data[8] << 8) |
@@ -1442,6 +1540,22 @@ static void handle_lost_events(void *ctx, int cpu, unsigned long long cnt)
 {
     (void)ctx;
     fprintf(stderr, "WARNING: Lost %llu events on CPU %d\n", cnt, cpu);
+
+    /* R-4 fix: emit lost events as JSON so log pipelines can track data gaps */
+    if (cfg.format == FMT_JSON) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        char iso_time[64];
+        struct tm tm_buf;
+        gmtime_r(&ts.tv_sec, &tm_buf);
+        strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+
+        printf("{\"timestamp\":\"%s.%06ldZ\","
+               "\"event_type\":\"lost_events\","
+               "\"cpu\":%d,\"lost_count\":%llu}\n",
+               iso_time, ts.tv_nsec / 1000, cpu, cnt);
+        fflush(stdout);
+    }
 }
 
 static int find_ssl_library(char *path, size_t path_len)
@@ -1620,6 +1734,47 @@ int main(int argc, char **argv)
     /* R7 fix: ignore SIGPIPE so stdout writes don't kill the process
      * when piped through tee or when the reader closes the pipe. */
     signal(SIGPIPE, SIG_IGN);
+
+    /* R-7 fix: Pre-flight checks for required kernel features.
+     * These give clear, actionable errors instead of cryptic libbpf failures. */
+    {
+        struct stat st_check;
+        int preflight_ok = 1;
+
+        if (stat("/sys/kernel/btf/vmlinux", &st_check) != 0) {
+            fprintf(stderr, "FATAL: BTF not available (/sys/kernel/btf/vmlinux missing).\n"
+                    "Kernel must have CONFIG_DEBUG_INFO_BTF=y.\n");
+            preflight_ok = 0;
+        }
+        if (stat("/sys/fs/bpf", &st_check) != 0) {
+            fprintf(stderr, "FATAL: BPF filesystem not mounted at /sys/fs/bpf.\n"
+                    "Run: mount -t bpf bpf /sys/fs/bpf\n");
+            preflight_ok = 0;
+        }
+        if (stat("/sys/kernel/debug", &st_check) != 0) {
+            fprintf(stderr, "FATAL: debugfs not mounted at /sys/kernel/debug.\n"
+                    "Run: mount -t debugfs debugfs /sys/kernel/debug\n");
+            preflight_ok = 0;
+        }
+        if (stat("/sys/kernel/tracing", &st_check) != 0) {
+            fprintf(stderr, "Warning: tracefs not mounted at /sys/kernel/tracing.\n"
+                    "Some kernels use /sys/kernel/debug/tracing instead.\n");
+            /* Not fatal — older kernels mount tracefs under debugfs */
+        }
+        /* BPF JIT check — warning only */
+        {
+            FILE *jit_f = fopen("/proc/sys/net/core/bpf_jit_enable", "r");
+            if (jit_f) {
+                int jit_val = 0;
+                if (fscanf(jit_f, "%d", &jit_val) == 1 && jit_val == 0)
+                    fprintf(stderr, "Warning: BPF JIT is disabled (bpf_jit_enable=0). "
+                            "Performance may be degraded.\n");
+                fclose(jit_f);
+            }
+        }
+        if (!preflight_ok)
+            return 1;
+    }
 
     /* Open and load BPF object (S5 fix: no CWD fallback).
      * Search trusted system paths first, then the directory containing

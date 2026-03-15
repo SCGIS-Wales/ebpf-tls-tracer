@@ -55,6 +55,7 @@ NODE_NAME = os.environ.get("NODE_NAME", "unknown")
 MAX_RETRIES = 5
 FIREHOSE_MAX_BATCH = 500  # AWS limit per PutRecordBatch call
 MAX_LINE_LEN = 65536  # Skip lines larger than 64KB to prevent memory exhaustion
+DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024  # R-6 fix: 50MB cap on dead-letter file
 LOG_FILE = "/var/log/tls-tracer/events.json"
 
 running = True
@@ -118,8 +119,18 @@ def send_chunk(firehose, records):
                 log("ERROR", f"Failed after {MAX_RETRIES} attempts, "
                     f"writing {len(records)} records to dead-letter file")
                 # S9 fix: use restrictive permissions (0o600) on dead-letter file
+                # R-6 fix: cap dead-letter file at DEAD_LETTER_MAX_BYTES
                 try:
                     dlq_path = "/var/log/tls-tracer/dead-letter.json"
+                    try:
+                        dlq_size = os.path.getsize(dlq_path)
+                    except OSError:
+                        dlq_size = 0
+                    if dlq_size >= DEAD_LETTER_MAX_BYTES:
+                        log("WARN", f"Dead-letter file at "
+                            f"{dlq_size // (1024*1024)}MB cap, "
+                            f"dropping {len(records)} records")
+                        return False
                     fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                     with os.fdopen(fd, "a") as dlq:
                         for rec in records:
