@@ -535,13 +535,17 @@ jobs:
           # The tracer reads /proc/<pid>/environ to detect K8s metadata, so processes
           # with these env vars (as set by the K8s downward API) will have k8s_pod
           # and k8s_namespace fields in their JSON events.
+          # IMPORTANT: Use httpbin.org/delay/3 to keep the curl process alive for 3+
+          # seconds. The tracer reads /proc/<pid>/environ AFTER processing the perf
+          # buffer event; if curl exits before that, the /proc entry is gone and
+          # metadata enrichment silently fails (race condition).
           echo "--- K8s metadata enrichment traffic ---"
           docker exec \
             -e POD_NAME=k8s-metadata-test \
             -e POD_NAMESPACE=integration-test \
             tls-tracer-ci-control-plane \
             curl -s -o /dev/null --connect-timeout 10 --max-time 15 --http1.1 \
-            https://httpbin.org/get \
+            https://httpbin.org/delay/3 \
             && echo "K8s metadata traffic: OK" \
             || echo "K8s metadata traffic: failed (non-critical)"
 
@@ -550,7 +554,8 @@ jobs:
             -e POD_NAMESPACE=integration-test \
             tls-tracer-ci-control-plane \
             curl -s -o /dev/null --connect-timeout 10 --max-time 15 --http1.1 \
-            https://httpbin.org/post -X POST -d '{"k8s":"test"}' \
+            -X POST -d '{"k8s":"test"}' \
+            https://httpbin.org/delay/3 \
             && echo "K8s metadata POST: OK" \
             || echo "K8s metadata POST: failed (non-critical)"
 
