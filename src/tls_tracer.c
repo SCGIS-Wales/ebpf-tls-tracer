@@ -107,6 +107,229 @@ static void print_printable(const char *data, __u32 len)
     }
 }
 
+/* --- K8s metadata enrichment --- */
+
+struct k8s_meta {
+    char pod_name[256];
+    char pod_namespace[256];
+    char container_id[80];
+};
+
+/* Read an environment variable from /proc/<pid>/environ */
+static int read_proc_env(pid_t pid, const char *var_name, char *buf, size_t buflen)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/environ", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    size_t var_len = strlen(var_name);
+    char *block = NULL;
+    size_t block_len = 0;
+    ssize_t n = getdelim(&block, &block_len, '\0', f);
+
+    while (n > 0) {
+        if ((size_t)n > var_len && block[var_len] == '=' &&
+            strncmp(block, var_name, var_len) == 0) {
+            snprintf(buf, buflen, "%s", block + var_len + 1);
+            /* Remove trailing newline/null artifacts */
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+                buf[--len] = '\0';
+            free(block);
+            fclose(f);
+            return 0;
+        }
+        n = getdelim(&block, &block_len, '\0', f);
+    }
+    free(block);
+    fclose(f);
+    return -1;
+}
+
+/* Extract container ID from /proc/<pid>/cgroup */
+static int read_container_id(pid_t pid, char *buf, size_t buflen)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        /* Look for containerd/docker cgroup paths:
+         * .../docker-<id>.scope  or  .../cri-containerd-<id>.scope
+         * or  .../pod<uid>/<container_id> */
+        char *p;
+
+        /* Pattern: cri-containerd- or docker- followed by hex ID */
+        p = strstr(line, "cri-containerd-");
+        if (!p)
+            p = strstr(line, "docker-");
+        if (p) {
+            /* Skip prefix to get to the ID */
+            char *id_start = strchr(p, '-');
+            if (id_start) {
+                id_start++;  /* skip second '-' for cri-containerd- */
+                if (strncmp(p, "cri-containerd-", 15) == 0) {
+                    id_start = p + 15;
+                } else {
+                    id_start = strchr(p, '-') + 1;
+                }
+                /* Copy up to .scope or end of line */
+                char *end = strstr(id_start, ".scope");
+                if (!end)
+                    end = strchr(id_start, '\n');
+                if (end) {
+                    size_t id_len = (size_t)(end - id_start);
+                    if (id_len >= buflen)
+                        id_len = buflen - 1;
+                    strncpy(buf, id_start, id_len);
+                    buf[id_len] = '\0';
+                    /* Truncate to first 12 chars (short container ID) */
+                    if (strlen(buf) > 12)
+                        buf[12] = '\0';
+                    fclose(f);
+                    return 0;
+                }
+            }
+        }
+
+        /* Pattern: last path component is a hex container ID (64 chars) */
+        p = strrchr(line, '/');
+        if (p && strlen(p + 1) >= 64) {
+            char *id = p + 1;
+            /* Verify it looks like hex */
+            int is_hex = 1;
+            for (int i = 0; i < 12 && id[i]; i++) {
+                if (!isxdigit((unsigned char)id[i])) {
+                    is_hex = 0;
+                    break;
+                }
+            }
+            if (is_hex) {
+                strncpy(buf, id, 12);
+                buf[12] = '\0';
+                fclose(f);
+                return 0;
+            }
+        }
+    }
+
+    fclose(f);
+    return -1;
+}
+
+static void get_k8s_meta(pid_t pid, struct k8s_meta *meta)
+{
+    memset(meta, 0, sizeof(*meta));
+
+    /* Pod name and namespace are typically set by K8s downward API:
+     * POD_NAME, POD_NAMESPACE, or HOSTNAME for pod name */
+    if (read_proc_env(pid, "POD_NAME", meta->pod_name, sizeof(meta->pod_name)) != 0)
+        read_proc_env(pid, "HOSTNAME", meta->pod_name, sizeof(meta->pod_name));
+
+    read_proc_env(pid, "POD_NAMESPACE", meta->pod_namespace, sizeof(meta->pod_namespace));
+    read_container_id(pid, meta->container_id, sizeof(meta->container_id));
+}
+
+/* --- HTTP Layer 7 parsing --- */
+
+struct http_info {
+    char method[16];
+    char path[512];
+    char host[256];
+};
+
+static void parse_http_info(const char *data, __u32 len, struct http_info *info)
+{
+    memset(info, 0, sizeof(*info));
+    if (len < 4)
+        return;
+
+    /* Check if data starts with an HTTP method */
+    const char *methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ",
+                             "HEAD ", "OPTIONS ", "CONNECT ", NULL};
+    int found = 0;
+    for (int i = 0; methods[i]; i++) {
+        size_t mlen = strlen(methods[i]);
+        if (len >= mlen && strncmp(data, methods[i], mlen) == 0) {
+            /* Copy method (without trailing space) */
+            strncpy(info->method, methods[i], mlen - 1);
+            info->method[mlen - 1] = '\0';
+
+            /* Extract path: from after method to next space or \r\n */
+            const char *path_start = data + mlen;
+            const char *path_end = path_start;
+            const char *data_end = data + len;
+            while (path_end < data_end && *path_end != ' ' &&
+                   *path_end != '\r' && *path_end != '\n')
+                path_end++;
+            size_t path_len = (size_t)(path_end - path_start);
+            if (path_len >= sizeof(info->path))
+                path_len = sizeof(info->path) - 1;
+            strncpy(info->path, path_start, path_len);
+            info->path[path_len] = '\0';
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found)
+        return;
+
+    /* Extract Host header */
+    const char *host_hdr = NULL;
+    const char *p = data;
+    const char *end = data + len;
+    while (p < end - 6) {
+        if ((*p == '\n' || p == data) &&
+            (strncasecmp(p + (p == data ? 0 : 1), "Host:", 5) == 0 ||
+             strncasecmp(p + (p == data ? 0 : 1), "host:", 5) == 0)) {
+            host_hdr = p + (p == data ? 5 : 6);
+            /* Skip whitespace */
+            while (host_hdr < end && (*host_hdr == ' ' || *host_hdr == '\t'))
+                host_hdr++;
+            break;
+        }
+        p++;
+    }
+
+    if (host_hdr) {
+        const char *host_end = host_hdr;
+        while (host_end < end && *host_end != '\r' && *host_end != '\n')
+            host_end++;
+        size_t host_len = (size_t)(host_end - host_hdr);
+        if (host_len >= sizeof(info->host))
+            host_len = sizeof(info->host) - 1;
+        strncpy(info->host, host_hdr, host_len);
+        info->host[host_len] = '\0';
+    }
+}
+
+/* Print a JSON string value, escaping special characters */
+static void print_json_string(const char *s)
+{
+    putchar('"');
+    for (; *s; s++) {
+        switch (*s) {
+        case '"':  printf("\\\""); break;
+        case '\\': printf("\\\\"); break;
+        case '\n': printf("\\n"); break;
+        case '\r': printf("\\r"); break;
+        case '\t': printf("\\t"); break;
+        default:
+            if (isprint((unsigned char)*s))
+                putchar(*s);
+            else
+                printf("\\x%02x", (unsigned char)*s);
+        }
+    }
+    putchar('"');
+}
+
 static void handle_event(void *ctx, int cpu __attribute__((unused)),
                          void *data, __u32 size)
 {
@@ -129,16 +352,83 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
     char addr_buf[128];
     format_addr(event, addr_buf, sizeof(addr_buf));
 
+    /* Format remote and local IPs separately for JSON */
+    char remote_ip[INET6_ADDRSTRLEN] = "-";
+    char local_ip[INET6_ADDRSTRLEN] = "-";
+    if (event->addr_family == ADDR_FAMILY_IPV4) {
+        if (event->remote_addr_v4 != 0) {
+            struct in_addr raddr = { .s_addr = event->remote_addr_v4 };
+            inet_ntop(AF_INET, &raddr, remote_ip, sizeof(remote_ip));
+        }
+        if (event->local_addr_v4 != 0) {
+            struct in_addr laddr = { .s_addr = event->local_addr_v4 };
+            inet_ntop(AF_INET, &laddr, local_ip, sizeof(local_ip));
+        }
+    } else if (event->addr_family == ADDR_FAMILY_IPV6) {
+        inet_ntop(AF_INET6, event->remote_addr_v6, remote_ip, sizeof(remote_ip));
+        inet_ntop(AF_INET6, event->local_addr_v6, local_ip, sizeof(local_ip));
+    }
+
     if (c->format == FMT_JSON) {
-        printf("{\"timestamp_ns\":%llu,\"pid\":%u,\"tid\":%u,\"uid\":%u,"
+        /* Get wall-clock timestamp */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        char iso_time[64];
+        struct tm *tm = gmtime(&ts.tv_sec);
+        strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", tm);
+
+        /* K8s metadata enrichment */
+        struct k8s_meta meta;
+        get_k8s_meta((pid_t)event->pid, &meta);
+
+        /* HTTP Layer 7 parsing (only for WRITE direction) */
+        struct http_info http;
+        memset(&http, 0, sizeof(http));
+        if (event->direction == DIRECTION_WRITE && data_len > 0)
+            parse_http_info(event->data, data_len, &http);
+
+        /* Emit one self-contained JSON event */
+        printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+               "\"pid\":%u,\"tid\":%u,\"uid\":%u,"
                "\"comm\":\"%.*s\",\"direction\":\"%s\","
-               "\"remote_addr\":\"%s\",\"data_len\":%u",
+               "\"src_ip\":\"%s\",\"src_port\":%u,"
+               "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+               "\"data_len\":%u",
+               iso_time, ts.tv_nsec / 1000,
                (unsigned long long)event->timestamp_ns,
                event->pid, event->tid, event->uid,
                MAX_COMM_LEN, event->comm,
                direction_str(event->direction),
-               addr_buf,
+               local_ip, event->local_port,
+               remote_ip, event->remote_port,
                data_len);
+
+        /* K8s fields (only if populated) */
+        if (meta.pod_name[0]) {
+            printf(",\"k8s_pod\":");
+            print_json_string(meta.pod_name);
+        }
+        if (meta.pod_namespace[0]) {
+            printf(",\"k8s_namespace\":");
+            print_json_string(meta.pod_namespace);
+        }
+        if (meta.container_id[0]) {
+            printf(",\"container_id\":");
+            print_json_string(meta.container_id);
+        }
+
+        /* HTTP Layer 7 fields (only if HTTP detected) */
+        if (http.method[0]) {
+            printf(",\"http_method\":\"%s\"", http.method);
+            if (http.path[0]) {
+                printf(",\"http_path\":");
+                print_json_string(http.path);
+            }
+            if (http.host[0]) {
+                printf(",\"http_host\":");
+                print_json_string(http.host);
+            }
+        }
 
         if (!c->data_only) {
             printf(",\"data\":\"");

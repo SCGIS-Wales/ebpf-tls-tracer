@@ -1,0 +1,50 @@
+# TLS Tracer Helm values
+#
+# Deploys as a DaemonSet on every node. Each pod uses eBPF to capture
+# outbound TLS traffic from all processes on the node, including pods
+# in any namespace.
+
+image:
+  repository: ghcr.io/scgis-wales/ebpf_tls_cli
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# Output format: "json" (recommended for K8s) or "text"
+outputFormat: json
+
+# Enable verbose logging (probe attach status, library path)
+verbose: true
+
+# Filter by PID (0 = all processes)
+filterPid: 0
+
+# Filter by UID (0 = all users)
+filterUid: 0
+
+# Custom path to libssl.so on the host (empty = auto-detect)
+sslLibPath: ""
+
+# Resource limits
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+# Node selector (e.g., to run only on specific nodes)
+nodeSelector: {}
+
+# Tolerations (e.g., to run on control-plane nodes)
+tolerations:
+  - operator: Exists
+
+# Pod annotations
+podAnnotations: {}
+
+# Service account
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
