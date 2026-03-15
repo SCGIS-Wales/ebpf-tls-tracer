@@ -1,12 +1,10 @@
-name: Build and Test eBPF CLI Tool
+name: Build and Test
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   build:
@@ -14,47 +12,56 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: Set up dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm gcc make libbpf-dev build-essential iproute2 git wget curl bpfcc-tools libelf-dev iputils-ping net-tools python3 python3-pip python3-setuptools kmod libmnl-dev linux-libc-dev
-          
-          # Install kernel headers needed for eBPF development
-          sudo apt-get install -y linux-headers-$(uname -r) linux-headers-generic
-          
-          # Install additional glibc development headers
-          sudo apt-get install -y libc6-dev libc6-dev-i386
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            llvm \
+            gcc \
+            make \
+            libbpf-dev \
+            libelf-dev \
+            zlib1g-dev \
+            linux-libc-dev \
+            libc6-dev
 
-          # Create symbolic links for missing asm headers
-          sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
-          
-          # Create symbolic links for missing bits headers
-          sudo ln -s /usr/include/x86_64-linux-gnu/bits /usr/include/bits
+      - name: Build
+        run: make all
 
-      - name: Verify project structure
+      - name: Run unit tests
+        run: make test
+
+      - name: Verify build artifacts
         run: |
-          ls -la
-          ls -la include  # Check if the include directory exists
-          ls -la src       # Check if the src directory exists
-          ls -la Makefile  # Ensure Makefile exists at the root
+          test -f bin/tls_tracer && echo "tls_tracer binary OK"
+          test -f bin/bpf_program.o && echo "BPF object OK"
+          file bin/tls_tracer
+          file bin/bpf_program.o
 
-      - name: Build the eBPF CLI Tool
-        run: make
+      - name: Smoke test (help output)
+        run: ./bin/tls_tracer --help
 
-      - name: List build output
-        run: ls -la bin || echo "bin directory not found"  # List the binaries created in the bin directory
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls_tracer-linux-amd64
+          path: |
+            bin/tls_tracer
+            bin/bpf_program.o
 
-      - name: Verify CLI tool exists and set permissions
-        run: |
-          if [ -f bin/cli_tool ]; then
-            chmod +x bin/cli_tool
-            echo "cli_tool is ready."
-          else
-            echo "cli_tool not found in bin directory."
-            exit 1
-          fi
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
 
-      - name: Run the eBPF CLI Tool
-        run: ./bin/cli_tool --start
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t tls_tracer:test .
+
+      - name: Test Docker image
+        run: docker run --rm tls_tracer:test --help
