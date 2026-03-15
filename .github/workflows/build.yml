@@ -60,11 +60,15 @@ jobs:
           python3 -m unittest tests.test_s3_shipper tests.test_kinesis_shipper -v
 
       - name: SonarQube code analysis
-        if: ${{ secrets.SONAR_TOKEN != '' }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         run: |
+          if [ -z "${SONAR_TOKEN}" ] || [ "${SONAR_TOKEN}" = "***" ]; then
+            echo "SONAR_TOKEN not configured, skipping SonarQube analysis"
+            echo "To enable, add SONAR_TOKEN secret and SONAR_HOST_URL variable to the repository"
+            exit 0
+          fi
           echo "Running SonarQube analysis..."
           wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610-linux-x64.zip -O /tmp/sonar.zip
           unzip -q /tmp/sonar.zip -d /tmp
