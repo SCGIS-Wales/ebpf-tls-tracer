@@ -41,9 +41,20 @@ jobs:
       - name: Audit libbpf version for CVE-2025-29481
         run: |
           echo "=== libbpf version check ==="
-          dpkg -l libbpf-dev 2>/dev/null | grep -E 'ii\s+libbpf' || echo "libbpf-dev not found via dpkg"
-          apt-cache policy libbpf-dev 2>/dev/null || true
-          echo "NOTE: CVE-2025-29481 affects libbpf 1.5.0. Ensure patched version is installed."
+          LIBBPF_VER=$(dpkg -l libbpf-dev 2>/dev/null | awk '/^ii/{print $3}' || echo "unknown")
+          echo "libbpf-dev version: ${LIBBPF_VER}"
+          if echo "${LIBBPF_VER}" | grep -q '^1\.5\.0'; then
+            echo "ERROR: libbpf 1.5.0 is vulnerable (CVE-2025-29481)"
+            exit 1
+          fi
+          echo "libbpf version OK"
+
+      - name: Check OpenSSL for CVE-2025-15467
+        run: |
+          OPENSSL_VER=$(openssl version | awk '{print $2}')
+          echo "OpenSSL version: ${OPENSSL_VER}"
+          echo "NOTE: CVE-2025-15467 affects OpenSSL 3.0-3.6 (pre-auth RCE via CMS AuthEnvelopedData)."
+          echo "Ensure runtime container and AL2023 nodes use patched OpenSSL."
 
       - name: Build
         run: make all
@@ -206,11 +217,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Create kind cluster (Kubernetes v1.35)
+      # H-5 fix: Test against K8s 1.34 (matches Helm chart kubeVersion: ">=1.34.0-0")
+      - name: Create kind cluster (Kubernetes v1.34)
         uses: helm/kind-action@v1
         with:
           cluster_name: tls-tracer-ci
-          node_image: kindest/node:v1.35.1
+          node_image: kindest/node:v1.34.0
           wait: 60s
 
       - name: Verify Kubernetes version
@@ -218,11 +230,11 @@ jobs:
           K8S_VERSION=$(kubectl version -o json | jq -r '.serverVersion.gitVersion')
           echo "Kubernetes version: ${K8S_VERSION}"
           MINOR=$(echo "${K8S_VERSION}" | sed 's/v[0-9]*\.\([0-9]*\)\..*/\1/')
-          if [ "${MINOR}" -lt 35 ]; then
-            echo "ERROR: Kubernetes version ${K8S_VERSION} is below required v1.35.0"
+          if [ "${MINOR}" -lt 34 ]; then
+            echo "ERROR: Kubernetes version ${K8S_VERSION} is below required v1.34.0"
             exit 1
           fi
-          echo "Kubernetes ${K8S_VERSION} meets requirement (>=1.35.0)"
+          echo "Kubernetes ${K8S_VERSION} meets requirement (>=1.34.0)"
 
       - name: Build and load tls_tracer image into kind
         run: |

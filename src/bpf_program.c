@@ -157,8 +157,18 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);  /* 256 KB ring buffer */
+    __uint(max_entries, 4 * 1024 * 1024);  /* 4 MB ring buffer (H-1 fix) */
 } tls_events SEC(".maps");
+
+/* H-1 fix: per-CPU counter for dropped events (ring buffer full).
+ * Unlike perf buffers, ring buffers silently drop events with no callback.
+ * We check the return value of bpf_ringbuf_output() and increment this. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} dropped_events SEC(".maps");
 
 /* Per-CPU scratch buffer for tls_event_t (too large for 512-byte BPF stack).
  * Each CPU gets its own copy, so no locking needed. */
@@ -201,6 +211,19 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     __builtin_memset(event->local_addr_v6, 0, 16);
     event->cipher[0] = '\0';
     return event;
+}
+
+/* --- Helper: emit event to ring buffer, counting drops (H-1 fix) --- */
+
+static __always_inline void emit_event(struct tls_event_t *event, __u64 out_size)
+{
+    long err = bpf_ringbuf_output(&tls_events, event, out_size, 0);
+    if (err < 0) {
+        __u32 zero = 0;
+        __u64 *cnt = bpf_map_lookup_elem(&dropped_events, &zero);
+        if (cnt)
+            __sync_fetch_and_add(cnt, 1);
+    }
 }
 
 /* --- Helper: populate event with connection info if available --- */
@@ -331,7 +354,7 @@ int probe_connect_return(struct pt_regs *ctx)
             }
 
             __u64 out_size = offsetof(struct tls_event_t, data);
-            bpf_ringbuf_output(&tls_events, event, out_size, 0);
+            emit_event(event, out_size);
         }
         goto cleanup;
     }
@@ -539,7 +562,7 @@ int probe_udp_sendmsg(struct pt_regs *ctx)
 
     {
         __u64 out_size = offsetof(struct tls_event_t, data);
-        bpf_ringbuf_output(&tls_events, event, out_size, 0);
+        emit_event(event, out_size);
     }
     return 0;
 }
@@ -816,7 +839,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
             __u64 out_size = offsetof(struct tls_event_t, data);
-            bpf_ringbuf_output(&tls_events, err_event, out_size, 0);
+            emit_event(err_event, out_size);
         }
         goto cleanup;
     }
@@ -847,7 +870,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
 
     if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
         __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
-        bpf_ringbuf_output(&tls_events, event, out_size, 0);
+        emit_event(event, out_size);
     }
 
 cleanup:
@@ -911,7 +934,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
             enrich_event_with_cipher(err_event, args->ssl);
             err_event->is_mtls = get_mtls_status(args->ssl);
             __u64 out_size = offsetof(struct tls_event_t, data);
-            bpf_ringbuf_output(&tls_events, err_event, out_size, 0);
+            emit_event(err_event, out_size);
         }
         goto cleanup;
     }
@@ -942,7 +965,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
 
     if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
         __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
-        bpf_ringbuf_output(&tls_events, event, out_size, 0);
+        emit_event(event, out_size);
     }
 
 cleanup:
