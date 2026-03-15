@@ -29,6 +29,7 @@ spec:
           command: ["sh", "-c"]
           args:
             - >-
+              set -o pipefail;
               ./tls_tracer -f {{ .Values.outputFormat }}
               {{- if .Values.verbose }} -v{{- end }}
               {{- if .Values.filterPid }} -p {{ .Values.filterPid }}{{- end }}
@@ -62,16 +63,17 @@ spec:
           {{- end }}
           securityContext:
             privileged: true
+            readOnlyRootFilesystem: true
           readinessProbe:
             exec:
-              command: ["test", "-f", "/tmp/tls_tracer_healthy"]
+              command: ["test", "-f", "/var/run/tls-tracer/healthy"]
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
             exec:
-              command: ["test", "-f", "/tmp/tls_tracer_healthy"]
+              command: ["test", "-f", "/var/run/tls-tracer/healthy"]
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 3
@@ -79,6 +81,8 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            - name: run-dir
+              mountPath: /var/run/tls-tracer
             - name: debugfs
               mountPath: /sys/kernel/debug
               readOnly: true
@@ -174,6 +178,10 @@ spec:
               mountPath: /var/log/tls-tracer
         {{- end }}
       volumes:
+        - name: run-dir
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         - name: debugfs
           hostPath:
             path: /sys/kernel/debug
@@ -196,7 +204,8 @@ spec:
             type: DirectoryOrCreate
         {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
         - name: log-pipe
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 512Mi
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

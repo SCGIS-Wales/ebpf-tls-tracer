@@ -22,7 +22,10 @@ spec:
           args: ["-f", "json", "-v"]
           securityContext:
             privileged: true
+            readOnlyRootFilesystem: true
           volumeMounts:
+            - name: run-dir
+              mountPath: /var/run/tls-tracer
             - name: sys-kernel-debug
               mountPath: /sys/kernel/debug
               readOnly: true
@@ -50,6 +53,10 @@ spec:
       tolerations:
         - operator: Exists
       volumes:
+        - name: run-dir
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         - name: sys-kernel-debug
           hostPath:
             path: /sys/kernel/debug
