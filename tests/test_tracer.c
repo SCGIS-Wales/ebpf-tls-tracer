@@ -120,6 +120,7 @@ static void test_zero_init(void)
     ASSERT_EQ(event.remote_port, 0, "remote_port should be 0");
     ASSERT_EQ(event.local_port, 0, "local_port should be 0");
     ASSERT_EQ(event.remote_addr_v4, 0, "remote_addr_v4 should be 0");
+    ASSERT_EQ(event.local_addr_v4, 0, "local_addr_v4 should be 0");
     ASSERT_EQ(event.comm[0], '\0', "comm should be empty");
     ASSERT_EQ(event.data[0], '\0', "data should be empty");
     PASS();

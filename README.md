@@ -250,7 +250,17 @@ CONFIG_UPROBE_EVENTS=y
 
 ## Kubernetes Deployment (v1.34+)
 
-TLS Tracer runs as a **DaemonSet** to monitor TLS traffic on every node. It requires privileged access to the host kernel for eBPF.
+TLS Tracer runs as a **DaemonSet** to monitor outbound TLS traffic from all processes on every node. It uses eBPF at the kernel level, which means it captures TLS traffic from **all pods and containers** on the node — including pods in any namespace (e.g., `apigee`, `default`, etc.) — without requiring sidecars or application changes.
+
+### How It Works on Kubernetes
+
+- Deploys as a **DaemonSet** (one pod per node) with `hostPID: true` and `privileged: true`
+- eBPF hooks into the **host kernel's** `SSL_read`/`SSL_write` and `connect()` syscalls
+- Captures outbound TLS traffic from **all pods/containers on the node**, across all namespaces (e.g., `apigee`, `default`)
+- Automatically enriches events with **K8s metadata** (pod name, namespace, container ID) via the downward API environment variables
+- Parses **HTTP Layer 7** details (method, path, Host header) from TLS plaintext
+- Captures **source and destination IP:port** for every connection
+- Logs are output in **JSON format** to stdout, one self-contained event per line
 
 ### Kubernetes Prerequisites
 
@@ -263,12 +273,25 @@ TLS Tracer runs as a **DaemonSet** to monitor TLS traffic on every node. It requ
 | **RBAC** | Cluster admin access to create privileged DaemonSets |
 | **OpenSSL on nodes** | `libssl.so` must be present on each node |
 
-### EKS with AL2023 Nodes
+### Minimum Container Permissions
 
-Amazon EKS with AL2023 AMI nodes is the recommended deployment target. AL2023 nodes have all required eBPF kernel features enabled by default.
+The TLS Tracer container **requires** the following to function:
+
+| Permission | Why |
+|---|---|
+| `privileged: true` | eBPF program loading requires full kernel access |
+| `hostPID: true` | Must see all processes on the node to capture TLS traffic |
+| `hostNetwork: true` | Required for connect() kprobe correlation |
+| Volume: `/sys/kernel/debug` | debugfs access for uprobe/kprobe events |
+| Volume: `/sys/kernel/tracing` | tracefs access for tracing infrastructure |
+| Volume: `/sys/fs/bpf` | BPF filesystem for map pinning |
+| Volume: `/usr/lib64` (host) | Access to host's `libssl.so` for uprobe attachment |
+| PSA: `privileged` | Namespace must allow privileged pods |
+
+### Deploy with Helm (Recommended)
 
 ```bash
-# Create EKS cluster with AL2023 nodes (eksctl)
+# Create EKS cluster with AL2023 nodes
 eksctl create cluster \
   --name my-cluster \
   --version 1.34 \
@@ -276,26 +299,91 @@ eksctl create cluster \
   --node-type m5.large \
   --node-ami-family AmazonLinux2023
 
-# Deploy TLS Tracer
-kubectl apply -f deploy/kubernetes/namespace.yaml
-kubectl apply -f deploy/kubernetes/rbac.yaml
-kubectl apply -f deploy/kubernetes/daemonset.yaml
+# Deploy TLS Tracer (JSON output by default)
+helm install tls-tracer helm/tls-tracer \
+  --namespace tls-tracer --create-namespace
 
 # Check status
 kubectl -n tls-tracer get pods -o wide
 
-# View logs (JSON output from a specific node's pod)
+# View JSON logs (all outbound TLS traffic on the node)
+kubectl -n tls-tracer logs -l app.kubernetes.io/name=tls-tracer --tail=50 -f
+```
+
+#### Helm Values
+
+| Value | Default | Description |
+|---|---|---|
+| `outputFormat` | `json` | Output format: `json` or `text` |
+| `verbose` | `true` | Enable verbose logging |
+| `filterPid` | `0` | Filter by PID (0 = all) |
+| `filterUid` | `0` | Filter by UID (0 = all) |
+| `sslLibPath` | `""` | Custom libssl.so path (empty = auto-detect) |
+| `image.repository` | `ghcr.io/scgis-wales/ebpf_tls_cli` | Container image |
+| `image.tag` | `latest` | Image tag |
+
+### JSON Log Output
+
+When deployed with `-f json` (the Helm chart default), each captured TLS event is a **single self-contained JSON line** with all context:
+
+```json
+{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":1710500000000000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"WRITE","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com","data":"\\x47\\x45\\x54..."}
+{"timestamp":"2026-03-15T10:30:00.234567Z","timestamp_ns":1710500000100000,"pid":12345,"tid":12345,"uid":1000,"comm":"curl","direction":"READ","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":256,"k8s_pod":"apigee-runtime-7b8f9c6d4-x2k9m","k8s_namespace":"apigee","container_id":"a1b2c3d4e5f6","data":"\\x48\\x54\\x54\\x50..."}
+{"timestamp":"2026-03-15T10:30:01.000000Z","timestamp_ns":1710500001000000,"pid":23456,"tid":23456,"uid":0,"comm":"java","direction":"WRITE","src_ip":"10.0.5.24","src_port":38901,"dst_ip":"10.0.1.50","dst_port":8443,"data_len":142,"k8s_pod":"apigee-cassandra-0","k8s_namespace":"apigee","container_id":"f6e5d4c3b2a1","http_method":"POST","http_path":"/v1/organizations","http_host":"management.apigee.internal","data":"\\x50\\x4f\\x53\\x54..."}
+```
+
+Each JSON event contains:
+
+| Field | Description |
+|---|---|
+| `timestamp` | ISO 8601 wall-clock timestamp with microseconds |
+| `timestamp_ns` | Kernel monotonic timestamp in nanoseconds |
+| `pid`/`tid` | Process and thread IDs |
+| `comm` | Process command name (e.g., `curl`, `java`, `node`, `python3`) |
+| `direction` | `WRITE` (outbound request) or `READ` (inbound response) |
+| `src_ip`/`src_port` | Source (local) IP address and port |
+| `dst_ip`/`dst_port` | Destination (remote) IP address and port |
+| `k8s_pod` | Kubernetes pod name (from downward API `POD_NAME` or `HOSTNAME`) |
+| `k8s_namespace` | Kubernetes namespace (from downward API `POD_NAMESPACE`) |
+| `container_id` | Short container ID (from cgroup) |
+| `http_method` | HTTP method if detected: GET, POST, PUT, DELETE, etc. |
+| `http_path` | HTTP request path (e.g., `/api/v1/status`) |
+| `http_host` | HTTP Host header value (the DNS hostname) |
+| `data_len` | Length of captured plaintext data |
+| `data` | Hex-encoded plaintext TLS data |
+
+K8s metadata fields (`k8s_pod`, `k8s_namespace`, `container_id`) and HTTP fields (`http_method`, `http_path`, `http_host`) are only present when detected. To enable K8s metadata, configure the downward API in your pod spec:
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+```
+
+### Deploy with kubectl (Alternative)
+
+```bash
+kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl apply -f deploy/kubernetes/rbac.yaml
+kubectl apply -f deploy/kubernetes/daemonset.yaml
+
+kubectl -n tls-tracer get pods -o wide
 kubectl -n tls-tracer logs -l app=tls-tracer --tail=50
 ```
 
 ### Node Configuration via EKS Userdata
 
-If nodes need build tools (for custom builds), add this to the EKS node group launch template userdata:
+If nodes need runtime libraries (usually pre-installed on AL2023):
 
 ```bash
 #!/bin/bash
 dnf install -y libbpf openssl-libs bpftool
-# The container image has everything else built-in
 ```
 
 ### What Needs to Be Configured
@@ -304,11 +392,7 @@ For Kubernetes 1.34+ on Linux kernel 6.x, the following must be true on each nod
 
 1. **Kernel modules loaded** (usually auto-loaded):
    ```bash
-   # Verify on a node
    lsmod | grep -E 'bpf|uprobe|kprobe'
-   # If not loaded:
-   modprobe uprobeevents
-   modprobe kprobeevents
    ```
 
 2. **BPF filesystem mounted** (auto-mounted on modern distros):
@@ -322,9 +406,8 @@ For Kubernetes 1.34+ on Linux kernel 6.x, the following must be true on each nod
    mount -t tracefs tracefs /sys/kernel/tracing
    ```
 
-4. **Privileged containers allowed** in the Pod Security Admission (PSA):
+4. **Privileged containers allowed** in Pod Security Admission:
    ```yaml
-   # If using Pod Security Standards, the namespace needs 'privileged' level
    apiVersion: v1
    kind: Namespace
    metadata:
@@ -336,6 +419,10 @@ For Kubernetes 1.34+ on Linux kernel 6.x, the following must be true on each nod
 ### Removing
 
 ```bash
+# Helm
+helm uninstall tls-tracer -n tls-tracer
+
+# Or kubectl
 kubectl delete -f deploy/kubernetes/daemonset.yaml
 kubectl delete -f deploy/kubernetes/rbac.yaml
 kubectl delete -f deploy/kubernetes/namespace.yaml
@@ -403,7 +490,12 @@ ebpf_tls_cli/
 ├── .github/
 │   └── workflows/
 │       └── build.yml         # CI: build, test, functional test, Docker publish
-├── Dockerfile                # Multi-stage build (AL2023 base)
+├── helm/
+│   └── tls-tracer/           # Helm chart for Kubernetes deployment
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       └── templates/
+├── Dockerfile                # Multi-stage build (Debian trixie)
 ├── Makefile                  # Build system
 ├── LICENSE                   # MIT License
 └── README.md
