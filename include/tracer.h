@@ -8,6 +8,7 @@
 typedef uint64_t __u64;
 typedef uint32_t __u32;
 typedef uint16_t __u16;
+typedef uint8_t  __u8;
 typedef int32_t  __s32;
 #endif
 
@@ -23,8 +24,35 @@ typedef int32_t  __s32;
 #define DIRECTION_WRITE 1
 
 /* Event types */
-#define EVENT_TLS_DATA  1
+#define EVENT_TLS_DATA      1
 #define EVENT_TLS_HANDSHAKE 2
+#define EVENT_CONNECT       3
+
+/* Address family constants (match AF_INET/AF_INET6) */
+#define ADDR_FAMILY_IPV4    2
+#define ADDR_FAMILY_IPV6    10
+
+/* Connection info stored per pid+fd for IP correlation */
+struct conn_info_t {
+    __u8  addr_family;       /* ADDR_FAMILY_IPV4 or ADDR_FAMILY_IPV6 */
+    __u8  _pad[3];
+    __u16 local_port;
+    __u16 remote_port;
+    union {
+        __u32 remote_addr_v4;
+        __u8  remote_addr_v6[16];
+    };
+    union {
+        __u32 local_addr_v4;
+        __u8  local_addr_v6[16];
+    };
+};
+
+/* Key for connection map: identifies a socket per thread */
+struct conn_key_t {
+    __u32 pid;
+    __u32 fd;
+};
 
 struct tls_event_t {
     __u64 timestamp_ns;
@@ -33,8 +61,16 @@ struct tls_event_t {
     __u32 uid;
     __u32 data_len;
     __u16 tls_version;
-    __u8  direction;    /* DIRECTION_READ or DIRECTION_WRITE */
+    __u8  direction;         /* DIRECTION_READ or DIRECTION_WRITE */
     __u8  event_type;
+    __u8  addr_family;       /* ADDR_FAMILY_IPV4 or ADDR_FAMILY_IPV6 */
+    __u8  _pad[3];
+    __u16 local_port;
+    __u16 remote_port;
+    union {
+        __u32 remote_addr_v4;
+        __u8  remote_addr_v6[16];
+    };
     char  comm[MAX_COMM_LEN];
     char  data[MAX_DATA_LEN];
 };

@@ -1,21 +1,19 @@
-# Multi-stage build for eBPF TLS Tracer
+# Multi-stage build for eBPF TLS Tracer on Amazon Linux 2023
 
 # --- Build stage ---
-FROM debian:bookworm-slim AS builder
+FROM amazonlinux:2023 AS builder
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN dnf install -y \
     clang \
     llvm \
     gcc \
     make \
-    libbpf-dev \
-    libelf-dev \
-    zlib1g-dev \
-    linux-libc-dev \
-    libc6-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libbpf-devel \
+    elfutils-libelf-devel \
+    zlib-devel \
+    kernel-devel \
+    kernel-headers \
+    && dnf clean all
 
 WORKDIR /build
 
@@ -27,16 +25,14 @@ COPY Makefile .
 RUN make all && make test
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM amazonlinux:2023
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libbpf1 \
-    libelf1 \
-    zlib1g \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+RUN dnf install -y \
+    libbpf \
+    elfutils-libelf \
+    zlib \
+    openssl-libs \
+    && dnf clean all
 
 WORKDIR /opt/tls_tracer
 
