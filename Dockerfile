@@ -37,12 +37,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libelf1 \
     zlib1g \
     libssl3t64 \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir boto3 \
+    && apt-get purge -y python3-pip python3-venv \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /opt/tls_tracer
 
 COPY --from=builder /build/bin/tls_tracer ./tls_tracer
 COPY --from=builder /build/bin/bpf_program.o ./bpf_program.o
+COPY scripts/s3_shipper.py ./scripts/s3_shipper.py
+COPY scripts/kinesis_shipper.py ./scripts/kinesis_shipper.py
 
 ENTRYPOINT ["./tls_tracer"]
 CMD ["--help"]
