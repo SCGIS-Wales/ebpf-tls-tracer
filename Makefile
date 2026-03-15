@@ -12,10 +12,15 @@ BUILD_DIR  := build
 BIN_DIR    := bin
 TEST_DIR   := tests
 
+# Detect arch-specific system include path (needed for asm/types.h on Debian/Ubuntu)
+UNAME_M    := $(shell uname -m)
+SYS_INC    := $(wildcard /usr/include/$(UNAME_M)-linux-gnu)
+
 # BPF compilation flags
 BPF_CFLAGS := -O2 -g -target bpf \
               -D__TARGET_ARCH_$(ARCH) \
               -I$(INCLUDE_DIR) \
+              $(if $(SYS_INC),-isystem $(SYS_INC)) \
               -Wall -Werror
 
 # User-space compilation flags
