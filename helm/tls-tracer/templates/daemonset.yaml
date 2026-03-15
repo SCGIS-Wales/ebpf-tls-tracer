@@ -28,6 +28,9 @@ spec:
       # A6 fix: with hostNetwork: true, DNS defaults to node's resolv.conf.
       # ClusterFirstWithHostNet allows resolving both cluster DNS and host DNS.
       dnsPolicy: ClusterFirstWithHostNet
+      # K-3 fix: give sidecars time to flush buffers on pod termination.
+      # Default 30s may be insufficient for S3/Kinesis batch uploads.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: tls-tracer
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -207,18 +210,21 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
+        # K-2 fix: kernel filesystem paths must already exist on the host.
+        # Using Directory (not DirectoryOrCreate) fails fast on misconfigured nodes
+        # instead of silently creating empty directories for kernel filesystems.
         - name: debugfs
           hostPath:
             path: /sys/kernel/debug
-            type: DirectoryOrCreate
+            type: Directory
         - name: tracefs
           hostPath:
             path: /sys/kernel/tracing
-            type: DirectoryOrCreate
+            type: Directory
         - name: bpffs
           hostPath:
             path: /sys/fs/bpf
-            type: DirectoryOrCreate
+            type: Directory
         - name: host-ssl
           hostPath:
             path: /usr/lib64
