@@ -20,17 +20,18 @@
 #include <arpa/inet.h>
 #include <limits.h>  /* for ULONG_MAX */
 #include <sys/stat.h>  /* for mkdir() */
+#include <dlfcn.h>     /* dlopen/dlsym for R1-REL OpenSSL version check */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "tracer.h"
 
-#define PERF_BUFFER_PAGES  64
+#define PERF_BUFFER_PAGES  256
 #define PERF_POLL_TIMEOUT  100
 #define MAX_PROBES         32
 #define MAX_SANITIZE_PATTERNS 32
 #define DNS_CACHE_SIZE     4096  /* max cached hostname entries (must be power of 2) */
 #define DNS_CACHE_TTL      300   /* seconds before expiry */
-#define K8S_CACHE_SIZE     256   /* max cached PID→k8s_meta entries (must be power of 2) */
+#define K8S_CACHE_SIZE     1024  /* max cached PID→k8s_meta entries (must be power of 2) */
 #define K8S_CACHE_TTL      60    /* seconds before re-reading /proc */
 
 static volatile sig_atomic_t exiting = 0;
@@ -151,6 +152,7 @@ struct config {
     int             hex_dump;
     int             data_only;
     int             verbose;
+    int             enable_quic;    /* P5-PERF: optional QUIC probe (--quic flag) */
     struct sanitize_pattern sanitize[MAX_SANITIZE_PATTERNS];
     int             sanitize_count;
 };
@@ -163,6 +165,7 @@ static struct config cfg = {
     .hex_dump        = 0,
     .data_only       = 0,
     .verbose         = 0,
+    .enable_quic     = 0,
     .sanitize_count  = 0,
 };
 
@@ -947,9 +950,9 @@ static void print_json_string(const char *s)
     print_json_string_n(s, 0);
 }
 
-static void handle_event(void *ctx, int cpu __attribute__((unused)),
-                         void *data, __u32 size)
+static void handle_event(void *ctx, int cpu, void *data, __u32 size)
 {
+    (void)cpu;
     struct tls_event_t *event = data;
     struct config *c = ctx;
 
@@ -1030,7 +1033,6 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
                    "\"error_code\":%d,\"error\":\"%s\"}\n",
                    remote_ip, event->remote_port,
                    ecode, err_desc);
-            fflush(stdout);
             return;
         }
 
@@ -1072,7 +1074,6 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
             printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
             printf("}\n");
-            fflush(stdout);
             return;
         }
 
@@ -1110,7 +1111,6 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
                 printf(",\"tls_version\":\"%s\"", tls_ver_str);
 
             printf("}\n");
-            fflush(stdout);
             return;
         }
 
@@ -1128,7 +1128,6 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
                    "\"transport\":\"udp\",\"protocol\":\"quic\"}\n",
                    local_ip, event->local_port,
                    remote_ip, event->remote_port);
-            fflush(stdout);
             return;
         }
 
@@ -1532,8 +1531,6 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
                 printf("\n");
         }
     }
-
-    fflush(stdout);
 }
 
 static void handle_lost_events(void *ctx, int cpu, unsigned long long cnt)
@@ -1554,7 +1551,6 @@ static void handle_lost_events(void *ctx, int cpu, unsigned long long cnt)
                "\"event_type\":\"lost_events\","
                "\"cpu\":%d,\"lost_count\":%llu}\n",
                iso_time, ts.tv_nsec / 1000, cpu, cnt);
-        fflush(stdout);
     }
 }
 
@@ -1601,6 +1597,7 @@ static void usage(const char *prog)
         "  -x, --hex              Show hex dump of captured data\n"
         "  -d, --data-only        Print only captured data (no headers)\n"
         "  -s, --sanitize REGEX   Sanitize URLs matching REGEX (case-insensitive, repeatable)\n"
+        "  -q, --quic             Enable QUIC/UDP detection probe (off by default)\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help message\n"
         "\n"
@@ -1613,6 +1610,59 @@ static void usage(const char *prog)
         "\n"
         "Requires root privileges (or CAP_BPF + CAP_PERFMON).\n",
         prog, prog, prog, prog, prog, prog);
+}
+
+/* R1-REL: Validate OpenSSL version for struct offset compatibility.
+ * The BPF program uses hardcoded offsets into SSL/BIO/SSL_CIPHER structs.
+ * These offsets are verified for specific OpenSSL versions. If the library
+ * version doesn't match, connection correlation may silently fail. */
+static void validate_openssl_version(const char *ssl_lib_path)
+{
+    /* Read the OpenSSL version string by looking for the version in the library.
+     * We use dlopen/dlsym to call OpenSSL_version() or SSLeay_version(). */
+    void *handle = dlopen(ssl_lib_path, RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle)
+        handle = dlopen(ssl_lib_path, RTLD_LAZY);
+    if (!handle) {
+        fprintf(stderr, "Warning: Cannot open %s for version check: %s\n",
+                ssl_lib_path, dlerror());
+        return;
+    }
+
+    /* OpenSSL 3.x: OpenSSL_version(OPENSSL_VERSION) returns version string */
+    const char *(*openssl_version_fn)(int) = dlsym(handle, "OpenSSL_version");
+    if (!openssl_version_fn) {
+        /* OpenSSL 1.1.x: try SSLeay_version */
+        openssl_version_fn = dlsym(handle, "SSLeay_version");
+    }
+
+    if (openssl_version_fn) {
+        const char *ver = openssl_version_fn(0);  /* OPENSSL_VERSION = 0 */
+        if (ver) {
+            fprintf(stderr, "OpenSSL version: %s\n", ver);
+
+            /* Known-good versions for hardcoded struct offsets */
+            int known_good = 0;
+            if (strstr(ver, "3.0.") || strstr(ver, "3.1.") ||
+                strstr(ver, "3.2.") || strstr(ver, "3.3.") ||
+                strstr(ver, "3.4.") ||
+                strstr(ver, "1.1.1"))
+                known_good = 1;
+
+            if (!known_good) {
+                fprintf(stderr,
+                    "WARNING: OpenSSL version '%s' has NOT been verified for\n"
+                    "struct offset compatibility. The BPF program uses hardcoded\n"
+                    "offsets into SSL->rbio (offset 16), BIO->num (offset 40/32),\n"
+                    "and SSL_CIPHER->name (offset 8). If these offsets changed\n"
+                    "in this version, connection correlation (conn_id, dst_ip)\n"
+                    "and cipher name extraction will silently fail.\n"
+                    "Verified versions: OpenSSL 1.1.1x, 3.0.x-3.4.x\n", ver);
+            }
+        }
+    }
+
+    dlclose(handle);
 }
 
 int main(int argc, char **argv)
@@ -1632,13 +1682,14 @@ int main(int argc, char **argv)
         {"hex",       no_argument,       NULL, 'x'},
         {"data-only", no_argument,       NULL, 'd'},
         {"sanitize",  required_argument, NULL, 's'},
+        {"quic",      no_argument,       NULL, 'q'},
         {"verbose",   no_argument,       NULL, 'v'},
         {"help",      no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qvh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': {
             char *endp;
@@ -1685,6 +1736,9 @@ int main(int argc, char **argv)
             if (add_sanitize_pattern(optarg) != 0)
                 return 1;
             break;
+        case 'q':
+            cfg.enable_quic = 1;
+            break;
         case 'v':
             cfg.verbose = 1;
             break;
@@ -1694,6 +1748,22 @@ int main(int argc, char **argv)
         default:
             usage(argv[0]);
             return 1;
+        }
+    }
+
+    /* S2-SEC: Default sanitization for sensitive HTTP headers.
+     * These patterns redact authentication tokens and session cookies
+     * from captured TLS data. Users can add more patterns with -s. */
+    {
+        static const char *default_sanitize_patterns[] = {
+            "Authorization:[[:space:]]*[^\r\n]+",
+            "Cookie:[[:space:]]*[^\r\n]+",
+            "Set-Cookie:[[:space:]]*[^\r\n]+",
+            "X-Api-Key:[[:space:]]*[^\r\n]+",
+            NULL,
+        };
+        for (int i = 0; default_sanitize_patterns[i]; i++) {
+            add_sanitize_pattern(default_sanitize_patterns[i]);
         }
     }
 
@@ -1721,6 +1791,8 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "Using SSL library: %s\n", cfg.ssl_lib);
 
+    validate_openssl_version(cfg.ssl_lib);
+
     /* Set up signal handlers (R6 fix: use sigaction for reliable signal handling).
      * signal() has undefined behavior on some systems — the handler may be reset
      * to SIG_DFL after first invocation. sigaction() is POSIX-recommended. */
@@ -1734,6 +1806,10 @@ int main(int argc, char **argv)
     /* R7 fix: ignore SIGPIPE so stdout writes don't kill the process
      * when piped through tee or when the reader closes the pipe. */
     signal(SIGPIPE, SIG_IGN);
+
+    /* P4-PERF: Use line-buffered stdout instead of per-event fflush.
+     * This achieves the same line-at-a-time semantics with fewer syscalls. */
+    setlinebuf(stdout);
 
     /* R-7 fix: Pre-flight checks for required kernel features.
      * These give clear, actionable errors instead of cryptic libbpf failures. */
@@ -1836,15 +1912,18 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "BPF object loaded successfully.\n");
 
-    /* Attach kprobes for connection tracking (connect syscall + tcp_set_state) */
+    /* Attach kprobes for connection tracking (connect syscall + tcp_set_state).
+     * P5-PERF: QUIC/UDP probe only attached when --quic flag is used,
+     * avoiding ~2% overhead from probing every UDP send on non-QUIC workloads. */
     const char *kprobe_names[] = {
         "probe_connect_enter",
         "probe_connect_return",
         "probe_tcp_set_state",
         "probe_udp_sendmsg",
     };
+    int num_kprobes = cfg.enable_quic ? 4 : 3;  /* skip udp_sendmsg unless --quic */
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < num_kprobes; i++) {
         prog = bpf_object__find_program_by_name(obj, kprobe_names[i]);
         if (!prog) {
             if (cfg.verbose)
@@ -1932,7 +2011,7 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 10);
 
-    /* Set up perf buffer */
+    /* Set up perf buffer (P1/P2-PERF: 256 pages, variable-length output) */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");
     if (map_fd < 0) {
         fprintf(stderr, "Error: Could not find 'tls_events' map in BPF object.\n");
@@ -1940,14 +2019,18 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES, handle_event,
-                          handle_lost_events, &cfg, NULL);
+    pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES,
+                          handle_event, handle_lost_events, &cfg, NULL);
     if (!pb) {
         fprintf(stderr, "Error: Failed to create perf buffer: %s\n",
                 strerror(errno));
         err = 1;
         goto cleanup;
     }
+
+    if (cfg.verbose)
+        fprintf(stderr, "Perf buffer: %d pages (%d KB per CPU)\n",
+                PERF_BUFFER_PAGES, PERF_BUFFER_PAGES * 4);
 
     /* Print startup banner */
     if (!cfg.data_only && cfg.format == FMT_TEXT) {

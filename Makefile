@@ -26,7 +26,7 @@ BPF_CFLAGS := -O2 -g -target bpf \
 # User-space compilation flags
 CFLAGS     := -O2 -g -Wall -Wextra -Werror \
               -I$(INCLUDE_DIR)
-LDFLAGS    := -lbpf -lelf -lz
+LDFLAGS    := -lbpf -lelf -lz -ldl
 
 # Source files
 BPF_SRC    := $(SRC_DIR)/bpf_program.c
