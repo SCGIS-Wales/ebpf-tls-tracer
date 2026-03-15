@@ -1675,7 +1675,7 @@ static void validate_openssl_version(const char *ssl_lib_path)
             int known_good = 0;
             if (strstr(ver, "3.0.") || strstr(ver, "3.1.") ||
                 strstr(ver, "3.2.") || strstr(ver, "3.3.") ||
-                strstr(ver, "3.4.") ||
+                strstr(ver, "3.4.") || strstr(ver, "3.5.") ||
                 strstr(ver, "1.1.1"))
                 known_good = 1;
 
@@ -1687,7 +1687,7 @@ static void validate_openssl_version(const char *ssl_lib_path)
                     "and SSL_CIPHER->name (offset 8). If these offsets changed\n"
                     "in this version, connection correlation (conn_id, dst_ip)\n"
                     "and cipher name extraction will silently fail.\n"
-                    "Verified versions: OpenSSL 1.1.1x, 3.0.x-3.4.x\n", ver);
+                    "Verified versions: OpenSSL 1.1.1x, 3.0.x-3.5.x\n", ver);
             }
         }
     }
