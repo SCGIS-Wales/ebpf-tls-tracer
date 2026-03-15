@@ -47,12 +47,34 @@ struct ssl_args_t {
     int   num;
 };
 
+/* Map to store TLS version per SSL pointer (populated by SSL_version uprobe).
+ * Key: SSL* pointer address, Value: TLS version (0x0303=TLS1.2, 0x0304=TLS1.3) */
+struct ssl_version_args_t {
+    void *ssl;  /* SSL * (first arg to SSL_version) */
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, struct ssl_args_t);
 } ssl_args_map SEC(".maps");
+
+/* Temporary map for SSL_version args between entry and return */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct ssl_version_args_t);
+} ssl_version_args_map SEC(".maps");
+
+/* Persistent map: SSL pointer → TLS version number */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);  /* SSL pointer cast to u64 */
+    __type(value, __u16);
+} ssl_version_map SEC(".maps");
 
 /* Connection info map: keyed by pid_tgid, stores remote addr/port.
  * Populated by connect/accept kprobes, read by SSL uprobes. */
@@ -227,11 +249,13 @@ cleanup:
     return 0;
 }
 
-/* --- tcp_set_state kprobe: capture local (source) address when TCP ESTABLISHED ---
+/* --- tcp_set_state kprobe: capture BOTH local and remote addresses when TCP ESTABLISHED ---
  *
  * tcp_set_state(struct sock *sk, int state) is called when a TCP socket
- * transitions state. When state == TCP_ESTABLISHED, both local and remote
- * addresses are populated in struct sock, giving us the source IP:port. */
+ * transitions state. When state == TCP_ESTABLISHED, struct sock has all
+ * addressing info populated. This fires DURING connect() — before the
+ * connect kretprobe — so we create/populate conn_info_t directly from
+ * struct sock rather than relying on a prior connect_return entry. */
 
 SEC("kprobe/tcp_set_state")
 int probe_tcp_set_state(struct pt_regs *ctx)
@@ -246,30 +270,83 @@ int probe_tcp_set_state(struct pt_regs *ctx)
 
     __u64 id = bpf_get_current_pid_tgid();
 
-    /* Look up existing conn_info (populated by connect kretprobe) */
-    struct conn_info_t *ci = bpf_map_lookup_elem(&conn_info_map, &id);
-    if (!ci)
-        return 0;
-
-    /* Read local address from struct sock */
+    /* Read address family */
     short family = 0;
     bpf_probe_read_kernel(&family, sizeof(family),
                           &sk->__sk_common.skc_family);
 
+    struct conn_info_t ci = {};
+
     if (family == AF_INET) {
-        __u32 saddr = 0;
-        __u16 sport = 0;
+        __u32 daddr = 0, saddr = 0;
+        __u16 dport = 0, sport = 0;
+
+        bpf_probe_read_kernel(&daddr, sizeof(daddr),
+                              &sk->__sk_common.skc_daddr);
         bpf_probe_read_kernel(&saddr, sizeof(saddr),
                               &sk->__sk_common.skc_rcv_saddr);
+        bpf_probe_read_kernel(&dport, sizeof(dport),
+                              &sk->__sk_common.skc_dport);
         bpf_probe_read_kernel(&sport, sizeof(sport),
                               &sk->__sk_common.skc_num);
-        ci->local_addr_v4 = saddr;
-        ci->local_port = sport;  /* skc_num is already host byte order */
-    }
-    /* Note: IPv6 local address requires reading sk->sk_v6_rcv_saddr
-     * which is at a variable offset — we skip it for now */
 
-    bpf_map_update_elem(&conn_info_map, &id, ci, BPF_ANY);
+        ci.addr_family = ADDR_FAMILY_IPV4;
+        ci.remote_addr_v4 = daddr;
+        ci.local_addr_v4 = saddr;
+        ci.remote_port = bpf_ntohs(dport);
+        ci.local_port = sport;  /* skc_num is already host byte order */
+    } else {
+        /* IPv6: skip for now (sk_v6_rcv_saddr offset varies) */
+        return 0;
+    }
+
+    bpf_map_update_elem(&conn_info_map, &id, &ci, BPF_ANY);
+    return 0;
+}
+
+/* --- Helper: look up TLS version for an SSL pointer --- */
+
+static __always_inline __u16 get_tls_version(void *ssl)
+{
+    __u64 key = (__u64)(unsigned long)ssl;
+    __u16 *ver = bpf_map_lookup_elem(&ssl_version_map, &key);
+    if (ver)
+        return *ver;
+    return 0;
+}
+
+/* --- SSL_version probes: capture TLS version per SSL connection ---
+ * int SSL_version(const SSL *s) returns TLS1_2_VERSION(0x0303) or
+ * TLS1_3_VERSION(0x0304). Called by applications or internally. */
+
+SEC("uprobe/SSL_version")
+int probe_ssl_version_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_version_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&ssl_version_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/SSL_version")
+int probe_ssl_version_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_version_args_t *args;
+
+    args = bpf_map_lookup_elem(&ssl_version_args_map, &id);
+    if (!args)
+        return 0;
+
+    int version = (int)PT_REGS_RC(ctx);
+    if (version > 0) {
+        __u64 key = (__u64)(unsigned long)args->ssl;
+        __u16 ver = (__u16)version;
+        bpf_map_update_elem(&ssl_version_map, &key, &ver, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&ssl_version_args_map, &id);
     return 0;
 }
 
@@ -314,6 +391,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
     event->uid = bpf_get_current_uid_gid();
     event->direction = DIRECTION_READ;
     event->event_type = EVENT_TLS_DATA;
+    event->tls_version = get_tls_version(args->ssl);
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     enrich_event_with_conn_info(event, id);
@@ -372,6 +450,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
     event->uid = bpf_get_current_uid_gid();
     event->direction = DIRECTION_WRITE;
     event->event_type = EVENT_TLS_DATA;
+    event->tls_version = get_tls_version(args->ssl);
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     enrich_event_with_conn_info(event, id);

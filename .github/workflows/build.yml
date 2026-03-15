@@ -285,27 +285,54 @@ jobs:
 
       - name: Generate TLS traffic from apigee namespace
         run: |
-          # Make outbound HTTPS requests from the apigee test pod
-          # The pod uses debian's system libssl.so.3 which matches what
-          # the tracer hooks via uprobes on the node
+          # === HTTP/1.1 requests (explicit --http1.1 flag) ===
+          echo "--- HTTP/1.1 traffic ---"
           for i in 1 2 3; do
             kubectl exec -n apigee apigee-test-client -- \
-              curl -s -o /dev/null -w "Request ${i}: HTTP %{http_code}\n" \
-              https://httpbin.org/get 2>/dev/null || echo "Request ${i}: connection failed (expected in CI)"
+              curl -s -o /dev/null --http1.1 -w "HTTP/1.1 GET ${i}: HTTP %{http_code}\n" \
+              https://httpbin.org/get 2>/dev/null || echo "HTTP/1.1 GET ${i}: failed (expected in CI)"
             sleep 1
           done
 
-          # Also try a POST request
+          # HTTP/1.1 POST
           kubectl exec -n apigee apigee-test-client -- \
-            curl -s -o /dev/null -w "POST request: HTTP %{http_code}\n" \
-            -X POST -d '{"test":"data"}' https://httpbin.org/post 2>/dev/null || echo "POST: connection failed (expected in CI)"
+            curl -s -o /dev/null --http1.1 -w "HTTP/1.1 POST: HTTP %{http_code}\n" \
+            -X POST -H "Content-Type: application/json" -d '{"test":"data"}' \
+            https://httpbin.org/post 2>/dev/null || echo "HTTP/1.1 POST: failed"
 
-          # Also generate traffic directly on the kind node (guaranteed to use node's libssl)
-          echo "Generating traffic from kind node directly..."
+          # === HTTP/2 requests ===
+          echo "--- HTTP/2 traffic ---"
+          for i in 1 2; do
+            kubectl exec -n apigee apigee-test-client -- \
+              curl -s -o /dev/null --http2 -w "HTTP/2 GET ${i}: HTTP %{http_code}\n" \
+              https://httpbin.org/get 2>/dev/null || echo "HTTP/2 GET ${i}: failed"
+            sleep 1
+          done
+
+          # === WebSocket upgrade attempt (server won't upgrade, but we detect the header) ===
+          echo "--- WebSocket upgrade attempt ---"
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --http1.1 -w "WS upgrade: HTTP %{http_code}\n" \
+            -H "Upgrade: websocket" -H "Connection: Upgrade" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            https://echo.websocket.org/ 2>/dev/null || echo "WebSocket: failed (expected)"
+
+          # === gRPC-style traffic (HTTP/2 POST to gRPC endpoint) ===
+          echo "--- gRPC-style traffic ---"
+          kubectl exec -n apigee apigee-test-client -- \
+            curl -s -o /dev/null --http2 -w "gRPC-style: HTTP %{http_code}\n" \
+            -H "content-type: application/grpc" \
+            -H "te: trailers" \
+            -X POST https://grpc.io/ 2>/dev/null || echo "gRPC-style: failed (expected)"
+
+          # === Node-level traffic (guaranteed to use node's libssl) ===
+          echo "--- Node-level traffic ---"
           docker exec tls-tracer-ci-control-plane \
             sh -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1 && \
-                   curl -s -o /dev/null https://httpbin.org/get && echo 'Node curl: OK' || echo 'Node curl: failed'" \
-            2>/dev/null || echo "Node traffic generation failed (non-critical)"
+                   curl -s -o /dev/null --http1.1 https://httpbin.org/get && echo 'Node HTTP/1.1: OK' && \
+                   curl -s -o /dev/null --http2 https://httpbin.org/get && echo 'Node HTTP/2: OK'" \
+            2>/dev/null || echo "Node traffic: failed (non-critical)"
 
           # Give tracer time to capture events
           sleep 10
@@ -355,7 +382,7 @@ jobs:
               ERRORS=$((ERRORS + 1))
             fi
 
-            # Check for expected fields
+            # Check for expected fields (required)
             for field in timestamp pid comm direction dst_ip dst_port data_len transport protocol; do
               if echo "${FIRST_LINE}" | grep -q "\"${field}\""; then
                 echo "Field '${field}' present in JSON"
@@ -363,6 +390,26 @@ jobs:
                 echo "WARNING: Field '${field}' missing from JSON"
               fi
             done
+
+            # Check for enriched fields (best-effort — may not appear on every event)
+            echo ""
+            echo "=== Checking enriched fields across all events ==="
+            for field in src_ip src_port dst_dns http_version tls_version http_method http_path http_host; do
+              if echo "${JSON_LINES}" | grep -q "\"${field}\""; then
+                SAMPLE=$(echo "${JSON_LINES}" | grep "\"${field}\"" | head -1 | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'{field}={d.get(\"${field}\",\"-\")}') " 2>/dev/null || true)
+                echo "Enriched field '${field}' found: ${SAMPLE}"
+              else
+                echo "Note: '${field}' not present (may not apply to captured traffic)"
+              fi
+            done
+
+            # Validate src_ip is populated (not "-") in at least one event
+            SRC_IP_POPULATED=$(echo "${JSON_LINES}" | grep '"src_ip"' | grep -v '"src_ip":"-"' | head -1 || true)
+            if [ -n "${SRC_IP_POPULATED}" ]; then
+              echo "PASS: src_ip is populated with actual IP address"
+            else
+              echo "WARNING: src_ip shows '-' in all events (tcp_set_state may not have fired)"
+            fi
           else
             echo ""
             echo "WARNING: No JSON events captured"

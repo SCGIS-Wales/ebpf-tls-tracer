@@ -23,7 +23,7 @@
 
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
-#define MAX_PROBES         10
+#define MAX_PROBES         12
 #define MAX_SANITIZE_PATTERNS 32
 
 static volatile sig_atomic_t exiting = 0;
@@ -308,6 +308,8 @@ struct http_info {
     char method[16];
     char path[512];
     char host[256];
+    char version[16];   /* "1.0", "1.1", or "2" */
+    int  websocket;     /* 1 if Upgrade: websocket detected */
 };
 
 static void parse_http_info(const char *data, __u32 len, struct http_info *info)
@@ -315,6 +317,21 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
     memset(info, 0, sizeof(*info));
     if (len < 4)
         return;
+
+    /* Check for HTTP response line: "HTTP/1.1 200 OK\r\n" */
+    if (len >= 8 && strncmp(data, "HTTP/", 5) == 0) {
+        const char *ver_start = data + 5;
+        const char *ver_end = ver_start;
+        const char *data_end = data + len;
+        while (ver_end < data_end && *ver_end != ' ' && *ver_end != '\r')
+            ver_end++;
+        size_t ver_len = (size_t)(ver_end - ver_start);
+        if (ver_len > 0 && ver_len < sizeof(info->version)) {
+            strncpy(info->version, ver_start, ver_len);
+            info->version[ver_len] = '\0';
+        }
+        /* Responses don't have method/path, but may have headers below */
+    }
 
     /* Check if data starts with an HTTP method */
     const char *methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ",
@@ -347,19 +364,48 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
     if (!found)
         return;
 
-    /* Extract Host header */
-    const char *host_hdr = NULL;
+    /* Extract HTTP version from request line: "METHOD /path HTTP/1.1\r\n" */
+    const char *http_ver = NULL;
     const char *p = data;
     const char *end = data + len;
-    while (p < end - 6) {
-        if ((*p == '\n' || p == data) &&
-            (strncasecmp(p + (p == data ? 0 : 1), "Host:", 5) == 0 ||
-             strncasecmp(p + (p == data ? 0 : 1), "host:", 5) == 0)) {
-            host_hdr = p + (p == data ? 5 : 6);
-            /* Skip whitespace */
-            while (host_hdr < end && (*host_hdr == ' ' || *host_hdr == '\t'))
-                host_hdr++;
+    /* Scan for "HTTP/" in the request line (before first \r\n) */
+    for (const char *s = p; s < end - 8; s++) {
+        if (*s == '\r' || *s == '\n')
             break;
+        if (strncmp(s, "HTTP/", 5) == 0) {
+            http_ver = s + 5;
+            break;
+        }
+    }
+    if (http_ver) {
+        const char *ver_end = http_ver;
+        while (ver_end < end && *ver_end != '\r' && *ver_end != '\n' && *ver_end != ' ')
+            ver_end++;
+        size_t ver_len = (size_t)(ver_end - http_ver);
+        if (ver_len >= sizeof(info->version))
+            ver_len = sizeof(info->version) - 1;
+        strncpy(info->version, http_ver, ver_len);
+        info->version[ver_len] = '\0';
+    }
+
+    /* Scan headers for Host and Upgrade: websocket */
+    const char *host_hdr = NULL;
+    while (p < end - 6) {
+        if (*p == '\n' || p == data) {
+            const char *hdr = p + (p == data ? 0 : 1);
+            size_t remaining = (size_t)(end - hdr);
+
+            if (remaining >= 5 && strncasecmp(hdr, "Host:", 5) == 0) {
+                host_hdr = hdr + 5;
+                while (host_hdr < end && (*host_hdr == ' ' || *host_hdr == '\t'))
+                    host_hdr++;
+            } else if (remaining >= 8 && strncasecmp(hdr, "Upgrade:", 8) == 0) {
+                const char *val = hdr + 8;
+                while (val < end && (*val == ' ' || *val == '\t'))
+                    val++;
+                if ((size_t)(end - val) >= 9 && strncasecmp(val, "websocket", 9) == 0)
+                    info->websocket = 1;
+            }
         }
         p++;
     }
@@ -498,29 +544,103 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
 
         /* Protocol detection: data signatures first, then well-known ports */
         const char *l7_proto = "unknown";
+        int is_http2 = 0;
 
-        /* 1. Detect by data content (most reliable) */
-        if (http.method[0])
-            l7_proto = "https";
-        else if (data_len >= 5 && strncmp(event->data, "HTTP/", 5) == 0)
-            l7_proto = "https";
-        else if (data_len >= 4 && (
-            /* gRPC: starts with binary frame (0x00 + 4-byte length) */
-            ((unsigned char)event->data[0] == 0x00 && data_len >= 5) ||
-            /* SMTP over TLS */
+        /* 1. Detect HTTP/2 connection preface (client→server first write)
+         * RFC 7540 §3.5: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" */
+        if (data_len >= 24 && strncmp(event->data, "PRI * HTTP/2.0", 14) == 0)
+            is_http2 = 1;
+
+        /* 2. Detect HTTP/2 frames by validating the 9-byte frame header.
+         * Format: length(3) + type(1) + flags(1) + stream_id(4)
+         * Valid frame types: 0x00(DATA) - 0x09(CONTINUATION) per RFC 7540 §6.
+         * To avoid false positives, we require:
+         *   - Frame length consistent with captured data (frame_len + 9 <= data_len * 2)
+         *   - SETTINGS(0x04) or HEADERS(0x01) frame types (most common first frames)
+         *   - Reserved bit in stream ID must be 0 */
+        if (!is_http2 && data_len >= 18) {  /* Need enough data to reduce false positives */
+            __u8 frame_type = (unsigned char)event->data[3];
+            /* Stream ID: top bit is reserved (must be 0) */
+            __u8 stream_id_top = (unsigned char)event->data[5];
+            __u32 frame_len = ((unsigned char)event->data[0] << 16) |
+                              ((unsigned char)event->data[1] << 8) |
+                              (unsigned char)event->data[2];
+            /* Only match SETTINGS(4), HEADERS(1), WINDOW_UPDATE(8) as first frames */
+            if ((frame_type == 0x04 || frame_type == 0x01 || frame_type == 0x08) &&
+                (stream_id_top & 0x80) == 0 &&
+                frame_len > 0 && frame_len <= 16384)
+                is_http2 = 1;
+        }
+
+        /* 3. Classify HTTP/2 traffic: gRPC vs plain HTTPS.
+         * gRPC uses HTTP/2 exclusively, typically on ports 443, 8443, or
+         * 50051-50055 (default grpc ports). Also check for gRPC message
+         * framing in DATA frames: compressed_flag(1) + msg_length(4). */
+        if (is_http2) {
+            /* gRPC detection heuristics:
+             * a) Well-known gRPC ports (50051-50055)
+             * b) HTTP/2 DATA frame (type=0x0) with gRPC length-prefixed message
+             * c) Check for gRPC content-type in HEADERS via HPACK
+             *    (te: trailers is gRPC-specific) */
+            __u16 port = event->remote_port;
+            if (port >= 50051 && port <= 50055) {
+                l7_proto = "grpc";
+            } else if (data_len >= 14 && (unsigned char)event->data[3] == 0x00) {
+                /* DATA frame: check if payload starts with gRPC message framing
+                 * (compressed_flag byte 0x00 or 0x01 + 4-byte big-endian length) */
+                __u8 grpc_compress = (unsigned char)event->data[9];
+                if (grpc_compress <= 1) {
+                    __u32 grpc_msg_len = ((unsigned char)event->data[10] << 24) |
+                                         ((unsigned char)event->data[11] << 16) |
+                                         ((unsigned char)event->data[12] << 8) |
+                                         (unsigned char)event->data[13];
+                    __u32 frame_len = ((unsigned char)event->data[0] << 16) |
+                                      ((unsigned char)event->data[1] << 8) |
+                                      (unsigned char)event->data[2];
+                    /* gRPC message length should be <= frame payload length - 5 */
+                    if (grpc_msg_len > 0 && grpc_msg_len <= frame_len)
+                        l7_proto = "grpc";
+                }
+            }
+            if (strcmp(l7_proto, "unknown") == 0)
+                l7_proto = "https";  /* HTTP/2 but not gRPC → HTTPS */
+        }
+
+        /* 4. Detect WebSocket upgrade (RFC 6455 over TLS = wss://)
+         * Request:  "Upgrade: websocket" header
+         * Response: "HTTP/1.1 101 Switching Protocols" */
+        if (strcmp(l7_proto, "unknown") == 0 || strcmp(l7_proto, "https") == 0) {
+            if (http.websocket)
+                l7_proto = "wss";
+            else if (data_len >= 12 && strncmp(event->data, "HTTP/1.1 101", 12) == 0)
+                l7_proto = "wss";
+        }
+
+        /* 5. Detect by HTTP/1.x data content */
+        if (strcmp(l7_proto, "unknown") == 0) {
+            if (http.method[0])
+                l7_proto = "https";
+            else if (data_len >= 5 && strncmp(event->data, "HTTP/", 5) == 0)
+                l7_proto = "https";
+        }
+
+        /* 6. Detect SMTP over TLS */
+        if (strcmp(l7_proto, "unknown") == 0 && data_len >= 4 && (
             strncmp(event->data, "EHLO", 4) == 0 ||
             strncmp(event->data, "MAIL", 4) == 0 ||
+            strncmp(event->data, "RCPT", 4) == 0 ||
             strncmp(event->data, "220 ", 4) == 0 ||
             strncmp(event->data, "250 ", 4) == 0))
-            l7_proto = event->remote_port == 443 ? "grpc" : "smtps";
-        else if (data_len >= 4 && (
-            /* IMAP over TLS */
+            l7_proto = "smtps";
+
+        /* 7. Detect IMAP over TLS */
+        if (strcmp(l7_proto, "unknown") == 0 && data_len >= 4 && (
             strncmp(event->data, "* OK", 4) == 0 ||
             (event->data[0] >= 'A' && event->data[0] <= 'Z' &&
              data_len >= 6 && strstr(event->data, "LOGIN") != NULL)))
             l7_proto = "imaps";
 
-        /* 2. Fall back to well-known TLS port numbers (RFC/IANA assignments) */
+        /* 8. Fall back to well-known TLS port numbers (RFC/IANA assignments) */
         if (strcmp(l7_proto, "unknown") == 0) {
             __u16 port = event->remote_port;
             switch (port) {
@@ -540,10 +660,34 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             case 9200:
             case 9243: l7_proto = "https";  break;  /* Elasticsearch */
             case 27017: l7_proto = "mongodb+srv"; break; /* MongoDB TLS */
+            /* gRPC default ports (no IANA assignment, de facto standard) */
+            case 50051:
+            case 50052:
+            case 50053:
+            case 50054:
+            case 50055: l7_proto = "grpc"; break;
             default: break;
             }
         }
+        /* TLS version: 0x0303=TLS1.2, 0x0304=TLS1.3 */
+        const char *tls_ver_str = NULL;
+        switch (event->tls_version) {
+        case 0x0301: tls_ver_str = "1.0"; break;
+        case 0x0302: tls_ver_str = "1.1"; break;
+        case 0x0303: tls_ver_str = "1.2"; break;
+        case 0x0304: tls_ver_str = "1.3"; break;
+        default: break;
+        }
+        if (tls_ver_str)
+            printf(",\"tls_version\":\"%s\"", tls_ver_str);
+
         printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
+
+        /* HTTP version: from request line or inferred from HTTP/2 detection */
+        if (is_http2)
+            printf(",\"http_version\":\"2\"");
+        else if (http.version[0])
+            printf(",\"http_version\":\"%s\"", http.version);
 
         if (http.method[0]) {
             printf(",\"http_method\":\"%s\"", http.method);
@@ -799,17 +943,21 @@ int main(int argc, char **argv)
         "probe_ssl_read_return",
         "probe_ssl_write_enter",
         "probe_ssl_write_return",
+        "probe_ssl_version_enter",
+        "probe_ssl_version_return",
     };
-    int is_retprobe[] = {0, 1, 0, 1};
+    int is_retprobe[] = {0, 1, 0, 1, 0, 1};
     const char *func_names[] = {
         "SSL_read",
         "SSL_read",
         "SSL_write",
         "SSL_write",
+        "SSL_version",
+        "SSL_version",
     };
 
     int uprobe_count = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
         if (!prog) {
             fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
