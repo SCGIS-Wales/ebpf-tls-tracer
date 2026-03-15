@@ -1,46 +1,47 @@
-# Use Debian Bullseye, which is more compatible with kernel development
-FROM debian:bullseye-slim
+# Multi-stage build for eBPF TLS Tracer
 
-# Set non-interactive frontend to avoid tzdata prompts
+# --- Build stage ---
+FROM debian:bookworm-slim AS builder
+
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install dependencies, including generic headers for eBPF development
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     llvm \
     gcc \
     make \
     libbpf-dev \
-    linux-headers-amd64 \
-    build-essential \
-    iproute2 \
-    git \
-    wget \
-    curl \
-    bpfcc-tools \
     libelf-dev \
-    iputils-ping \
-    net-tools \
-    python3 \
-    python3-pip \
-    python3-setuptools \
+    zlib1g-dev \
     linux-libc-dev \
-    kmod \
-    libmnl-dev
+    libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set up working directory
-WORKDIR /app
+WORKDIR /build
 
-# Copy all project files into the container
-COPY include /app/include
-COPY src /app/src
-COPY Makefile /app/Makefile
+COPY include/ include/
+COPY src/ src/
+COPY tests/ tests/
+COPY Makefile .
 
-# Check if the Makefile and necessary files exist
-RUN ls -la /app
+RUN make all && make test
 
-# Compile the eBPF program and user-space application
-RUN make
+# --- Runtime stage ---
+FROM debian:bookworm-slim
 
-# Command to run the CLI tool (you can adjust this based on your needs)
-CMD ["./cli_tool", "--start"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libbpf1 \
+    libelf1 \
+    zlib1g \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/tls_tracer
+
+COPY --from=builder /build/bin/tls_tracer ./tls_tracer
+COPY --from=builder /build/bin/bpf_program.o ./bpf_program.o
+
+ENTRYPOINT ["./tls_tracer"]
+CMD ["--help"]

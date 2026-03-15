@@ -1,61 +1,101 @@
-# Complete Makefile for building the eBPF program and user-space application
+# eBPF TLS Tracer - Makefile
+# Builds the eBPF kernel probe and user-space CLI tool
 
-# Compiler and flags
-CC = clang
-CFLAGS = -O2 -target bpf -I./include  # Include the headers from the 'include' directory
+CLANG      ?= clang
+GCC        ?= gcc
+ARCH       := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
-# Paths
-SRC_DIR = src
-OBJ_DIR = obj
-BIN_DIR = bin
-INCLUDE_DIR = include
+# Directories
+SRC_DIR    := src
+INCLUDE_DIR := include
+BUILD_DIR  := build
+BIN_DIR    := bin
+TEST_DIR   := tests
 
-# Sources and objects
-BPF_PROGRAM = $(SRC_DIR)/bpf_program.c
-USER_PROGRAM = $(SRC_DIR)/user_space.c
-CLI_TOOL = $(SRC_DIR)/cli_tool.c
-BPF_OBJECT = $(OBJ_DIR)/bpf_program.o
-USER_OBJECT = $(OBJ_DIR)/user_space.o
-CLI_OBJECT = $(OBJ_DIR)/cli_tool.o
+# BPF compilation flags
+BPF_CFLAGS := -O2 -g -target bpf \
+              -D__TARGET_ARCH_$(ARCH) \
+              -I$(INCLUDE_DIR) \
+              -Wall -Werror
 
-# Output binaries
-USER_BINARY = $(BIN_DIR)/user_space
-CLI_BINARY = $(BIN_DIR)/cli_tool
+# User-space compilation flags
+CFLAGS     := -O2 -g -Wall -Wextra -Wpedantic \
+              -I$(INCLUDE_DIR)
+LDFLAGS    := -lbpf -lelf -lz
 
-# Create necessary directories
-$(OBJ_DIR) $(BIN_DIR):
-	@echo "Creating directories: $(OBJ_DIR) and $(BIN_DIR)"
-	mkdir -p $(OBJ_DIR) $(BIN_DIR)
+# Source files
+BPF_SRC    := $(SRC_DIR)/bpf_program.c
+TRACER_SRC := $(SRC_DIR)/tls_tracer.c
 
-# Default target
-all: $(OBJ_DIR) $(BIN_DIR) $(BPF_OBJECT) $(USER_BINARY) $(CLI_BINARY)
+# Output files
+BPF_OBJ    := $(BIN_DIR)/bpf_program.o
+TRACER_BIN := $(BIN_DIR)/tls_tracer
 
-# Compile eBPF program
-$(BPF_OBJECT): $(BPF_PROGRAM) | $(OBJ_DIR)
-	@echo "Compiling eBPF program: $<"
-	$(CC) $(CFLAGS) -c $< -o $@ || { echo "Error compiling $<"; exit 1; }
+# Test files
+TEST_SRC   := $(TEST_DIR)/test_tracer.c
+TEST_BIN   := $(BUILD_DIR)/test_tracer
 
-# Compile user-space program
-$(USER_OBJECT): $(USER_PROGRAM) | $(OBJ_DIR)
-	@echo "Compiling user-space program: $<"
-	gcc -I$(INCLUDE_DIR) -c $< -o $@ || { echo "Error compiling $<"; exit 1; }
+# Install paths
+PREFIX     ?= /usr/local
+INSTALL_BIN := $(PREFIX)/bin
+INSTALL_LIB := $(PREFIX)/lib/tls_tracer
 
-# Compile CLI tool
-$(CLI_OBJECT): $(CLI_TOOL) | $(OBJ_DIR)
-	@echo "Compiling CLI tool: $<"
-	gcc -I$(INCLUDE_DIR) -c $< -o $@ || { echo "Error compiling $<"; exit 1; }
+.PHONY: all clean install uninstall test help
 
-# Link user-space binary
-$(USER_BINARY): $(USER_OBJECT) | $(BIN_DIR)
-	@echo "Linking user-space binary: $@"
-	gcc -o $@ $^ || { echo "Error linking $@"; exit 1; }
+all: $(BPF_OBJ) $(TRACER_BIN)
 
-# Link CLI tool binary
-$(CLI_BINARY): $(CLI_OBJECT) | $(BIN_DIR)
-	@echo "Linking CLI tool binary: $@"
-	gcc -o $@ $^ || { echo "Error linking $@"; exit 1; }
+# Create output directories
+$(BUILD_DIR) $(BIN_DIR):
+	@mkdir -p $@
 
-# Clean up build artifacts
+# Compile eBPF program (must use clang with bpf target)
+$(BPF_OBJ): $(BPF_SRC) $(INCLUDE_DIR)/tracer.h | $(BIN_DIR)
+	@echo "  BPF     $@"
+	@$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+# Compile user-space tracer
+$(BUILD_DIR)/tls_tracer.o: $(TRACER_SRC) $(INCLUDE_DIR)/tracer.h | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
+$(TRACER_BIN): $(BUILD_DIR)/tls_tracer.o | $(BIN_DIR)
+	@echo "  LD      $@"
+	@$(GCC) -o $@ $^ $(LDFLAGS)
+
+# Tests
+$(BUILD_DIR)/test_tracer.o: $(TEST_DIR)/test_tracer.c $(INCLUDE_DIR)/tracer.h | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
+$(TEST_BIN): $(BUILD_DIR)/test_tracer.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	@$(GCC) -o $@ $^
+
+test: $(TEST_BIN)
+	@echo "  TEST    Running unit tests..."
+	@./$(TEST_BIN)
+
+# Install
+install: all
+	@echo "  INSTALL $(INSTALL_BIN)/tls_tracer"
+	@install -d $(INSTALL_BIN) $(INSTALL_LIB)
+	@install -m 755 $(TRACER_BIN) $(INSTALL_BIN)/tls_tracer
+	@install -m 644 $(BPF_OBJ) $(INSTALL_LIB)/bpf_program.o
+
+uninstall:
+	@echo "  REMOVE  $(INSTALL_BIN)/tls_tracer"
+	@rm -f $(INSTALL_BIN)/tls_tracer
+	@rm -rf $(INSTALL_LIB)
+
 clean:
-	@echo "Cleaning up build artifacts..."
-	rm -rf $(OBJ_DIR) $(BIN_DIR)
+	@echo "  CLEAN"
+	@rm -rf $(BUILD_DIR) $(BIN_DIR)
+
+help:
+	@echo "eBPF TLS Tracer build targets:"
+	@echo "  all       - Build BPF program and tracer binary (default)"
+	@echo "  test      - Build and run unit tests"
+	@echo "  install   - Install to $(PREFIX)"
+	@echo "  uninstall - Remove installed files"
+	@echo "  clean     - Remove build artifacts"
+	@echo "  help      - Show this message"
