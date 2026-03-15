@@ -11,6 +11,7 @@ typedef uint64_t __u64;
 typedef uint32_t __u32;
 typedef uint16_t __u16;
 typedef uint8_t  __u8;
+typedef int16_t  __s16;
 typedef int32_t  __s32;
 #endif
 
@@ -29,6 +30,9 @@ typedef int32_t  __s32;
 #define EVENT_TLS_DATA      1
 #define EVENT_TLS_HANDSHAKE 2
 #define EVENT_CONNECT       3
+#define EVENT_CONNECT_ERROR 4
+#define EVENT_TLS_ERROR     5
+#define EVENT_QUIC_DETECTED 6
 
 /* Address family constants (match AF_INET/AF_INET6) */
 #define ADDR_FAMILY_IPV4    2
@@ -66,7 +70,8 @@ struct tls_event_t {
     __u8  direction;         /* DIRECTION_READ or DIRECTION_WRITE */
     __u8  event_type;
     __u8  addr_family;       /* ADDR_FAMILY_IPV4 or ADDR_FAMILY_IPV6 */
-    __u8  _pad[3];
+    __u8  _pad[1];
+    __s16 error_code;        /* errno for connect errors, SSL ret for TLS errors */
     __u16 local_port;
     __u16 remote_port;
     union {
@@ -78,6 +83,7 @@ struct tls_event_t {
         __u8  local_addr_v6[16];
     };
     char  comm[MAX_COMM_LEN];
+    char  cipher[MAX_CIPHER_LEN]; /* TLS cipher suite name (e.g. "TLS_AES_256_GCM_SHA384") */
     char  data[MAX_DATA_LEN];
 };
 

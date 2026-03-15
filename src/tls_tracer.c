@@ -23,7 +23,7 @@
 
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
-#define MAX_PROBES         12
+#define MAX_PROBES         14
 #define MAX_SANITIZE_PATTERNS 32
 
 static volatile sig_atomic_t exiting = 0;
@@ -308,13 +308,134 @@ struct http_info {
     char method[16];
     char path[512];
     char host[256];
+    char user_agent[256]; /* User-Agent header value */
     char version[16];   /* "1.0", "1.1", or "2" */
     int  websocket;     /* 1 if Upgrade: websocket detected */
+    int  grpc_status;   /* gRPC status code (-1 = not present, 0-16 = code) */
 };
+
+/* Kafka wire protocol detection: check if data matches Kafka request header.
+ * Kafka request header: message_size(4) + api_key(2) + api_version(2) + correlation_id(4) + client_id_len(2)
+ * Minimum 14 bytes. */
+static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
+{
+    if (len < 14)
+        return 0;
+
+    /* Read message_size (4 bytes, big-endian) */
+    __u32 msg_size = ((unsigned char)data[0] << 24) |
+                     ((unsigned char)data[1] << 16) |
+                     ((unsigned char)data[2] << 8) |
+                     (unsigned char)data[3];
+
+    /* Sanity: 4 < msg_size < 100MB, and msg_size + 4 should be close to data len */
+    if (msg_size <= 4 || msg_size > 104857600)
+        return 0;
+
+    /* Read api_key (2 bytes, big-endian, signed) */
+    int ak = (int)(short)(((unsigned char)data[4] << 8) |
+                          (unsigned char)data[5]);
+    if (ak < 0 || ak > 74)
+        return 0;
+
+    /* Read api_version (2 bytes) */
+    int av = (int)(short)(((unsigned char)data[6] << 8) |
+                          (unsigned char)data[7]);
+    if (av < 0 || av > 20)
+        return 0;
+
+    /* Read correlation_id (4 bytes) — must be >= 0 */
+    int corr_id = (int)(((unsigned char)data[8] << 24) |
+                        ((unsigned char)data[9] << 16) |
+                        ((unsigned char)data[10] << 8) |
+                        (unsigned char)data[11]);
+    if (corr_id < 0)
+        return 0;
+
+    /* Read client_id_length (2 bytes, -1 for null) */
+    int cid_len = (int)(short)(((unsigned char)data[12] << 8) |
+                               (unsigned char)data[13]);
+    if (cid_len < -1 || cid_len > 1024)
+        return 0;
+
+    /* If client_id_length > 0, verify there's enough data */
+    if (cid_len > 0 && len < (unsigned)(14 + cid_len))
+        return 0;
+
+    *api_key = (int)ak;
+    return 1;
+}
+
+static const char *kafka_api_key_name(int api_key)
+{
+    switch (api_key) {
+    case 0: return "Produce";
+    case 1: return "Fetch";
+    case 2: return "ListOffsets";
+    case 3: return "Metadata";
+    case 8: return "OffsetCommit";
+    case 9: return "OffsetFetch";
+    case 10: return "FindCoordinator";
+    case 11: return "JoinGroup";
+    case 12: return "Heartbeat";
+    case 13: return "LeaveGroup";
+    case 14: return "SyncGroup";
+    case 17: return "SaslHandshake";
+    case 18: return "ApiVersions";
+    case 19: return "CreateTopics";
+    case 20: return "DeleteTopics";
+    case 22: return "InitProducerId";
+    case 36: return "SaslAuthenticate";
+    default: return NULL;
+    }
+}
+
+/* WebSocket frame parsing: extract close code from close frame (opcode 0x8) */
+static int parse_websocket_close_code(const char *data, __u32 len)
+{
+    if (len < 2)
+        return -1;
+
+    __u8 opcode = (unsigned char)data[0] & 0x0F;
+    if (opcode != 0x08)  /* Close frame */
+        return -1;
+
+    __u8 mask_bit = ((unsigned char)data[1] & 0x80) ? 1 : 0;
+    __u8 payload_len = (unsigned char)data[1] & 0x7F;
+
+    if (payload_len < 2)
+        return -1;  /* No close code in payload */
+
+    int offset = 2;
+    __u8 masking_key[4] = {0};
+    if (mask_bit) {
+        if (len < (unsigned)(offset + 4))
+            return -1;
+        for (int i = 0; i < 4; i++)
+            masking_key[i] = (unsigned char)data[offset + i];
+        offset += 4;
+    }
+
+    if (len < (unsigned)(offset + 2))
+        return -1;
+
+    __u16 code;
+    if (mask_bit) {
+        __u8 b0 = (unsigned char)data[offset] ^ masking_key[0];
+        __u8 b1 = (unsigned char)data[offset + 1] ^ masking_key[1];
+        code = (b0 << 8) | b1;
+    } else {
+        code = ((unsigned char)data[offset] << 8) |
+               (unsigned char)data[offset + 1];
+    }
+
+    return (int)code;
+}
 
 static void parse_http_info(const char *data, __u32 len, struct http_info *info)
 {
     memset(info, 0, sizeof(*info));
+    info->grpc_status = -1;  /* -1 = not present */
     if (len < 4)
         return;
 
@@ -404,12 +525,34 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
                 host_hdr = hdr + 5;
                 while (host_hdr < end && (*host_hdr == ' ' || *host_hdr == '\t'))
                     host_hdr++;
+            } else if (remaining >= 11 && strncasecmp(hdr, "User-Agent:", 11) == 0) {
+                const char *val = hdr + 11;
+                while (val < end && (*val == ' ' || *val == '\t'))
+                    val++;
+                const char *val_end = val;
+                while (val_end < end && *val_end != '\r' && *val_end != '\n')
+                    val_end++;
+                size_t ua_len = (size_t)(val_end - val);
+                if (ua_len >= sizeof(info->user_agent))
+                    ua_len = sizeof(info->user_agent) - 1;
+                strncpy(info->user_agent, val, ua_len);
+                info->user_agent[ua_len] = '\0';
             } else if (remaining >= 8 && strncasecmp(hdr, "Upgrade:", 8) == 0) {
                 const char *val = hdr + 8;
                 while (val < end && (*val == ' ' || *val == '\t'))
                     val++;
                 if ((size_t)(end - val) >= 9 && strncasecmp(val, "websocket", 9) == 0)
                     info->websocket = 1;
+            } else if (remaining >= 12 && strncasecmp(hdr, "grpc-status:", 12) == 0) {
+                const char *val = hdr + 12;
+                while (val < end && (*val == ' ' || *val == '\t'))
+                    val++;
+                if (val < end && *val >= '0' && *val <= '9') {
+                    int code = *val - '0';
+                    if (val + 1 < end && *(val + 1) >= '0' && *(val + 1) <= '9')
+                        code = code * 10 + (*(val + 1) - '0');
+                    info->grpc_status = code;
+                }
             }
         }
         p++;
@@ -494,6 +637,92 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         char iso_time[64];
         struct tm *tm = gmtime(&ts.tv_sec);
         strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", tm);
+
+        /* Handle TCP connect error events */
+        if (event->event_type == EVENT_CONNECT_ERROR) {
+            const char *err_desc = "unknown";
+            int ecode = (int)event->error_code;
+            switch (ecode) {
+            case 111: err_desc = "connection_refused"; break;
+            case 110: err_desc = "connection_timed_out"; break;
+            case 113: err_desc = "no_route_to_host"; break;
+            case 101: err_desc = "network_unreachable"; break;
+            case 112: err_desc = "host_down"; break;
+            case 99:  err_desc = "address_not_available"; break;
+            case 98:  err_desc = "address_already_in_use"; break;
+            case 106: err_desc = "already_connected"; break;
+            case 114: err_desc = "already_in_progress"; break;
+            case 115: err_desc = "in_progress"; break;
+            default: break;
+            }
+
+            printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+                   "\"pid\":%u,\"tid\":%u,"
+                   "\"comm\":\"%.*s\",\"event_type\":\"tcp_error\","
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"error_code\":%d,\"error\":\"%s\"}\n",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid,
+                   MAX_COMM_LEN, event->comm,
+                   remote_ip, event->remote_port,
+                   ecode, err_desc);
+            fflush(stdout);
+            return;
+        }
+
+        /* Handle TLS error events */
+        if (event->event_type == EVENT_TLS_ERROR) {
+            const char *tls_ver_str = NULL;
+            switch (event->tls_version) {
+            case 0x0301: tls_ver_str = "1.0"; break;
+            case 0x0302: tls_ver_str = "1.1"; break;
+            case 0x0303: tls_ver_str = "1.2"; break;
+            case 0x0304: tls_ver_str = "1.3"; break;
+            default: break;
+            }
+
+            printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+                   "\"pid\":%u,\"tid\":%u,"
+                   "\"comm\":\"%.*s\",\"event_type\":\"tls_error\","
+                   "\"direction\":\"%s\","
+                   "\"src_ip\":\"%s\",\"src_port\":%u,"
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"ssl_return_code\":%d",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid,
+                   MAX_COMM_LEN, event->comm,
+                   direction_str(event->direction),
+                   local_ip, event->local_port,
+                   remote_ip, event->remote_port,
+                   (int)event->error_code);
+
+            if (tls_ver_str)
+                printf(",\"tls_version\":\"%s\"", tls_ver_str);
+
+            printf("}\n");
+            fflush(stdout);
+            return;
+        }
+
+        /* Handle QUIC detection events */
+        if (event->event_type == EVENT_QUIC_DETECTED) {
+            printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+                   "\"pid\":%u,\"tid\":%u,"
+                   "\"comm\":\"%.*s\",\"event_type\":\"quic_detected\","
+                   "\"src_ip\":\"%s\",\"src_port\":%u,"
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"transport\":\"udp\",\"protocol\":\"quic\"}\n",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid,
+                   MAX_COMM_LEN, event->comm,
+                   local_ip, event->local_port,
+                   remote_ip, event->remote_port);
+            fflush(stdout);
+            return;
+        }
 
         /* K8s metadata enrichment */
         struct k8s_meta meta;
@@ -645,7 +874,13 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
              data_len >= 6 && strstr(event->data, "LOGIN") != NULL)))
             l7_proto = "imaps";
 
-        /* 8. Fall back to well-known TLS port numbers (RFC/IANA assignments) */
+        /* 8. Detect Kafka wire protocol (binary header structure) */
+        int kafka_api_key = -1;
+        if (strcmp(l7_proto, "unknown") == 0 &&
+            detect_kafka_protocol(event->data, data_len, &kafka_api_key))
+            l7_proto = "kafka";
+
+        /* 9. Fall back to well-known TLS port numbers (RFC/IANA assignments) */
         if (strcmp(l7_proto, "unknown") == 0) {
             __u16 port = event->remote_port;
             switch (port) {
@@ -665,6 +900,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             case 9200:
             case 9243: l7_proto = "https";  break;  /* Elasticsearch */
             case 27017: l7_proto = "mongodb+srv"; break; /* MongoDB TLS */
+            /* Kafka TLS ports (Confluent Cloud / self-hosted) */
+            case 9092:
+            case 9093:
+            case 9094: l7_proto = "kafka";  break;
             /* gRPC default ports (no IANA assignment, de facto standard) */
             case 50051:
             case 50052:
@@ -686,6 +925,16 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         if (tls_ver_str)
             printf(",\"tls_version\":\"%s\"", tls_ver_str);
 
+        /* TLS cipher suite name (from SSL_get_current_cipher uprobe) */
+        if (event->cipher[0]) {
+            printf(",\"tls_cipher\":");
+            /* Ensure null-terminated for safety */
+            char cipher_safe[MAX_CIPHER_LEN + 1];
+            memcpy(cipher_safe, event->cipher, MAX_CIPHER_LEN);
+            cipher_safe[MAX_CIPHER_LEN] = '\0';
+            print_json_string(cipher_safe);
+        }
+
         printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
 
         /* HTTP version: from request line or inferred from HTTP/2 detection */
@@ -703,6 +952,80 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             if (http.host[0]) {
                 printf(",\"http_host\":");
                 print_json_string(http.host);
+            }
+        }
+
+        /* User-Agent header */
+        if (http.user_agent[0]) {
+            printf(",\"user_agent\":");
+            print_json_string(http.user_agent);
+        }
+
+        /* gRPC status code from grpc-status header (0-16) */
+        if (http.grpc_status >= 0) {
+            const char *grpc_desc = "unknown";
+            switch (http.grpc_status) {
+            case 0:  grpc_desc = "OK"; break;
+            case 1:  grpc_desc = "CANCELLED"; break;
+            case 2:  grpc_desc = "UNKNOWN"; break;
+            case 3:  grpc_desc = "INVALID_ARGUMENT"; break;
+            case 4:  grpc_desc = "DEADLINE_EXCEEDED"; break;
+            case 5:  grpc_desc = "NOT_FOUND"; break;
+            case 6:  grpc_desc = "ALREADY_EXISTS"; break;
+            case 7:  grpc_desc = "PERMISSION_DENIED"; break;
+            case 8:  grpc_desc = "RESOURCE_EXHAUSTED"; break;
+            case 9:  grpc_desc = "FAILED_PRECONDITION"; break;
+            case 10: grpc_desc = "ABORTED"; break;
+            case 11: grpc_desc = "OUT_OF_RANGE"; break;
+            case 12: grpc_desc = "UNIMPLEMENTED"; break;
+            case 13: grpc_desc = "INTERNAL"; break;
+            case 14: grpc_desc = "UNAVAILABLE"; break;
+            case 15: grpc_desc = "DATA_LOSS"; break;
+            case 16: grpc_desc = "UNAUTHENTICATED"; break;
+            default: break;
+            }
+            printf(",\"grpc_status\":%d,\"grpc_status_name\":\"%s\"",
+                   http.grpc_status, grpc_desc);
+        }
+
+        /* Kafka API key detection */
+        if (kafka_api_key >= 0) {
+            const char *api_name = kafka_api_key_name(kafka_api_key);
+            printf(",\"kafka_api_key\":%d", kafka_api_key);
+            if (api_name)
+                printf(",\"kafka_api_name\":\"%s\"", api_name);
+        }
+
+        /* WebSocket close code detection */
+        if (strcmp(l7_proto, "wss") == 0 || strcmp(l7_proto, "unknown") == 0) {
+            int ws_close = parse_websocket_close_code(event->data, data_len);
+            if (ws_close >= 0) {
+                const char *ws_desc = "unknown";
+                switch (ws_close) {
+                case 1000: ws_desc = "NORMAL_CLOSURE"; break;
+                case 1001: ws_desc = "GOING_AWAY"; break;
+                case 1002: ws_desc = "PROTOCOL_ERROR"; break;
+                case 1003: ws_desc = "UNSUPPORTED_DATA"; break;
+                case 1005: ws_desc = "NO_STATUS_RECEIVED"; break;
+                case 1006: ws_desc = "ABNORMAL_CLOSURE"; break;
+                case 1007: ws_desc = "INVALID_FRAME_PAYLOAD_DATA"; break;
+                case 1008: ws_desc = "POLICY_VIOLATION"; break;
+                case 1009: ws_desc = "MESSAGE_TOO_BIG"; break;
+                case 1010: ws_desc = "MANDATORY_EXTENSION"; break;
+                case 1011: ws_desc = "INTERNAL_ERROR"; break;
+                case 1012: ws_desc = "SERVICE_RESTART"; break;
+                case 1013: ws_desc = "TRY_AGAIN_LATER"; break;
+                case 1014: ws_desc = "BAD_GATEWAY"; break;
+                case 1015: ws_desc = "TLS_HANDSHAKE"; break;
+                default:
+                    if (ws_close >= 3000 && ws_close <= 3999)
+                        ws_desc = "REGISTERED";
+                    else if (ws_close >= 4000 && ws_close <= 4999)
+                        ws_desc = "PRIVATE";
+                    break;
+                }
+                printf(",\"ws_close_code\":%d,\"ws_close_reason\":\"%s\"",
+                       ws_close, ws_desc);
             }
         }
 
@@ -918,9 +1241,10 @@ int main(int argc, char **argv)
         "probe_connect_enter",
         "probe_connect_return",
         "probe_tcp_set_state",
+        "probe_udp_sendmsg",
     };
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         prog = bpf_object__find_program_by_name(obj, kprobe_names[i]);
         if (!prog) {
             if (cfg.verbose)
@@ -950,8 +1274,10 @@ int main(int argc, char **argv)
         "probe_ssl_write_return",
         "probe_ssl_version_enter",
         "probe_ssl_version_return",
+        "probe_ssl_get_cipher_enter",
+        "probe_ssl_get_cipher_return",
     };
-    int is_retprobe[] = {0, 1, 0, 1, 0, 1};
+    int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1};
     const char *func_names[] = {
         "SSL_read",
         "SSL_read",
@@ -959,10 +1285,12 @@ int main(int argc, char **argv)
         "SSL_write",
         "SSL_version",
         "SSL_version",
+        "SSL_get_current_cipher",
+        "SSL_get_current_cipher",
     };
 
     int uprobe_count = 0;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
         if (!prog) {
             fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
@@ -998,7 +1326,7 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 6);
+        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 8);
 
     /* Set up perf buffer */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");

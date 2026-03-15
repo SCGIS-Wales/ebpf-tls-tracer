@@ -76,6 +76,31 @@ struct {
     __type(value, __u16);
 } ssl_version_map SEC(".maps");
 
+/* Cipher name storage: SSL pointer → cipher name string.
+ * Populated by SSL_get_current_cipher uprobe (reads SSL_CIPHER->name). */
+struct cipher_name_t {
+    char name[64];  /* MAX_CIPHER_LEN */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);  /* SSL pointer cast to u64 */
+    __type(value, struct cipher_name_t);
+} cipher_name_map SEC(".maps");
+
+/* Temp map for SSL_get_current_cipher args (SSL * → pid_tgid correlation) */
+struct ssl_cipher_args_t {
+    void *ssl;  /* SSL * (first arg to SSL_get_current_cipher) */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct ssl_cipher_args_t);
+} ssl_cipher_args_map SEC(".maps");
+
 /* Connection info map: keyed by pid_tgid, stores remote addr/port.
  * Populated by connect/accept kprobes, read by SSL uprobes. */
 struct {
@@ -131,11 +156,13 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     event->tls_version = 0;
     event->direction = 0;
     event->event_type = 0;
+    event->error_code = 0;
     event->addr_family = 0;
     event->local_port = 0;
     event->remote_port = 0;
     event->remote_addr_v4 = 0;
     event->local_addr_v4 = 0;
+    event->cipher[0] = '\0';
     return event;
 }
 
@@ -219,8 +246,43 @@ int probe_connect_return(struct pt_regs *ctx)
 
     ret = (int)PT_REGS_RC(ctx);
     /* connect returns 0 on success, or -EINPROGRESS for non-blocking */
-    if (ret != 0 && ret != -115)  /* -EINPROGRESS = -115 */
+    if (ret != 0 && ret != -115) {  /* -EINPROGRESS = -115 */
+        /* Emit a TCP connection error event */
+        struct tls_event_t *event = get_event_buf();
+        if (event) {
+            event->timestamp_ns = bpf_ktime_get_ns();
+            event->pid = id >> 32;
+            event->tid = (__u32)id;
+            event->uid = bpf_get_current_uid_gid();
+            event->direction = DIRECTION_WRITE;
+            event->event_type = EVENT_CONNECT_ERROR;
+            event->error_code = (__s16)(-ret);  /* Store positive errno */
+            event->data_len = 0;
+            bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+            /* Try to get destination address from connect args */
+            __u16 sa_family = 0;
+            bpf_probe_read_user(&sa_family, sizeof(sa_family),
+                                &args->addr->sa_family);
+            if (sa_family == AF_INET) {
+                struct sockaddr_in sin = {};
+                bpf_probe_read_user(&sin, sizeof(sin), args->addr);
+                event->addr_family = ADDR_FAMILY_IPV4;
+                event->remote_addr_v4 = sin.sin_addr.s_addr;
+                event->remote_port = bpf_ntohs(sin.sin_port);
+            } else if (sa_family == AF_INET6) {
+                struct sockaddr_in6 sin6 = {};
+                bpf_probe_read_user(&sin6, sizeof(sin6), args->addr);
+                event->addr_family = ADDR_FAMILY_IPV6;
+                __builtin_memcpy(event->remote_addr_v6, &sin6.sin6_addr, 16);
+                event->remote_port = bpf_ntohs(sin6.sin6_port);
+            }
+
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
+                                  event, sizeof(*event));
+        }
         goto cleanup;
+    }
 
     struct conn_info_t ci = {};
     __u16 sa_family = 0;
@@ -304,6 +366,66 @@ int probe_tcp_set_state(struct pt_regs *ctx)
     return 0;
 }
 
+/* --- QUIC detection: detect UDP traffic to port 443 with QUIC Initial header ---
+ * QUIC Initial packets have:
+ *   Byte 0: Header Form (bit 7) = 1 (Long Header), Fixed Bit (bit 6) = 1,
+ *           Packet Type (bits 5-4) = 00 (Initial) → byte & 0xF0 == 0xC0
+ *   Bytes 1-4: QUIC Version (big-endian)
+ * We probe udp_sendmsg to detect outbound QUIC. */
+
+SEC("kprobe/udp_sendmsg")
+int probe_udp_sendmsg(struct pt_regs *ctx)
+{
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    if (!sk)
+        return 0;
+
+    /* Check destination port - QUIC uses 443 or 8443 */
+    __u16 dport = 0;
+    bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+    dport = bpf_ntohs(dport);
+    if (dport != 443 && dport != 8443)
+        return 0;
+
+    /* Read address family - only handle IPv4 for now */
+    short family = 0;
+    bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+    if (family != AF_INET)
+        return 0;
+
+    /* Emit a QUIC detection event */
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        return 0;
+
+    __u64 id = bpf_get_current_pid_tgid();
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->direction = DIRECTION_WRITE;
+    event->event_type = EVENT_QUIC_DETECTED;
+    event->data_len = 0;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    __u32 daddr = 0;
+    bpf_probe_read_kernel(&daddr, sizeof(daddr), &sk->__sk_common.skc_daddr);
+    event->addr_family = ADDR_FAMILY_IPV4;
+    event->remote_addr_v4 = daddr;
+    event->remote_port = dport;
+
+    __u32 saddr = 0;
+    __u16 sport = 0;
+    bpf_probe_read_kernel(&saddr, sizeof(saddr), &sk->__sk_common.skc_rcv_saddr);
+    bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+    event->local_addr_v4 = saddr;
+    event->local_port = sport;
+
+    bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
+    return 0;
+}
+
 /* --- Helper: look up TLS version for an SSL pointer --- */
 
 static __always_inline __u16 get_tls_version(void *ssl)
@@ -312,6 +434,68 @@ static __always_inline __u16 get_tls_version(void *ssl)
     __u16 *ver = bpf_map_lookup_elem(&ssl_version_map, &key);
     if (ver)
         return *ver;
+    return 0;
+}
+
+/* --- Helper: look up cipher name for an SSL pointer --- */
+
+static __always_inline void enrich_event_with_cipher(struct tls_event_t *event, void *ssl)
+{
+    __u64 key = (__u64)(unsigned long)ssl;
+    struct cipher_name_t *cn = bpf_map_lookup_elem(&cipher_name_map, &key);
+    if (cn)
+        __builtin_memcpy(event->cipher, cn->name, 64);
+}
+
+/* --- SSL_get_current_cipher probes: capture negotiated cipher suite ---
+ * const SSL_CIPHER *SSL_get_current_cipher(const SSL *ssl)
+ * Returns a pointer to the SSL_CIPHER struct. We read the cipher name
+ * from SSL_CIPHER->name (offset 8 on 64-bit, after uint32_t valid + padding). */
+
+SEC("uprobe/SSL_get_current_cipher")
+int probe_ssl_get_cipher_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cipher_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&ssl_cipher_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/SSL_get_current_cipher")
+int probe_ssl_get_cipher_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cipher_args_t *args;
+
+    args = bpf_map_lookup_elem(&ssl_cipher_args_map, &id);
+    if (!args)
+        return 0;
+
+    void *ssl_cipher = (void *)PT_REGS_RC(ctx);
+    if (!ssl_cipher)
+        goto cleanup_cipher;
+
+    /* Read the cipher name pointer from SSL_CIPHER struct.
+     * In OpenSSL 3.x, SSL_CIPHER layout:
+     *   offset 0: uint32_t valid (4 bytes)
+     *   offset 4: 4 bytes padding (on 64-bit)
+     *   offset 8: const char *name (8 bytes pointer)
+     */
+    const char *name_ptr = NULL;
+    if (bpf_probe_read_user(&name_ptr, sizeof(name_ptr),
+                            (void *)ssl_cipher + 8) != 0 || !name_ptr)
+        goto cleanup_cipher;
+
+    struct cipher_name_t cn = {};
+    if (bpf_probe_read_user(cn.name, sizeof(cn.name) - 1, name_ptr) == 0) {
+        cn.name[63] = '\0';
+        __u64 ssl_key = (__u64)(unsigned long)args->ssl;
+        bpf_map_update_elem(&cipher_name_map, &ssl_key, &cn, BPF_ANY);
+    }
+
+cleanup_cipher:
+    bpf_map_delete_elem(&ssl_cipher_args_map, &id);
     return 0;
 }
 
@@ -378,8 +562,29 @@ int probe_ssl_read_return(struct pt_regs *ctx)
         return 0;
 
     ret = (int)PT_REGS_RC(ctx);
-    if (ret <= 0)
+    if (ret <= 0) {
+        /* SSL_read error: ret 0 = connection closed, ret < 0 = error.
+         * Emit a TLS error event so userspace can log the failure. */
+        if (ret < 0) {
+            struct tls_event_t *err_event = get_event_buf();
+            if (err_event) {
+                err_event->timestamp_ns = bpf_ktime_get_ns();
+                err_event->pid = id >> 32;
+                err_event->tid = (__u32)id;
+                err_event->uid = bpf_get_current_uid_gid();
+                err_event->direction = DIRECTION_READ;
+                err_event->event_type = EVENT_TLS_ERROR;
+                err_event->error_code = (__s16)ret;
+                err_event->tls_version = get_tls_version(args->ssl);
+                err_event->data_len = 0;
+                bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
+                enrich_event_with_conn_info(err_event, id);
+                bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
+                                      err_event, sizeof(*err_event));
+            }
+        }
         goto cleanup;
+    }
 
     struct tls_event_t *event = get_event_buf();
     if (!event)
@@ -395,6 +600,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     enrich_event_with_conn_info(event, id);
+    enrich_event_with_cipher(event, args->ssl);
 
     __u32 read_len = ret;
     if (read_len > MAX_DATA_LEN)
@@ -437,8 +643,28 @@ int probe_ssl_write_return(struct pt_regs *ctx)
         return 0;
 
     ret = (int)PT_REGS_RC(ctx);
-    if (ret <= 0)
+    if (ret <= 0) {
+        /* SSL_write error: emit TLS error event */
+        if (ret < 0) {
+            struct tls_event_t *err_event = get_event_buf();
+            if (err_event) {
+                err_event->timestamp_ns = bpf_ktime_get_ns();
+                err_event->pid = id >> 32;
+                err_event->tid = (__u32)id;
+                err_event->uid = bpf_get_current_uid_gid();
+                err_event->direction = DIRECTION_WRITE;
+                err_event->event_type = EVENT_TLS_ERROR;
+                err_event->error_code = (__s16)ret;
+                err_event->tls_version = get_tls_version(args->ssl);
+                err_event->data_len = 0;
+                bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
+                enrich_event_with_conn_info(err_event, id);
+                bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
+                                      err_event, sizeof(*err_event));
+            }
+        }
         goto cleanup;
+    }
 
     struct tls_event_t *event = get_event_buf();
     if (!event)
@@ -454,6 +680,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     enrich_event_with_conn_info(event, id);
+    enrich_event_with_cipher(event, args->ssl);
 
     __u32 write_len = ret;
     if (write_len > MAX_DATA_LEN)
