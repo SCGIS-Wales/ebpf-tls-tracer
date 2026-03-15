@@ -54,6 +54,11 @@ jobs:
       - name: Smoke test (help output)
         run: ./bin/tls_tracer --help
 
+      - name: Run Python shipper tests
+        run: |
+          pip install boto3 --quiet
+          python3 -m unittest tests.test_s3_shipper tests.test_kinesis_shipper -v
+
       - name: Package release artifacts
         run: |
           mkdir -p release
@@ -201,7 +206,9 @@ jobs:
           kubectl create namespace apigee
           kubectl label namespace apigee pod-security.kubernetes.io/enforce=privileged
 
-          # Deploy a test pod in apigee namespace that makes outbound HTTPS requests
+          # Deploy a test pod using debian (shares system libssl with node)
+          # This is critical: eBPF uprobes attach per-inode, so the test pod
+          # must use the same libssl.so as the node for events to be captured
           kubectl apply -f - <<WORKLOAD
           apiVersion: v1
           kind: Pod
@@ -213,7 +220,7 @@ jobs:
           spec:
             containers:
               - name: client
-                image: curlimages/curl:latest
+                image: debian:trixie-slim
                 command: ["sleep", "3600"]
                 env:
                   - name: POD_NAME
@@ -227,7 +234,11 @@ jobs:
           WORKLOAD
 
           kubectl wait --for=condition=ready pod/apigee-test-client -n apigee --timeout=120s
-          echo "apigee test workload is ready"
+
+          # Install curl inside the debian pod (uses system libssl.so.3)
+          kubectl exec -n apigee apigee-test-client -- \
+            sh -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1"
+          echo "apigee test workload is ready (debian with system libssl)"
 
       - name: Deploy tls-tracer DaemonSet
         run: |
@@ -252,10 +263,13 @@ jobs:
       - name: Generate TLS traffic from apigee namespace
         run: |
           # Make outbound HTTPS requests from the apigee test pod
+          # The pod uses debian's system libssl.so.3 which matches what
+          # the tracer hooks via uprobes on the node
           for i in 1 2 3; do
             kubectl exec -n apigee apigee-test-client -- \
               curl -s -o /dev/null -w "Request ${i}: HTTP %{http_code}\n" \
               https://httpbin.org/get 2>/dev/null || echo "Request ${i}: connection failed (expected in CI)"
+            sleep 1
           done
 
           # Also try a POST request
@@ -263,8 +277,15 @@ jobs:
             curl -s -o /dev/null -w "POST request: HTTP %{http_code}\n" \
             -X POST -d '{"test":"data"}' https://httpbin.org/post 2>/dev/null || echo "POST: connection failed (expected in CI)"
 
+          # Also generate traffic directly on the kind node (guaranteed to use node's libssl)
+          echo "Generating traffic from kind node directly..."
+          docker exec tls-tracer-ci-control-plane \
+            sh -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1 && \
+                   curl -s -o /dev/null https://httpbin.org/get && echo 'Node curl: OK' || echo 'Node curl: failed'" \
+            2>/dev/null || echo "Node traffic generation failed (non-critical)"
+
           # Give tracer time to capture events
-          sleep 5
+          sleep 10
 
       - name: Validate tls-tracer JSON logs
         run: |
@@ -294,24 +315,25 @@ jobs:
             ERRORS=$((ERRORS + 1))
           fi
 
-          # Check for JSON output (if tracer captured any events)
-          JSON_LINES=$(echo "${LOGS}" | grep '^{' | head -5 || true)
+          # Check for JSON output
+          JSON_LINES=$(echo "${LOGS}" | grep '^{' | head -10 || true)
           if [ -n "${JSON_LINES}" ]; then
             echo ""
             echo "=== Captured JSON events ==="
-            echo "${JSON_LINES}" | head -5
+            echo "${JSON_LINES}"
 
             # Validate JSON structure
-            echo "${JSON_LINES}" | head -1 | python3 -m json.tool > /dev/null 2>&1
+            FIRST_LINE=$(echo "${JSON_LINES}" | head -1)
+            echo "${FIRST_LINE}" | python3 -m json.tool > /dev/null 2>&1
             if [ $? -eq 0 ]; then
               echo "JSON output is valid"
             else
-              echo "WARNING: JSON output is not valid JSON"
+              echo "ERROR: JSON output is not valid JSON"
+              ERRORS=$((ERRORS + 1))
             fi
 
             # Check for expected fields
-            FIRST_LINE=$(echo "${JSON_LINES}" | head -1)
-            for field in timestamp pid comm direction dst_ip dst_port data_len; do
+            for field in timestamp pid comm direction dst_ip dst_port data_len transport protocol; do
               if echo "${FIRST_LINE}" | grep -q "\"${field}\""; then
                 echo "Field '${field}' present in JSON"
               else
@@ -320,8 +342,9 @@ jobs:
             done
           else
             echo ""
-            echo "NOTE: No JSON events captured (outbound HTTPS may not work in CI kind cluster)"
-            echo "This is expected - the test validates that the tracer deploys and runs correctly"
+            echo "WARNING: No JSON events captured"
+            echo "This can happen in CI if the kind node's libssl path differs."
+            echo "The test still validates that the tracer deploys and runs correctly."
           fi
 
           echo ""

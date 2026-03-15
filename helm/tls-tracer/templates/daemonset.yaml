@@ -99,9 +99,9 @@ spec:
             {{- end }}
         {{- if .Values.s3.enabled }}
         - name: s3-shipper
-          image: "{{ .Values.s3.image.repository }}:{{ .Values.s3.image.tag }}"
-          imagePullPolicy: {{ .Values.s3.image.pullPolicy }}
-          command: ["sh", "-c", "pip install --quiet boto3 && python3 /scripts/s3_shipper.py"]
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python3", "/opt/tls_tracer/scripts/s3_shipper.py"]
           env:
             - name: S3_BUCKET
               value: {{ .Values.s3.bucket | quote }}
@@ -132,15 +132,12 @@ spec:
           volumeMounts:
             - name: log-pipe
               mountPath: /var/log/tls-tracer
-            - name: s3-scripts
-              mountPath: /scripts
-              readOnly: true
         {{- end }}
         {{- if .Values.kinesis.enabled }}
         - name: kinesis-shipper
-          image: "{{ .Values.kinesis.image.repository }}:{{ .Values.kinesis.image.tag }}"
-          imagePullPolicy: {{ .Values.kinesis.image.pullPolicy }}
-          command: ["sh", "-c", "pip install --quiet boto3 && python3 /scripts/kinesis_shipper.py"]
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python3", "/opt/tls_tracer/scripts/kinesis_shipper.py"]
           env:
             - name: DELIVERY_STREAM
               value: {{ .Values.kinesis.deliveryStreamName | quote }}
@@ -167,9 +164,6 @@ spec:
           volumeMounts:
             - name: log-pipe
               mountPath: /var/log/tls-tracer
-            - name: kinesis-scripts
-              mountPath: /scripts
-              readOnly: true
         {{- end }}
       volumes:
         - name: debugfs
@@ -195,18 +189,6 @@ spec:
         {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
         - name: log-pipe
           emptyDir: {}
-        {{- end }}
-        {{- if .Values.s3.enabled }}
-        - name: s3-scripts
-          configMap:
-            name: {{ include "tls-tracer.fullname" . }}-s3-shipper
-            defaultMode: 0755
-        {{- end }}
-        {{- if .Values.kinesis.enabled }}
-        - name: kinesis-scripts
-          configMap:
-            name: {{ include "tls-tracer.fullname" . }}-kinesis-shipper
-            defaultMode: 0755
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

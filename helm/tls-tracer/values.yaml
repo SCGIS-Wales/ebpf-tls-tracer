@@ -85,11 +85,6 @@ s3:
   flushIntervalSeconds: 60
   # Maximum batch size (lines) before flush
   batchSize: 1000
-  # S3 sidecar image
-  image:
-    repository: python
-    tag: "3.12-slim"
-    pullPolicy: IfNotPresent
   # Resources for S3 sidecar
   resources:
     limits:
@@ -113,11 +108,6 @@ kinesis:
   batchSize: 500
   # Flush interval in seconds
   flushIntervalSeconds: 30
-  # Kinesis sidecar image
-  image:
-    repository: python
-    tag: "3.12-slim"
-    pullPolicy: IfNotPresent
   # Resources for Kinesis sidecar
   resources:
     limits:
