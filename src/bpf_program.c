@@ -113,6 +113,7 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     event->local_port = 0;
     event->remote_port = 0;
     event->remote_addr_v4 = 0;
+    event->local_addr_v4 = 0;
     return event;
 }
 
@@ -130,8 +131,10 @@ static __always_inline void enrich_event_with_conn_info(struct tls_event_t *even
 
     if (ci->addr_family == ADDR_FAMILY_IPV4) {
         event->remote_addr_v4 = ci->remote_addr_v4;
+        event->local_addr_v4 = ci->local_addr_v4;
     } else if (ci->addr_family == ADDR_FAMILY_IPV6) {
         __builtin_memcpy(event->remote_addr_v6, ci->remote_addr_v6, 16);
+        __builtin_memcpy(event->local_addr_v6, ci->local_addr_v6, 16);
     }
 }
 

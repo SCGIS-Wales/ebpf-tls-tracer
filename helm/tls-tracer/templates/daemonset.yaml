@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tls-tracer.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "tls-tracer.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tls-tracer.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "tls-tracer.serviceAccountName" . }}
+      hostPID: true
+      hostNetwork: true
+      containers:
+        - name: tls-tracer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "-f"
+            - "{{ .Values.outputFormat }}"
+            {{- if .Values.verbose }}
+            - "-v"
+            {{- end }}
+            {{- if .Values.filterPid }}
+            - "-p"
+            - "{{ .Values.filterPid }}"
+            {{- end }}
+            {{- if .Values.filterUid }}
+            - "-u"
+            - "{{ .Values.filterUid }}"
+            {{- end }}
+            {{- if .Values.sslLibPath }}
+            - "-l"
+            - "{{ .Values.sslLibPath }}"
+            {{- end }}
+          securityContext:
+            privileged: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: host-ssl
+              mountPath: /usr/lib64
+              readOnly: true
+            - name: host-ssl-x86
+              mountPath: /usr/lib/x86_64-linux-gnu
+              readOnly: true
+      volumes:
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: DirectoryOrCreate
+        - name: tracefs
+          hostPath:
+            path: /sys/kernel/tracing
+            type: DirectoryOrCreate
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: host-ssl
+          hostPath:
+            path: /usr/lib64
+            type: DirectoryOrCreate
+        - name: host-ssl-x86
+          hostPath:
+            path: /usr/lib/x86_64-linux-gnu
+            type: DirectoryOrCreate
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

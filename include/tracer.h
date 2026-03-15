@@ -73,6 +73,10 @@ struct tls_event_t {
         __u32 remote_addr_v4;
         __u8  remote_addr_v6[16];
     };
+    union {
+        __u32 local_addr_v4;
+        __u8  local_addr_v6[16];
+    };
     char  comm[MAX_COMM_LEN];
     char  data[MAX_DATA_LEN];
 };
