@@ -6,6 +6,10 @@ metadata:
   labels:
     {{- include "tls-tracer.labels" . | nindent 4 }}
 spec:
+  # R4 fix: explicit updateStrategy. OnDelete gives operators control over
+  # when each node's eBPF probes are recycled (important for production).
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       {{- include "tls-tracer.selectorLabels" . | nindent 6 }}
@@ -21,6 +25,9 @@ spec:
       serviceAccountName: {{ include "tls-tracer.serviceAccountName" . }}
       hostPID: true
       hostNetwork: true
+      # A6 fix: with hostNetwork: true, DNS defaults to node's resolv.conf.
+      # ClusterFirstWithHostNet allows resolving both cluster DNS and host DNS.
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: tls-tracer
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -28,7 +35,11 @@ spec:
           {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
           command: ["sh", "-c"]
           args:
+            # R3/R7 fix: use tee -a (append) and trap SIGPIPE to prevent
+            # silent termination if the log pipe breaks. Also ignore SIGPIPE
+            # so the tracer continues even if tee dies.
             - >-
+              trap '' PIPE;
               set -o pipefail;
               ./tls_tracer -f {{ .Values.outputFormat }}
               {{- if .Values.verbose }} -v{{- end }}
@@ -36,7 +47,7 @@ spec:
               {{- if .Values.filterUid }} -u {{ .Values.filterUid }}{{- end }}
               {{- if .Values.sslLibPath }} -l {{ .Values.sslLibPath }}{{- end }}
               {{- range .Values.sanitizePatterns }} -s '{{ . }}'{{- end }}
-              | tee /var/log/tls-tracer/events.json
+              | tee -a /var/log/tls-tracer/events.json
           {{- else }}
           args:
             - "-f"
@@ -62,6 +73,11 @@ spec:
             {{- end }}
           {{- end }}
           securityContext:
+            # S6 fix: privileged: true is REQUIRED for eBPF program loading (bpf() syscall),
+            # uprobe/kprobe attachment, and accessing /sys/kernel/debug.
+            # There is no way to run eBPF tracing with reduced capabilities.
+            # readOnlyRootFilesystem prevents runtime modification of the container.
+            # runAsNonRoot cannot be set because eBPF requires root (CAP_BPF+CAP_PERFMON+CAP_SYS_ADMIN).
             privileged: true
             readOnlyRootFilesystem: true
           readinessProbe:
@@ -73,11 +89,19 @@ spec:
             failureThreshold: 3
           livenessProbe:
             exec:
-              command: ["test", "-f", "/var/run/tls-tracer/healthy"]
-            initialDelaySeconds: 10
+              # R5 fix: check health file modification time is within 30s.
+              # The tracer updates the health file every ~10s. If the file
+              # exists but is stale (>30s old), the event loop may be hung.
+              command:
+                - sh
+                - -c
+                - >-
+                  test -f /var/run/tls-tracer/healthy &&
+                  [ "$(( $(date +%s) - $(stat -c %Y /var/run/tls-tracer/healthy) ))" -lt 30 ]
+            initialDelaySeconds: 15
             periodSeconds: 15
-            timeoutSeconds: 3
-            failureThreshold: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -154,7 +178,8 @@ spec:
             - name: DELIVERY_STREAM
               value: {{ .Values.kinesis.deliveryStreamName | quote }}
             - name: AWS_REGION
-              value: {{ default .Values.metadata.awsRegion (default "" .Values.kinesis.region) | quote }}
+              # C6 fix: prefer kinesis.region, fall back to metadata.awsRegion
+              value: {{ .Values.kinesis.region | default .Values.metadata.awsRegion | quote }}
             - name: FLUSH_INTERVAL
               value: {{ .Values.kinesis.flushIntervalSeconds | quote }}
             - name: BATCH_SIZE
@@ -203,9 +228,11 @@ spec:
             path: /usr/lib/x86_64-linux-gnu
             type: DirectoryOrCreate
         {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
+        # R9 fix: reduced sizeLimit and log rotation handled by shippers.
+        # The shipper tracks offsets and truncates after successful upload.
         - name: log-pipe
           emptyDir:
-            sizeLimit: 512Mi
+            sizeLimit: 256Mi
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

@@ -20,8 +20,9 @@ class TestKinesisShipperTailFile(unittest.TestCase):
         self.log_file = os.path.join(self.tmpdir, "events.json")
 
     def tearDown(self):
-        if os.path.exists(self.log_file):
-            os.unlink(self.log_file)
+        for f in [self.log_file, self.log_file + ".new"]:
+            if os.path.exists(f):
+                os.unlink(f)
         os.rmdir(self.tmpdir)
 
     def test_tail_new_lines(self):
@@ -32,9 +33,10 @@ class TestKinesisShipperTailFile(unittest.TestCase):
             f.write('{"event":"first"}\n')
             f.write('{"event":"second"}\n')
 
-        lines, offset = kinesis_shipper.tail_file(self.log_file, 0)
+        lines, offset, inode = kinesis_shipper.tail_file(self.log_file, 0, None)
         self.assertEqual(len(lines), 2)
         self.assertGreater(offset, 0)
+        self.assertIsNotNone(inode)
 
     def test_tail_incremental(self):
         """Should only read lines added after the last offset."""
@@ -43,13 +45,13 @@ class TestKinesisShipperTailFile(unittest.TestCase):
         with open(self.log_file, "w") as f:
             f.write('{"event":"first"}\n')
 
-        lines, offset = kinesis_shipper.tail_file(self.log_file, 0)
+        lines, offset, inode = kinesis_shipper.tail_file(self.log_file, 0, None)
         self.assertEqual(len(lines), 1)
 
         with open(self.log_file, "a") as f:
             f.write('{"event":"second"}\n')
 
-        lines, new_offset = kinesis_shipper.tail_file(self.log_file, offset)
+        lines, new_offset, _ = kinesis_shipper.tail_file(self.log_file, offset, inode)
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0], '{"event":"second"}')
 
@@ -60,12 +62,12 @@ class TestKinesisShipperTailFile(unittest.TestCase):
         with open(self.log_file, "w") as f:
             f.write('{"event":"data"}\n' * 10)
 
-        _, offset = kinesis_shipper.tail_file(self.log_file, 0)
+        _, offset, inode = kinesis_shipper.tail_file(self.log_file, 0, None)
 
         with open(self.log_file, "w") as f:
             f.write('{"event":"rotated"}\n')
 
-        lines, _ = kinesis_shipper.tail_file(self.log_file, offset)
+        lines, _, _ = kinesis_shipper.tail_file(self.log_file, offset, inode)
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0], '{"event":"rotated"}')
 
@@ -73,9 +75,60 @@ class TestKinesisShipperTailFile(unittest.TestCase):
         """Should return empty list and offset 0."""
         import kinesis_shipper
 
-        lines, offset = kinesis_shipper.tail_file("/nonexistent", 0)
+        lines, offset, inode = kinesis_shipper.tail_file("/nonexistent", 0, None)
         self.assertEqual(lines, [])
         self.assertEqual(offset, 0)
+        self.assertIsNone(inode)
+
+    def test_tail_inode_change_detection(self):
+        """R10: should reset offset when inode changes (tee restart)."""
+        import kinesis_shipper
+
+        # Write enough data to get a large offset
+        with open(self.log_file, "w") as f:
+            for i in range(20):
+                f.write(f'{{"event":"line_{i}"}}\n')
+
+        _, offset, inode = kinesis_shipper.tail_file(self.log_file, 0, None)
+        self.assertGreater(offset, 100)
+
+        # Simulate tee restart: write a small new file
+        # Use a different path + rename to guarantee a different inode
+        alt_file = self.log_file + ".new"
+        with open(alt_file, "w") as f:
+            f.write('{"event":"after_restart"}\n')
+        os.unlink(self.log_file)
+        os.rename(alt_file, self.log_file)
+
+        lines, new_offset, new_inode = kinesis_shipper.tail_file(
+            self.log_file, offset, inode
+        )
+        # Either inode changed (reset to 0) or file shrunk (size < offset reset)
+        # In both cases, we should read the full new file content
+        self.assertGreaterEqual(len(lines), 1)
+        self.assertIn('{"event":"after_restart"}', lines)
+
+
+class TestKinesisShipperParseIntEnv(unittest.TestCase):
+    """S8: test _parse_int_env validation."""
+
+    def test_valid_int(self):
+        import kinesis_shipper
+        with patch.dict(os.environ, {"TEST_VAR": "42"}):
+            val = kinesis_shipper._parse_int_env("TEST_VAR", 10)
+            self.assertEqual(val, 42)
+
+    def test_invalid_int_uses_default(self):
+        import kinesis_shipper
+        with patch.dict(os.environ, {"TEST_VAR": "abc"}):
+            val = kinesis_shipper._parse_int_env("TEST_VAR", 10)
+            self.assertEqual(val, 10)
+
+    def test_below_min_clamps(self):
+        import kinesis_shipper
+        with patch.dict(os.environ, {"TEST_VAR": "0"}):
+            val = kinesis_shipper._parse_int_env("TEST_VAR", 10, min_val=1)
+            self.assertEqual(val, 1)
 
 
 class TestKinesisShipperEnrichRecord(unittest.TestCase):

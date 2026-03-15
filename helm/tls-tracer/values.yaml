@@ -15,6 +15,10 @@
 
 # --- 1. Identity & Naming ---
 
+# Create namespace with PSA labels (S7 fix).
+# Set to true when using --create-namespace to ensure privileged pods are allowed.
+createNamespace: false
+
 # Company prefix applied to all resource names and namespace.
 # Example: companyPrefix: "acme-" → resources named "acme-tls-tracer-*"
 companyPrefix: ""
@@ -37,7 +41,7 @@ metadata:
 # --- 2. Image ---
 
 image:
-  repository: ghcr.io/scgis-wales/ebpf_tls_cli
+  repository: ghcr.io/scgis-wales/ebpf-tls-tracer
   # Pin to a specific version in production to avoid non-deterministic deploys
   tag: "0.1.0"
   pullPolicy: IfNotPresent

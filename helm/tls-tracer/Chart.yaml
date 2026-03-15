@@ -11,8 +11,8 @@ keywords:
   - security
   - monitoring
   - observability
-home: https://github.com/SCGIS-Wales/ebpf_tls_cli
+home: https://github.com/SCGIS-Wales/ebpf-tls-tracer
 sources:
-  - https://github.com/SCGIS-Wales/ebpf_tls_cli
+  - https://github.com/SCGIS-Wales/ebpf-tls-tracer
 maintainers:
   - name: SCGIS-Wales

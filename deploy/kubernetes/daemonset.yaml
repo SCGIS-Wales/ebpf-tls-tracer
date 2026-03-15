@@ -6,6 +6,9 @@ metadata:
   labels:
     app: tls-tracer
 spec:
+  # R4 fix: explicit updateStrategy for production control
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       app: tls-tracer
@@ -18,7 +21,7 @@ spec:
       hostNetwork: true
       containers:
         - name: tls-tracer
-          image: ghcr.io/scgis-wales/ebpf_tls_cli:latest
+          image: ghcr.io/scgis-wales/ebpf-tls-tracer:latest
           args: ["-f", "json", "-v"]
           securityContext:
             privileged: true
