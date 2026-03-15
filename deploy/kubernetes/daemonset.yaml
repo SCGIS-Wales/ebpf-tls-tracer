@@ -55,6 +55,9 @@ spec:
             - name: host-ssl-x86
               mountPath: /host/usr/lib/x86_64-linux-gnu
               readOnly: true
+            - name: host-ssl-arm64
+              mountPath: /host/usr/lib/aarch64-linux-gnu
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -94,4 +97,8 @@ spec:
         - name: host-ssl-x86
           hostPath:
             path: /usr/lib/x86_64-linux-gnu
+            type: DirectoryOrCreate
+        - name: host-ssl-arm64
+          hostPath:
+            path: /usr/lib/aarch64-linux-gnu
             type: DirectoryOrCreate
