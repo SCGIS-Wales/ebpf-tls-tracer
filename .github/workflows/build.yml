@@ -231,19 +231,19 @@ jobs:
 
       - name: Deploy tls-tracer DaemonSet
         run: |
-          # Create tls-tracer namespace
-          kubectl create namespace tls-tracer
-          kubectl label namespace tls-tracer pod-security.kubernetes.io/enforce=privileged
-
-          # Deploy tls-tracer using Helm chart
+          # Deploy tls-tracer using Helm chart (--create-namespace handles namespace creation)
           helm install tls-tracer helm/tls-tracer \
             --namespace tls-tracer \
+            --create-namespace \
             --set image.repository=tls_tracer \
             --set image.tag=ci-kind \
             --set image.pullPolicy=Never \
             --set outputFormat=json \
             --set verbose=true \
             --timeout=120s
+
+          # Label namespace for privileged PSA
+          kubectl label namespace tls-tracer pod-security.kubernetes.io/enforce=privileged --overwrite
 
           kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=tls-tracer \
             -n tls-tracer --timeout=120s
