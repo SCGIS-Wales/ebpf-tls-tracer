@@ -60,6 +60,7 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "unknown")
 NODE_NAME = os.environ.get("NODE_NAME", "unknown")
 MAX_RETRIES = 5
 MAX_LINE_LEN = 65536  # Skip lines larger than 64KB to prevent memory exhaustion
+DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024  # R-6 fix: 50MB cap on dead-letter file
 LOG_FILE = "/var/log/tls-tracer/events.json"
 
 running = True
@@ -129,8 +130,17 @@ def flush_batch(s3_client, batch):
     log("ERROR", f"Failed to upload after {MAX_RETRIES} attempts, "
         f"writing {len(batch)} records to dead-letter file")
     # S9 fix: use restrictive permissions (0o600) on dead-letter file
+    # R-6 fix: cap dead-letter file at DEAD_LETTER_MAX_BYTES to prevent pod eviction
     try:
         dlq_path = "/var/log/tls-tracer/dead-letter.json"
+        try:
+            dlq_size = os.path.getsize(dlq_path)
+        except OSError:
+            dlq_size = 0
+        if dlq_size >= DEAD_LETTER_MAX_BYTES:
+            log("WARN", f"Dead-letter file at {dlq_size // (1024*1024)}MB cap, "
+                f"dropping {len(batch)} records to prevent disk exhaustion")
+            return False
         fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as dlq:
             dlq.write(body)

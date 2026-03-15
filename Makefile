@@ -39,6 +39,8 @@ TRACER_BIN := $(BIN_DIR)/tls_tracer
 # Test files
 TEST_SRC   := $(TEST_DIR)/test_tracer.c
 TEST_BIN   := $(BUILD_DIR)/test_tracer
+TEST_HELPERS_SRC := $(TEST_DIR)/test_helpers.c
+TEST_HELPERS_BIN := $(BUILD_DIR)/test_helpers
 
 # Install paths
 PREFIX     ?= /usr/local
@@ -76,9 +78,20 @@ $(TEST_BIN): $(BUILD_DIR)/test_tracer.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	@$(GCC) -o $@ $^
 
-test: $(TEST_BIN)
-	@echo "  TEST    Running unit tests..."
+# Helper function tests (JSON, HTTP, Kafka, sanitize, addr formatting)
+$(BUILD_DIR)/test_helpers.o: $(TEST_HELPERS_SRC) $(INCLUDE_DIR)/tracer.h | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -Wno-unused-function -c $< -o $@
+
+$(TEST_HELPERS_BIN): $(BUILD_DIR)/test_helpers.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	@$(GCC) -o $@ $^
+
+test: $(TEST_BIN) $(TEST_HELPERS_BIN)
+	@echo "  TEST    Running struct/constant tests..."
 	@./$(TEST_BIN)
+	@echo "  TEST    Running helper function tests..."
+	@./$(TEST_HELPERS_BIN)
 
 # Install
 install: all
