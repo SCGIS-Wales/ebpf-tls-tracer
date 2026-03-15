@@ -1593,7 +1593,12 @@ static int find_ssl_library(char *path, size_t path_len)
     };
 
     for (int i = 0; candidates[i]; i++) {
-        if (access(candidates[i], R_OK) == 0) {
+        /* Use open() instead of access() to avoid TOCTOU race (CWE-367).
+         * access() checks permissions, then the file is opened later —
+         * an attacker could swap the file between check and use. */
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
             snprintf(path, path_len, "%s", candidates[i]);
             return 0;
         }
@@ -1848,11 +1853,14 @@ int main(int argc, char **argv)
             return 1;
         }
     } else {
-        if (access(cfg.ssl_lib, R_OK) != 0) {
+        /* Use open() instead of access() to avoid TOCTOU race (CWE-367) */
+        int fd = open(cfg.ssl_lib, O_RDONLY);
+        if (fd < 0) {
             fprintf(stderr, "Error: Cannot access SSL library at '%s': %s\n",
                     cfg.ssl_lib, strerror(errno));
             return 1;
         }
+        close(fd);
     }
 
     if (cfg.verbose)
@@ -1969,14 +1977,22 @@ int main(int argc, char **argv)
     }
     const char *bpf_obj_path = NULL;
     for (int i = 0; bpf_obj_paths[i]; i++) {
-        if (access(bpf_obj_paths[i], R_OK) == 0) {
+        /* Use open() instead of access() to avoid TOCTOU race (CWE-367) */
+        int fd = open(bpf_obj_paths[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
             bpf_obj_path = bpf_obj_paths[i];
             break;
         }
     }
     /* Fallback: check next to the executable (e.g., bin/bpf_program.o) */
-    if (!bpf_obj_path && exe_dir_bpf[0] && access(exe_dir_bpf, R_OK) == 0)
-        bpf_obj_path = exe_dir_bpf;
+    if (!bpf_obj_path && exe_dir_bpf[0]) {
+        int fd = open(exe_dir_bpf, O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            bpf_obj_path = exe_dir_bpf;
+        }
+    }
     if (!bpf_obj_path) {
         fprintf(stderr, "Error: Cannot find bpf_program.o in any search path\n");
         return 1;
@@ -2134,11 +2150,15 @@ int main(int argc, char **argv)
      * pre-created for local dev. Falling back to /tmp would allow a local
      * attacker to create a symlink and trick root into overwriting files. */
     const char *health_file = "/var/run/tls-tracer/healthy";
-    if (access("/var/run/tls-tracer", F_OK) != 0) {
-        if (mkdir("/var/run/tls-tracer", 0755) != 0) {
+    /* Use open(O_DIRECTORY) instead of access(F_OK) to avoid TOCTOU race (CWE-367) */
+    {
+        int dfd = open("/var/run/tls-tracer", O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) {
+            close(dfd);
+        } else if (mkdir("/var/run/tls-tracer", 0755) != 0) {
             fprintf(stderr, "Warning: Cannot create /var/run/tls-tracer: %s "
                     "(health file disabled)\n", strerror(errno));
-            health_file = NULL;  /* disable health file rather than fall back to /tmp */
+            health_file = NULL;
         }
     }
     FILE *hf = health_file ? fopen(health_file, "w") : NULL;

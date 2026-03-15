@@ -58,11 +58,6 @@ static void print_json_string_n(const char *s, size_t maxlen)
     putchar('"');
 }
 
-static void print_json_string(const char *s)
-{
-    print_json_string_n(s, 0);
-}
-
 /* --- HTTP parsing --- */
 struct http_info {
     char method[16];
@@ -90,8 +85,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
             ver_end++;
         size_t ver_len = (size_t)(ver_end - ver_start);
         if (ver_len > 0 && ver_len < sizeof(info->version)) {
-            strncpy(info->version, ver_start, ver_len);
-            info->version[ver_len] = '\0';
+            snprintf(info->version, sizeof(info->version), "%.*s",
+                     (int)ver_len, ver_start);
         }
         if (ver_end < data_end && *ver_end == ' ') {
             const char *status_start = ver_end + 1;
@@ -112,8 +107,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
     for (int i = 0; methods[i]; i++) {
         size_t mlen = strlen(methods[i]);
         if (len >= mlen && strncmp(data, methods[i], mlen) == 0) {
-            strncpy(info->method, methods[i], mlen - 1);
-            info->method[mlen - 1] = '\0';
+            snprintf(info->method, sizeof(info->method), "%.*s",
+                     (int)(mlen - 1), methods[i]);
 
             const char *path_start = data + mlen;
             const char *path_end = path_start;
@@ -124,8 +119,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
             size_t path_len = (size_t)(path_end - path_start);
             if (path_len >= sizeof(info->path))
                 path_len = sizeof(info->path) - 1;
-            strncpy(info->path, path_start, path_len);
-            info->path[path_len] = '\0';
+            snprintf(info->path, sizeof(info->path), "%.*s",
+                     (int)path_len, path_start);
             found = 1;
             break;
         }
@@ -145,8 +140,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
                 ver_end++;
             size_t ver_len = (size_t)(ver_end - http_ver);
             if (ver_len >= sizeof(info->version)) ver_len = sizeof(info->version) - 1;
-            strncpy(info->version, http_ver, ver_len);
-            info->version[ver_len] = '\0';
+            snprintf(info->version, sizeof(info->version), "%.*s",
+                     (int)ver_len, http_ver);
         }
     }
 
@@ -172,8 +167,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
                 while (val_end < end && *val_end != '\r' && *val_end != '\n') val_end++;
                 size_t ua_len = (size_t)(val_end - val);
                 if (ua_len >= sizeof(info->user_agent)) ua_len = sizeof(info->user_agent) - 1;
-                strncpy(info->user_agent, val, ua_len);
-                info->user_agent[ua_len] = '\0';
+                snprintf(info->user_agent, sizeof(info->user_agent), "%.*s",
+                         (int)ua_len, val);
             } else if (remaining >= 8 && strncasecmp(hdr, "Upgrade:", 8) == 0) {
                 const char *val = hdr + 8;
                 while (val < end && (*val == ' ' || *val == '\t')) val++;
@@ -198,8 +193,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
         while (host_end < end && *host_end != '\r' && *host_end != '\n') host_end++;
         size_t host_len = (size_t)(host_end - host_hdr);
         if (host_len >= sizeof(info->host)) host_len = sizeof(info->host) - 1;
-        strncpy(info->host, host_hdr, host_len);
-        info->host[host_len] = '\0';
+        snprintf(info->host, sizeof(info->host), "%.*s",
+                 (int)host_len, host_hdr);
     }
 }
 
@@ -377,7 +372,7 @@ static void test_json_escape_nonprintable_uses_unicode(void)
 {
     TEST(json_escape_nonprintable_unicode);
     /* J-1/S-3 fix: non-printable must use \uXXXX, not \xNN */
-    char input[] = {'\x01', '\x7f', '\0'};
+    const char input[] = {'\x01', '\x7f', '\0'};
     char *out = capture_stdout(print_json_string_n, input, 0);
     /* Should produce \u0001 and \u007f, NOT \x01 and \x7f */
     ASSERT_STR_CONTAINS(out, "\\u0001", "byte 0x01 escaped as \\u0001");
@@ -392,7 +387,7 @@ static void test_json_escape_null_byte_handling(void)
 {
     TEST(json_null_byte_bounded);
     /* With maxlen, should stop at maxlen even with embedded nulls */
-    char input[] = {'a', '\0', 'b'};  /* 'a' then null then 'b' */
+    const char input[] = {'a', '\0', 'b'};  /* 'a' then null then 'b' */
     char *out = capture_stdout(print_json_string_n, input, 3);
     /* Should stop at null byte since *s is checked */
     ASSERT_STR_EQ(out, "\"a\"", "stops at null byte");
@@ -421,7 +416,7 @@ static void test_json_maxlen_truncation(void)
 static void test_json_high_byte_unicode_escape(void)
 {
     TEST(json_high_byte_unicode_escape);
-    char input[] = {(char)0x80, (char)0xff, '\0'};
+    const char input[] = {(char)0x80, (char)0xff, '\0'};
     char *out = capture_stdout(print_json_string_n, input, 0);
     ASSERT_STR_CONTAINS(out, "\\u0080", "0x80 escaped as \\u0080");
     ASSERT_STR_CONTAINS(out, "\\u00ff", "0xff escaped as \\u00ff");
@@ -561,10 +556,10 @@ static void test_http_long_path(void)
     TEST(http_parse_long_path);
     char data[1024];
     memset(data, 0, sizeof(data));
-    strcpy(data, "GET /");
+    snprintf(data, 6, "GET /");
     /* Fill with 'a' to exceed path buffer */
     memset(data + 5, 'a', 600);
-    strcpy(data + 605, " HTTP/1.1\r\n\r\n");
+    snprintf(data + 605, sizeof(data) - 605, " HTTP/1.1\r\n\r\n");
     struct http_info info;
     parse_http_info(data, strlen(data), &info);
     ASSERT_STR_EQ(info.method, "GET", "method parsed");
@@ -743,7 +738,7 @@ static void test_sanitize_no_match(void)
     add_test_sanitize_pattern("secret=[^&]*");
     char str[256] = "/api/v1?name=test&id=123";
     char original[256];
-    strcpy(original, str);
+    snprintf(original, sizeof(original), "%s", str);
     sanitize_string(str, sizeof(str));
     ASSERT_STR_EQ(str, original, "no change when no match");
     PASS();
@@ -860,7 +855,7 @@ static void test_edge_max_comm_length(void)
 {
     TEST(edge_max_comm_json);
     /* MAX_COMM_LEN = 16, should truncate correctly */
-    char comm[20] = "abcdefghijklmnopqrst";
+    const char comm[20] = "abcdefghijklmnopqrst";
     char *out = capture_stdout(print_json_string_n, comm, MAX_COMM_LEN);
     ASSERT_TRUE(strlen(out) <= MAX_COMM_LEN + 2, "output bounded by maxlen");
     /* Should contain the first 16 chars */
