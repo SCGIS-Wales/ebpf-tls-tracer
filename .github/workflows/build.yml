@@ -64,9 +64,9 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         run: |
-          if [ -z "${SONAR_TOKEN}" ] || [ "${SONAR_TOKEN}" = "***" ]; then
-            echo "SONAR_TOKEN not configured, skipping SonarQube analysis"
-            echo "To enable, add SONAR_TOKEN secret and SONAR_HOST_URL variable to the repository"
+          if [ -z "${SONAR_HOST_URL}" ]; then
+            echo "SONAR_HOST_URL not configured, skipping SonarQube analysis"
+            echo "To enable, add SONAR_HOST_URL variable and SONAR_TOKEN secret to the repository"
             exit 0
           fi
           echo "Running SonarQube analysis..."
