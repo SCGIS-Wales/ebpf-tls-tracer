@@ -32,6 +32,7 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "unknown")
 NODE_NAME = os.environ.get("NODE_NAME", "unknown")
 MAX_RETRIES = 5
 FIREHOSE_MAX_BATCH = 500  # AWS limit per PutRecordBatch call
+MAX_LINE_LEN = 65536  # Skip lines larger than 64KB to prevent memory exhaustion (S6)
 LOG_FILE = "/var/log/tls-tracer/events.json"
 
 running = True
@@ -92,7 +93,17 @@ def send_chunk(firehose, records):
             if attempt < MAX_RETRIES:
                 time.sleep(delay)
             else:
-                log("ERROR", f"Failed after {MAX_RETRIES} attempts, dropping {len(records)} records")
+                log("ERROR", f"Failed after {MAX_RETRIES} attempts, "
+                    f"writing {len(records)} records to dead-letter file")
+                # Write failed records to local dead-letter file (R10)
+                try:
+                    dlq_path = "/var/log/tls-tracer/dead-letter.json"
+                    with open(dlq_path, "a") as dlq:
+                        for rec in records:
+                            dlq.write(rec["Data"].decode("utf-8"))
+                    log("INFO", f"Wrote {len(records)} records to {dlq_path}")
+                except Exception as dlq_err:
+                    log("ERROR", f"Dead-letter write failed: {dlq_err}")
                 return False
         except Exception as e:
             log("ERROR", f"Unexpected error: {e}")
@@ -141,6 +152,9 @@ def tail_file(path, offset):
             for line in f:
                 stripped = line.strip()
                 if stripped:
+                    if len(stripped) > MAX_LINE_LEN:
+                        log("WARN", f"Skipping oversized line ({len(stripped)} bytes)")
+                        continue
                     lines.append(stripped)
             new_offset = f.tell()
             return lines, new_offset

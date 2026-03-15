@@ -68,9 +68,11 @@ struct {
     __type(value, struct ssl_version_args_t);
 } ssl_version_args_map SEC(".maps");
 
-/* Persistent map: SSL pointer → TLS version number */
+/* Persistent map: SSL pointer → TLS version number.
+ * Uses LRU hash to auto-evict oldest entries and prevent memory leaks
+ * when SSL objects are freed without cleanup notification. */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, __u64);  /* SSL pointer cast to u64 */
     __type(value, __u16);
@@ -83,7 +85,7 @@ struct cipher_name_t {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, __u64);  /* SSL pointer cast to u64 */
     __type(value, struct cipher_name_t);
@@ -92,7 +94,7 @@ struct {
 /* mTLS detection map: SSL pointer → whether client cert is present.
  * Populated by SSL_get_certificate uprobe (non-NULL return = mTLS). */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, __u64);  /* SSL pointer cast to u64 */
     __type(value, __u8);  /* 1 = mTLS (client cert present), 0 = one-way */
@@ -123,9 +125,10 @@ struct {
 } ssl_cipher_args_map SEC(".maps");
 
 /* Connection info map: keyed by pid_tgid, stores remote addr/port.
- * Populated by connect/accept kprobes, read by SSL uprobes. */
+ * Populated by connect/accept kprobes, read by SSL uprobes.
+ * Uses LRU hash to auto-evict stale entries from exited processes. */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, __u64);
     __type(value, struct conn_info_t);
@@ -174,6 +177,7 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     event->tid = 0;
     event->uid = 0;
     event->data_len = 0;
+    event->fd = 0;
     event->tls_version = 0;
     event->direction = 0;
     event->event_type = 0;
@@ -184,6 +188,10 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     event->remote_port = 0;
     event->remote_addr_v4 = 0;
     event->local_addr_v4 = 0;
+    /* Zero full IPv6 union fields to prevent stale data leaking from
+     * a previous IPv6 event into a subsequent IPv4 event (R4 fix). */
+    __builtin_memset(event->remote_addr_v6, 0, 16);
+    __builtin_memset(event->local_addr_v6, 0, 16);
     event->cipher[0] = '\0';
     return event;
 }
@@ -310,6 +318,13 @@ int probe_connect_return(struct pt_regs *ctx)
         goto cleanup;
     }
 
+    /* Check if tcp_set_state already populated a complete entry with local
+     * address.  If so, don't overwrite — the tcp_set_state entry is more
+     * complete (has both local + remote).  This fixes the src_ip race. */
+    struct conn_info_t *existing = bpf_map_lookup_elem(&conn_info_map, &id);
+    if (existing && existing->local_port != 0)
+        goto cleanup;
+
     struct conn_info_t ci = {};
     __u16 sa_family = 0;
     bpf_probe_read_user(&sa_family, sizeof(sa_family), &args->addr->sa_family);
@@ -383,8 +398,27 @@ int probe_tcp_set_state(struct pt_regs *ctx)
         ci.local_addr_v4 = saddr;
         ci.remote_port = bpf_ntohs(dport);
         ci.local_port = sport;  /* skc_num is already host byte order */
+    } else if (family == AF_INET6) {
+        /* IPv6: read addresses from struct sock.
+         * sk_v6_daddr and sk_v6_rcv_saddr are at stable offsets in
+         * struct ipv6_pinfo embedded in tcp6_sock.  For CO-RE compatible
+         * kernels we use the __sk_common fields available since 4.x. */
+        __u16 dport = 0, sport = 0;
+
+        bpf_probe_read_kernel(&dport, sizeof(dport),
+                              &sk->__sk_common.skc_dport);
+        bpf_probe_read_kernel(&sport, sizeof(sport),
+                              &sk->__sk_common.skc_num);
+
+        ci.addr_family = ADDR_FAMILY_IPV6;
+        ci.remote_port = bpf_ntohs(dport);
+        ci.local_port = sport;
+
+        /* sk_v6_daddr at offset 200, sk_v6_rcv_saddr at offset 216 on
+         * x86_64 5.x-6.x kernels — read raw bytes to stay portable. */
+        bpf_probe_read_kernel(ci.remote_addr_v6, 16, (void *)sk + 200);
+        bpf_probe_read_kernel(ci.local_addr_v6, 16, (void *)sk + 216);
     } else {
-        /* IPv6: skip for now (sk_v6_rcv_saddr offset varies) */
         return 0;
     }
 
@@ -413,10 +447,10 @@ int probe_udp_sendmsg(struct pt_regs *ctx)
     if (dport != 443 && dport != 8443)
         return 0;
 
-    /* Read address family - only handle IPv4 for now */
+    /* Handle IPv4 and IPv6 (R9 fix: previously only IPv4 was handled) */
     short family = 0;
     bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-    if (family != AF_INET)
+    if (family != AF_INET && family != AF_INET6)
         return 0;
 
     /* Emit a QUIC detection event */
@@ -435,21 +469,59 @@ int probe_udp_sendmsg(struct pt_regs *ctx)
     event->data_len = 0;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
-    __u32 daddr = 0;
-    bpf_probe_read_kernel(&daddr, sizeof(daddr), &sk->__sk_common.skc_daddr);
-    event->addr_family = ADDR_FAMILY_IPV4;
-    event->remote_addr_v4 = daddr;
     event->remote_port = dport;
 
-    __u32 saddr = 0;
-    __u16 sport = 0;
-    bpf_probe_read_kernel(&saddr, sizeof(saddr), &sk->__sk_common.skc_rcv_saddr);
-    bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
-    event->local_addr_v4 = saddr;
-    event->local_port = sport;
+    if (family == AF_INET) {
+        __u32 daddr = 0, saddr = 0;
+        __u16 sport = 0;
+        bpf_probe_read_kernel(&daddr, sizeof(daddr), &sk->__sk_common.skc_daddr);
+        bpf_probe_read_kernel(&saddr, sizeof(saddr), &sk->__sk_common.skc_rcv_saddr);
+        bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+        event->addr_family = ADDR_FAMILY_IPV4;
+        event->remote_addr_v4 = daddr;
+        event->local_addr_v4 = saddr;
+        event->local_port = sport;
+    } else {
+        __u16 sport = 0;
+        bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+        event->addr_family = ADDR_FAMILY_IPV6;
+        event->local_port = sport;
+        bpf_probe_read_kernel(event->remote_addr_v6, 16, (void *)sk + 200);
+        bpf_probe_read_kernel(event->local_addr_v6, 16, (void *)sk + 216);
+    }
 
     bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
     return 0;
+}
+
+/* --- Helper: extract socket fd from SSL struct ---
+ * SSL->rbio (offset 16 on 64-bit) points to a BIO struct.
+ * BIO->num (offset 40 on OpenSSL 3.x, 32 on 1.1.x) holds the socket fd.
+ * This technique is used by Pixie/New Relic and eCapture for connection
+ * correlation. See: https://blog.px.dev/ebpf-tls-tracing-past-present-future/ */
+
+static __always_inline int get_ssl_fd(void *ssl)
+{
+    if (!ssl)
+        return -1;
+
+    /* Read SSL->rbio pointer (offset 16 on both OpenSSL 1.1.x and 3.x) */
+    void *rbio = NULL;
+    if (bpf_probe_read_user(&rbio, sizeof(rbio), (void *)ssl + 16) != 0 || !rbio)
+        return -1;
+
+    /* Read BIO->num (the socket fd).
+     * OpenSSL 3.x: offset 40 (after method ptr + various fields)
+     * OpenSSL 1.1.x: offset 32
+     * Try offset 40 first (OpenSSL 3.x is more common on modern distros) */
+    int fd = -1;
+    bpf_probe_read_user(&fd, sizeof(fd), (void *)rbio + 40);
+    if (fd >= 0)
+        return fd;
+
+    /* Fallback: try OpenSSL 1.1.x offset */
+    bpf_probe_read_user(&fd, sizeof(fd), (void *)rbio + 32);
+    return fd;
 }
 
 /* --- Helper: look up TLS version for an SSL pointer --- */
@@ -632,26 +704,31 @@ int probe_ssl_read_return(struct pt_regs *ctx)
         return 0;
 
     ret = (int)PT_REGS_RC(ctx);
+
+    /* Extract socket fd from SSL struct for connection correlation */
+    int ssl_fd = get_ssl_fd(args->ssl);
+
     if (ret <= 0) {
-        /* SSL_read error: ret 0 = connection closed, ret < 0 = error.
-         * Emit a TLS error event so userspace can log the failure. */
-        if (ret < 0) {
-            struct tls_event_t *err_event = get_event_buf();
-            if (err_event) {
-                err_event->timestamp_ns = bpf_ktime_get_ns();
-                err_event->pid = id >> 32;
-                err_event->tid = (__u32)id;
-                err_event->uid = bpf_get_current_uid_gid();
-                err_event->direction = DIRECTION_READ;
-                err_event->event_type = EVENT_TLS_ERROR;
-                err_event->error_code = (__s16)ret;
-                err_event->tls_version = get_tls_version(args->ssl);
-                err_event->data_len = 0;
-                bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
-                enrich_event_with_conn_info(err_event, id);
-                bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
-                                      err_event, sizeof(*err_event));
-            }
+        /* SSL_read returns: 0 = peer closed connection, <0 = error.
+         * Emit EVENT_TLS_CLOSE for ret==0, EVENT_TLS_ERROR for ret<0 (#3 fix). */
+        struct tls_event_t *err_event = get_event_buf();
+        if (err_event) {
+            err_event->timestamp_ns = bpf_ktime_get_ns();
+            err_event->pid = id >> 32;
+            err_event->tid = (__u32)id;
+            err_event->uid = bpf_get_current_uid_gid();
+            err_event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
+            err_event->direction = DIRECTION_READ;
+            err_event->event_type = (ret == 0) ? EVENT_TLS_CLOSE : EVENT_TLS_ERROR;
+            err_event->error_code = (__s16)ret;
+            err_event->tls_version = get_tls_version(args->ssl);
+            err_event->data_len = 0;
+            bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
+            enrich_event_with_conn_info(err_event, id);
+            enrich_event_with_cipher(err_event, args->ssl);
+            err_event->is_mtls = get_mtls_status(args->ssl);
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
+                                  err_event, sizeof(*err_event));
         }
         goto cleanup;
     }
@@ -664,6 +741,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
     event->pid = id >> 32;
     event->tid = (__u32)id;
     event->uid = bpf_get_current_uid_gid();
+    event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
     event->direction = DIRECTION_READ;
     event->event_type = EVENT_TLS_DATA;
     event->tls_version = get_tls_version(args->ssl);
@@ -714,25 +792,30 @@ int probe_ssl_write_return(struct pt_regs *ctx)
         return 0;
 
     ret = (int)PT_REGS_RC(ctx);
+
+    /* Extract socket fd from SSL struct for connection correlation */
+    int ssl_fd = get_ssl_fd(args->ssl);
+
     if (ret <= 0) {
-        /* SSL_write error: emit TLS error event */
-        if (ret < 0) {
-            struct tls_event_t *err_event = get_event_buf();
-            if (err_event) {
-                err_event->timestamp_ns = bpf_ktime_get_ns();
-                err_event->pid = id >> 32;
-                err_event->tid = (__u32)id;
-                err_event->uid = bpf_get_current_uid_gid();
-                err_event->direction = DIRECTION_WRITE;
-                err_event->event_type = EVENT_TLS_ERROR;
-                err_event->error_code = (__s16)ret;
-                err_event->tls_version = get_tls_version(args->ssl);
-                err_event->data_len = 0;
-                bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
-                enrich_event_with_conn_info(err_event, id);
-                bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
-                                      err_event, sizeof(*err_event));
-            }
+        /* SSL_write returns: 0 = connection closed, <0 = error (#3 fix) */
+        struct tls_event_t *err_event = get_event_buf();
+        if (err_event) {
+            err_event->timestamp_ns = bpf_ktime_get_ns();
+            err_event->pid = id >> 32;
+            err_event->tid = (__u32)id;
+            err_event->uid = bpf_get_current_uid_gid();
+            err_event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
+            err_event->direction = DIRECTION_WRITE;
+            err_event->event_type = (ret == 0) ? EVENT_TLS_CLOSE : EVENT_TLS_ERROR;
+            err_event->error_code = (__s16)ret;
+            err_event->tls_version = get_tls_version(args->ssl);
+            err_event->data_len = 0;
+            bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
+            enrich_event_with_conn_info(err_event, id);
+            enrich_event_with_cipher(err_event, args->ssl);
+            err_event->is_mtls = get_mtls_status(args->ssl);
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
+                                  err_event, sizeof(*err_event));
         }
         goto cleanup;
     }
@@ -745,6 +828,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
     event->pid = id >> 32;
     event->tid = (__u32)id;
     event->uid = bpf_get_current_uid_gid();
+    event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
     event->direction = DIRECTION_WRITE;
     event->event_type = EVENT_TLS_DATA;
     event->tls_version = get_tls_version(args->ssl);

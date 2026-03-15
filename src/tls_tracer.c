@@ -6,6 +6,7 @@
 // plaintext data flowing through TLS connections, along with
 // the remote IP address and port of each connection.
 
+#define _GNU_SOURCE  /* for memmem() */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,8 @@
 #include <ctype.h>
 #include <regex.h>
 #include <arpa/inet.h>
+#include <limits.h>  /* for ULONG_MAX */
+#include <sys/stat.h>  /* for mkdir() */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "tracer.h"
@@ -25,8 +28,85 @@
 #define PERF_POLL_TIMEOUT  100
 #define MAX_PROBES         16
 #define MAX_SANITIZE_PATTERNS 32
+#define DNS_CACHE_SIZE     4096  /* max cached hostname entries */
+#define DNS_CACHE_TTL      300   /* seconds before expiry */
 
 static volatile sig_atomic_t exiting = 0;
+static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+signum (#2 fix) */
+
+/* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
+ * When a Host: header is parsed, the hostname is stored here.
+ * Subsequent events on the same connection inherit the cached hostname
+ * even if they don't contain an HTTP Host header. */
+struct dns_cache_entry {
+    __u32 pid;
+    __u32 fd;
+    time_t last_seen;
+    char   hostname[256];
+};
+
+static struct dns_cache_entry dns_cache[DNS_CACHE_SIZE];
+static int dns_cache_count = 0;
+
+static const char *dns_cache_lookup(__u32 pid, __u32 fd)
+{
+    time_t now = time(NULL);
+    for (int i = 0; i < dns_cache_count; i++) {
+        if (dns_cache[i].pid == pid && dns_cache[i].fd == fd) {
+            if (now - dns_cache[i].last_seen > DNS_CACHE_TTL) {
+                /* Expired — evict by swapping with last entry */
+                dns_cache[i] = dns_cache[--dns_cache_count];
+                return NULL;
+            }
+            dns_cache[i].last_seen = now;
+            return dns_cache[i].hostname;
+        }
+    }
+    return NULL;
+}
+
+static void dns_cache_store(__u32 pid, __u32 fd, const char *hostname)
+{
+    if (!hostname || !hostname[0] || fd == 0)
+        return;
+
+    time_t now = time(NULL);
+
+    /* Update existing entry */
+    for (int i = 0; i < dns_cache_count; i++) {
+        if (dns_cache[i].pid == pid && dns_cache[i].fd == fd) {
+            snprintf(dns_cache[i].hostname, sizeof(dns_cache[i].hostname), "%s", hostname);
+            dns_cache[i].last_seen = now;
+            return;
+        }
+    }
+
+    /* Evict expired entries first */
+    for (int i = 0; i < dns_cache_count; ) {
+        if (now - dns_cache[i].last_seen > DNS_CACHE_TTL) {
+            dns_cache[i] = dns_cache[--dns_cache_count];
+        } else {
+            i++;
+        }
+    }
+
+    /* Add new entry (evict oldest if full) */
+    int slot;
+    if (dns_cache_count < DNS_CACHE_SIZE) {
+        slot = dns_cache_count++;
+    } else {
+        /* Find and evict the oldest entry */
+        slot = 0;
+        for (int i = 1; i < DNS_CACHE_SIZE; i++) {
+            if (dns_cache[i].last_seen < dns_cache[slot].last_seen)
+                slot = i;
+        }
+    }
+    dns_cache[slot].pid = pid;
+    dns_cache[slot].fd = fd;
+    dns_cache[slot].last_seen = now;
+    snprintf(dns_cache[slot].hostname, sizeof(dns_cache[slot].hostname), "%s", hostname);
+}
 
 /* Output format */
 enum output_fmt {
@@ -66,7 +146,7 @@ static struct config cfg = {
 
 static void sig_handler(int signo)
 {
-    (void)signo;
+    exit_signal = signo;
     exiting = 1;
 }
 
@@ -310,6 +390,7 @@ struct http_info {
     char host[256];
     char user_agent[256]; /* User-Agent header value */
     char version[16];   /* "1.0", "1.1", or "2" */
+    int  status_code;   /* HTTP response status code (0 = not a response) (#6 fix) */
     int  websocket;     /* 1 if Upgrade: websocket detected */
     int  grpc_status;   /* gRPC status code (-1 = not present, 0-16 = code) */
 };
@@ -366,28 +447,196 @@ static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
     return 1;
 }
 
+/* #9 fix: Kafka response frame detection.
+ * Response header: message_size(4) + correlation_id(4).
+ * No api_key in responses — they're matched by correlation_id client-side. */
+static int detect_kafka_response(const char *data, __u32 len)
+{
+    if (len < 12)
+        return 0;
+
+    __u32 msg_size = ((unsigned char)data[0] << 24) |
+                     ((unsigned char)data[1] << 16) |
+                     ((unsigned char)data[2] << 8) |
+                     (unsigned char)data[3];
+
+    if (msg_size <= 4 || msg_size > 104857600)
+        return 0;
+
+    int corr_id = (int)(((unsigned char)data[4] << 24) |
+                        ((unsigned char)data[5] << 16) |
+                        ((unsigned char)data[6] << 8) |
+                        (unsigned char)data[7]);
+    if (corr_id < 0)
+        return 0;
+
+    /* Error code (2 bytes, valid range -1 to 120) */
+    int error_code = (int)(short)(((unsigned char)data[8] << 8) |
+                                   (unsigned char)data[9]);
+    if (error_code < -1 || error_code > 120)
+        return 0;
+
+    if (msg_size + 4 < 8)
+        return 0;
+
+    return 1;
+}
+
+/* #10 fix: Extended Kafka API key names (covers all commonly used API keys) */
 static const char *kafka_api_key_name(int api_key)
 {
     switch (api_key) {
-    case 0: return "Produce";
-    case 1: return "Fetch";
-    case 2: return "ListOffsets";
-    case 3: return "Metadata";
-    case 8: return "OffsetCommit";
-    case 9: return "OffsetFetch";
+    case 0:  return "Produce";
+    case 1:  return "Fetch";
+    case 2:  return "ListOffsets";
+    case 3:  return "Metadata";
+    case 4:  return "LeaderAndIsr";
+    case 5:  return "StopReplica";
+    case 6:  return "UpdateMetadata";
+    case 7:  return "ControlledShutdown";
+    case 8:  return "OffsetCommit";
+    case 9:  return "OffsetFetch";
     case 10: return "FindCoordinator";
     case 11: return "JoinGroup";
     case 12: return "Heartbeat";
     case 13: return "LeaveGroup";
     case 14: return "SyncGroup";
+    case 15: return "DescribeGroups";
+    case 16: return "ListGroups";
     case 17: return "SaslHandshake";
     case 18: return "ApiVersions";
     case 19: return "CreateTopics";
     case 20: return "DeleteTopics";
+    case 21: return "DeleteRecords";
     case 22: return "InitProducerId";
+    case 23: return "OffsetForLeaderEpoch";
+    case 24: return "AddPartitionsToTxn";
+    case 25: return "AddOffsetsToTxn";
+    case 26: return "EndTxn";
+    case 27: return "WriteTxnMarkers";
+    case 28: return "TxnOffsetCommit";
+    case 29: return "DescribeAcls";
+    case 30: return "CreateAcls";
+    case 31: return "DeleteAcls";
+    case 32: return "DescribeConfigs";
+    case 33: return "AlterConfigs";
+    case 34: return "AlterReplicaLogDirs";
+    case 35: return "DescribeLogDirs";
     case 36: return "SaslAuthenticate";
+    case 37: return "CreatePartitions";
+    case 38: return "CreateDelegationToken";
+    case 39: return "RenewDelegationToken";
+    case 40: return "ExpireDelegationToken";
+    case 41: return "DescribeDelegationToken";
+    case 42: return "DeleteGroups";
+    case 43: return "ElectLeaders";
+    case 44: return "IncrementalAlterConfigs";
+    case 45: return "AlterPartitionReassignments";
+    case 46: return "ListPartitionReassignments";
+    case 47: return "OffsetDelete";
+    case 48: return "DescribeClientQuotas";
+    case 49: return "AlterClientQuotas";
+    case 50: return "DescribeUserScramCredentials";
+    case 51: return "AlterUserScramCredentials";
+    case 56: return "AlterPartition";
+    case 57: return "UpdateFeatures";
+    case 60: return "DescribeCluster";
+    case 61: return "DescribeProducers";
+    case 65: return "DescribeTransactions";
+    case 66: return "ListTransactions";
+    case 67: return "AllocateProducerIds";
     default: return NULL;
     }
+}
+
+/* #7 fix: HTTP/2 RST_STREAM and GOAWAY error code parsing.
+ * RST_STREAM (type 0x03): 9-byte header + 4-byte error code
+ * GOAWAY (type 0x07): 9-byte header + 4-byte last_stream_id + 4-byte error code */
+static int parse_h2_error_code(const char *data, __u32 len, int *frame_type_out)
+{
+    if (len < 13)
+        return -1;
+
+    __u8 frame_type = (unsigned char)data[3];
+    __u32 frame_len = ((unsigned char)data[0] << 16) |
+                      ((unsigned char)data[1] << 8) |
+                      (unsigned char)data[2];
+
+    *frame_type_out = frame_type;
+
+    if (frame_type == 0x03 && frame_len == 4 && len >= 13) {
+        /* RST_STREAM: error code at offset 9 */
+        __u32 error_code = ((unsigned char)data[9] << 24) |
+                           ((unsigned char)data[10] << 16) |
+                           ((unsigned char)data[11] << 8) |
+                           (unsigned char)data[12];
+        return (int)error_code;
+    }
+
+    if (frame_type == 0x07 && frame_len >= 8 && len >= 17) {
+        /* GOAWAY: last_stream_id at 9-12, error code at 13-16 */
+        __u32 error_code = ((unsigned char)data[13] << 24) |
+                           ((unsigned char)data[14] << 16) |
+                           ((unsigned char)data[15] << 8) |
+                           (unsigned char)data[16];
+        return (int)error_code;
+    }
+
+    return -1;
+}
+
+static const char *h2_error_code_name(int code)
+{
+    switch (code) {
+    case 0x0: return "NO_ERROR";
+    case 0x1: return "PROTOCOL_ERROR";
+    case 0x2: return "INTERNAL_ERROR";
+    case 0x3: return "FLOW_CONTROL_ERROR";
+    case 0x4: return "SETTINGS_TIMEOUT";
+    case 0x5: return "STREAM_CLOSED";
+    case 0x6: return "FRAME_SIZE_ERROR";
+    case 0x7: return "REFUSED_STREAM";
+    case 0x8: return "CANCEL";
+    case 0x9: return "COMPRESSION_ERROR";
+    case 0xa: return "CONNECT_ERROR";
+    case 0xb: return "ENHANCE_YOUR_CALM";
+    case 0xc: return "INADEQUATE_SECURITY";
+    case 0xd: return "HTTP_1_1_REQUIRED";
+    default:  return "UNKNOWN";
+    }
+}
+
+/* #8 fix: Search for grpc-status in HTTP/2 frame payload.
+ * grpc-status is not in the HPACK static table, so it's typically sent
+ * as a literal. We scan for the raw bytes as a best-effort heuristic. */
+static int parse_grpc_status_from_h2(const char *data, __u32 len)
+{
+    if (len < 18)
+        return -1;
+
+    const char *needle = "grpc-status";
+    size_t needle_len = 11;
+    const void *found = memmem(data, len, needle, needle_len);
+    if (!found)
+        return -1;
+
+    const char *pos = (const char *)found + needle_len;
+    const char *data_end = data + len;
+
+    /* Skip HPACK encoding bytes or whitespace between name and value */
+    while (pos < data_end && (*pos < '0' || *pos > '9') &&
+           (size_t)(pos - (const char *)found) < needle_len + 4)
+        pos++;
+
+    if (pos < data_end && *pos >= '0' && *pos <= '9') {
+        int code = *pos - '0';
+        if (pos + 1 < data_end && *(pos + 1) >= '0' && *(pos + 1) <= '9')
+            code = code * 10 + (*(pos + 1) - '0');
+        if (code <= 16)
+            return code;
+    }
+
+    return -1;
 }
 
 /* WebSocket frame parsing: extract close code from close frame (opcode 0x8) */
@@ -439,7 +688,7 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
     if (len < 4)
         return;
 
-    /* Check for HTTP response line: "HTTP/1.1 200 OK\r\n" */
+    /* Check for HTTP response line: "HTTP/1.1 200 OK\r\n" (#6 fix: parse status code) */
     if (len >= 8 && strncmp(data, "HTTP/", 5) == 0) {
         const char *ver_start = data + 5;
         const char *ver_end = ver_start;
@@ -451,7 +700,18 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
             strncpy(info->version, ver_start, ver_len);
             info->version[ver_len] = '\0';
         }
-        /* Responses don't have method/path, but may have headers below */
+        /* Parse status code: "HTTP/1.1 200 OK" → 200 */
+        if (ver_end < data_end && *ver_end == ' ') {
+            const char *status_start = ver_end + 1;
+            if (status_start + 3 <= data_end &&
+                status_start[0] >= '1' && status_start[0] <= '5' &&
+                status_start[1] >= '0' && status_start[1] <= '9' &&
+                status_start[2] >= '0' && status_start[2] <= '9') {
+                info->status_code = (status_start[0] - '0') * 100 +
+                                    (status_start[1] - '0') * 10 +
+                                    (status_start[2] - '0');
+            }
+        }
     }
 
     /* Check if data starts with an HTTP method */
@@ -570,11 +830,13 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
     }
 }
 
-/* Print a JSON string value, escaping special characters */
-static void print_json_string(const char *s)
+/* Print a JSON string value, escaping special characters.
+ * For length-bounded strings (e.g. comm from kernel), use maxlen > 0
+ * to avoid reading past the buffer. If maxlen == 0, reads until NUL. */
+static void print_json_string_n(const char *s, size_t maxlen)
 {
     putchar('"');
-    for (; *s; s++) {
+    for (size_t i = 0; (maxlen == 0 ? *s : i < maxlen) && *s; s++, i++) {
         switch (*s) {
         case '"':  printf("\\\""); break;
         case '\\': printf("\\\\"); break;
@@ -589,6 +851,12 @@ static void print_json_string(const char *s)
         }
     }
     putchar('"');
+}
+
+/* Print a NUL-terminated JSON string value, escaping special characters */
+static void print_json_string(const char *s)
+{
+    print_json_string_n(s, 0);
 }
 
 static void handle_event(void *ctx, int cpu __attribute__((unused)),
@@ -631,12 +899,13 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
     }
 
     if (c->format == FMT_JSON) {
-        /* Get wall-clock timestamp */
+        /* Get wall-clock timestamp (use gmtime_r for thread-safety) */
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         char iso_time[64];
-        struct tm *tm = gmtime(&ts.tv_sec);
-        strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", tm);
+        struct tm tm_buf;
+        gmtime_r(&ts.tv_sec, &tm_buf);
+        strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S", &tm_buf);
 
         /* Handle TCP connect error events */
         if (event->event_type == EVENT_CONNECT_ERROR) {
@@ -663,16 +932,58 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,"
-                   "\"comm\":\"%.*s\",\"event_type\":\"tcp_error\","
-                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
-                   "\"error_code\":%d,\"error\":\"%s\"}\n",
+                   "\"pid\":%u,\"tid\":%u,\"comm\":",
                    iso_time, ts.tv_nsec / 1000,
                    (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid,
-                   MAX_COMM_LEN, event->comm,
+                   event->pid, event->tid);
+            print_json_string_n(event->comm, MAX_COMM_LEN);
+            printf(",\"event_type\":\"tcp_error\","
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+                   "\"error_code\":%d,\"error\":\"%s\"}\n",
                    remote_ip, event->remote_port,
                    ecode, err_desc);
+            fflush(stdout);
+            return;
+        }
+
+        /* Handle TLS close events (#3 fix) */
+        if (event->event_type == EVENT_TLS_CLOSE) {
+            const char *tls_ver_str = NULL;
+            switch (event->tls_version) {
+            case 0x0301: tls_ver_str = "1.0"; break;
+            case 0x0302: tls_ver_str = "1.1"; break;
+            case 0x0303: tls_ver_str = "1.2"; break;
+            case 0x0304: tls_ver_str = "1.3"; break;
+            default: break;
+            }
+
+            printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
+                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid);
+            print_json_string_n(event->comm, MAX_COMM_LEN);
+            printf(",\"event_type\":\"tls_close\","
+                   "\"direction\":\"%s\","
+                   "\"src_ip\":\"%s\",\"src_port\":%u,"
+                   "\"dst_ip\":\"%s\",\"dst_port\":%u",
+                   direction_str(event->direction),
+                   local_ip, event->local_port,
+                   remote_ip, event->remote_port);
+
+            if (event->fd > 0)
+                printf(",\"conn_id\":\"%u:%u\"", event->pid, event->fd);
+            if (tls_ver_str)
+                printf(",\"tls_version\":\"%s\"", tls_ver_str);
+            if (event->cipher[0]) {
+                printf(",\"tls_cipher\":");
+                char cipher_safe[MAX_CIPHER_LEN + 1];
+                memcpy(cipher_safe, event->cipher, MAX_CIPHER_LEN);
+                cipher_safe[MAX_CIPHER_LEN] = '\0';
+                print_json_string(cipher_safe);
+            }
+            printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
+            printf("}\n");
             fflush(stdout);
             return;
         }
@@ -689,20 +1000,23 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             }
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,"
-                   "\"comm\":\"%.*s\",\"event_type\":\"tls_error\","
+                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid);
+            print_json_string_n(event->comm, MAX_COMM_LEN);
+            printf(",\"event_type\":\"tls_error\","
                    "\"direction\":\"%s\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"ssl_return_code\":%d",
-                   iso_time, ts.tv_nsec / 1000,
-                   (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid,
-                   MAX_COMM_LEN, event->comm,
                    direction_str(event->direction),
                    local_ip, event->local_port,
                    remote_ip, event->remote_port,
                    (int)event->error_code);
+
+            if (event->fd > 0)
+                printf(",\"conn_id\":\"%u:%u\"", event->pid, event->fd);
 
             if (tls_ver_str)
                 printf(",\"tls_version\":\"%s\"", tls_ver_str);
@@ -715,15 +1029,15 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         /* Handle QUIC detection events */
         if (event->event_type == EVENT_QUIC_DETECTED) {
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-                   "\"pid\":%u,\"tid\":%u,"
-                   "\"comm\":\"%.*s\",\"event_type\":\"quic_detected\","
+                   "\"pid\":%u,\"tid\":%u,\"comm\":",
+                   iso_time, ts.tv_nsec / 1000,
+                   (unsigned long long)event->timestamp_ns,
+                   event->pid, event->tid);
+            print_json_string_n(event->comm, MAX_COMM_LEN);
+            printf(",\"event_type\":\"quic_detected\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"transport\":\"udp\",\"protocol\":\"quic\"}\n",
-                   iso_time, ts.tv_nsec / 1000,
-                   (unsigned long long)event->timestamp_ns,
-                   event->pid, event->tid,
-                   MAX_COMM_LEN, event->comm,
                    local_ip, event->local_port,
                    remote_ip, event->remote_port);
             fflush(stdout);
@@ -748,24 +1062,38 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
 
         /* Emit one self-contained JSON event */
         printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
-               "\"pid\":%u,\"tid\":%u,\"uid\":%u,"
-               "\"comm\":\"%.*s\",\"direction\":\"%s\","
+               "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
+               iso_time, ts.tv_nsec / 1000,
+               (unsigned long long)event->timestamp_ns,
+               event->pid, event->tid, event->uid);
+        print_json_string_n(event->comm, MAX_COMM_LEN);
+        printf(",\"direction\":\"%s\","
                "\"src_ip\":\"%s\",\"src_port\":%u,"
                "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                "\"data_len\":%u",
-               iso_time, ts.tv_nsec / 1000,
-               (unsigned long long)event->timestamp_ns,
-               event->pid, event->tid, event->uid,
-               MAX_COMM_LEN, event->comm,
                direction_str(event->direction),
                local_ip, event->local_port,
                remote_ip, event->remote_port,
                data_len);
 
-        /* DNS / hostname from HTTP Host header (best-effort) */
+        /* Connection ID for correlating events on the same TCP connection.
+         * Combines PID and socket fd into a unique identifier. */
+        if (event->fd > 0)
+            printf(",\"conn_id\":\"%u:%u\"", event->pid, event->fd);
+
+        /* DNS / hostname from HTTP Host header (best-effort).
+         * Cache the hostname per {pid, fd} so subsequent events on the same
+         * connection inherit it even without a Host header. */
+        const char *dns_hostname = NULL;
         if (http.host[0]) {
+            dns_hostname = http.host;
+            dns_cache_store(event->pid, event->fd, http.host);
+        } else if (event->fd > 0) {
+            dns_hostname = dns_cache_lookup(event->pid, event->fd);
+        }
+        if (dns_hostname) {
             printf(",\"dst_dns\":");
-            print_json_string(http.host);
+            print_json_string(dns_hostname);
         }
 
         /* K8s fields (only if populated) */
@@ -873,11 +1201,11 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             strncmp(event->data, "250 ", 4) == 0))
             l7_proto = "smtps";
 
-        /* 7. Detect IMAP over TLS */
+        /* 7. Detect IMAP over TLS (use memmem for bounded search — R7 fix) */
         if (strcmp(l7_proto, "unknown") == 0 && data_len >= 4 && (
             strncmp(event->data, "* OK", 4) == 0 ||
             (event->data[0] >= 'A' && event->data[0] <= 'Z' &&
-             data_len >= 6 && strstr(event->data, "LOGIN") != NULL)))
+             data_len >= 6 && memmem(event->data, data_len, "LOGIN", 5) != NULL)))
             l7_proto = "imaps";
 
         /* 8. Detect Kafka wire protocol (binary header structure) */
@@ -952,6 +1280,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         else if (http.version[0])
             printf(",\"http_version\":\"%s\"", http.version);
 
+        /* #6 fix: HTTP response status code */
+        if (http.status_code > 0)
+            printf(",\"http_status\":%d", http.status_code);
+
         if (http.method[0]) {
             printf(",\"http_method\":\"%s\"", http.method);
             if (http.path[0]) {
@@ -968,6 +1300,27 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         if (http.user_agent[0]) {
             printf(",\"user_agent\":");
             print_json_string(http.user_agent);
+        }
+
+        /* #7 fix: HTTP/2 RST_STREAM / GOAWAY error codes */
+        if (is_http2 && data_len >= 13) {
+            int h2_frame_type = 0;
+            int h2_err = parse_h2_error_code(event->data, data_len, &h2_frame_type);
+            if (h2_err >= 0) {
+                printf(",\"h2_error_code\":%d,\"h2_error_name\":\"%s\"",
+                       h2_err, h2_error_code_name(h2_err));
+                if (h2_frame_type == 0x03)
+                    printf(",\"h2_frame_type\":\"RST_STREAM\"");
+                else if (h2_frame_type == 0x07)
+                    printf(",\"h2_frame_type\":\"GOAWAY\"");
+            }
+        }
+
+        /* #8 fix: Try enhanced grpc-status detection from H2 frame payload */
+        if (is_http2 && http.grpc_status < 0 && data_len > 0) {
+            int h2_grpc = parse_grpc_status_from_h2(event->data, data_len);
+            if (h2_grpc >= 0)
+                http.grpc_status = h2_grpc;
         }
 
         /* gRPC status code from grpc-status header (0-16) */
@@ -997,12 +1350,26 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
                    http.grpc_status, grpc_desc);
         }
 
-        /* Kafka API key detection */
+        /* Kafka API key detection (request frames) */
         if (kafka_api_key >= 0) {
             const char *api_name = kafka_api_key_name(kafka_api_key);
             printf(",\"kafka_api_key\":%d", kafka_api_key);
             if (api_name)
                 printf(",\"kafka_api_name\":\"%s\"", api_name);
+            printf(",\"kafka_frame_type\":\"request\"");
+        }
+
+        /* #9 fix: Kafka response frame detection */
+        if (kafka_api_key < 0 && strcmp(l7_proto, "unknown") == 0 &&
+            detect_kafka_response(event->data, data_len)) {
+            l7_proto = "kafka";
+            printf(",\"kafka_frame_type\":\"response\"");
+            if (data_len >= 10) {
+                int k_err = (int)(short)(((unsigned char)event->data[8] << 8) |
+                                          (unsigned char)event->data[9]);
+                if (k_err != 0)
+                    printf(",\"kafka_error_code\":%d", k_err);
+            }
         }
 
         /* WebSocket close code detection */
@@ -1043,9 +1410,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         if (!c->data_only) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            struct tm *tm = localtime(&ts.tv_sec);
+            struct tm tm_buf;
+            localtime_r(&ts.tv_sec, &tm_buf);
             char timebuf[64];
-            strftime(timebuf, sizeof(timebuf), "%H:%M:%S", tm);
+            strftime(timebuf, sizeof(timebuf), "%H:%M:%S", &tm_buf);
 
             printf("%-12s %-6s PID=%-6u TID=%-6u UID=%-4u COMM=%-15.*s ADDR=%-21s LEN=%u\n",
                    timebuf,
@@ -1158,12 +1526,26 @@ int main(int argc, char **argv)
     int opt;
     while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:vh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'p':
-            cfg.filter_pid = (__u32)atoi(optarg);
+        case 'p': {
+            char *endp;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > UINT_MAX) {
+                fprintf(stderr, "Error: Invalid PID '%s'\n", optarg);
+                return 1;
+            }
+            cfg.filter_pid = (__u32)val;
             break;
-        case 'u':
-            cfg.filter_uid = (__u32)atoi(optarg);
+        }
+        case 'u': {
+            char *endp;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val > UINT_MAX) {
+                fprintf(stderr, "Error: Invalid UID '%s'\n", optarg);
+                return 1;
+            }
+            cfg.filter_uid = (__u32)val;
             break;
+        }
         case 'l':
             snprintf(cfg.ssl_lib, sizeof(cfg.ssl_lib), "%s", optarg);
             break;
@@ -1227,11 +1609,33 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    /* Open and load BPF object */
-    obj = bpf_object__open_file("bpf_program.o", NULL);
+    /* Open and load BPF object.
+     * Search order: installed path first, then CWD fallback for development.
+     * Using an absolute path prevents loading a malicious .o from CWD (S5 fix). */
+    const char *bpf_obj_paths[] = {
+        "/usr/local/lib/tls_tracer/bpf_program.o",
+        "/opt/tls_tracer/bpf_program.o",
+        "bpf_program.o",
+        NULL,
+    };
+    const char *bpf_obj_path = NULL;
+    for (int i = 0; bpf_obj_paths[i]; i++) {
+        if (access(bpf_obj_paths[i], R_OK) == 0) {
+            bpf_obj_path = bpf_obj_paths[i];
+            break;
+        }
+    }
+    if (!bpf_obj_path) {
+        fprintf(stderr, "Error: Cannot find bpf_program.o in any search path\n");
+        return 1;
+    }
+    if (cfg.verbose)
+        fprintf(stderr, "Loading BPF object: %s\n", bpf_obj_path);
+
+    obj = bpf_object__open_file(bpf_obj_path, NULL);
     if (!obj) {
-        fprintf(stderr, "Error: Failed to open BPF object file: %s\n",
-                strerror(errno));
+        fprintf(stderr, "Error: Failed to open BPF object file '%s': %s\n",
+                bpf_obj_path, strerror(errno));
         return 1;
     }
 
@@ -1369,23 +1773,29 @@ int main(int argc, char **argv)
     }
 
     /* Touch health file to signal readiness */
-    const char *health_file = "/tmp/tls_tracer_healthy";
+    /* Use a dedicated path for health file to prevent spoofing via /tmp (S4 fix).
+     * Falls back to /tmp if the directory doesn't exist (e.g., local dev). */
+    const char *health_file = "/var/run/tls-tracer/healthy";
+    if (access("/var/run/tls-tracer", F_OK) != 0) {
+        if (mkdir("/var/run/tls-tracer", 0755) != 0)
+            health_file = "/tmp/tls_tracer_healthy";  /* fallback */
+    }
     FILE *hf = fopen(health_file, "w");
     if (hf) {
         fprintf(hf, "ready\n");
         fclose(hf);
     }
 
-    /* Main event loop */
+    /* Main event loop (#1 fix: don't mask poll errors) */
     int poll_count = 0;
     while (!exiting) {
-        err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT);
-        if (err < 0 && err != -EINTR) {
+        int poll_err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT);
+        if (poll_err < 0 && poll_err != -EINTR) {
             fprintf(stderr, "Error: Polling perf buffer failed: %s\n",
-                    strerror(-err));
+                    strerror(-poll_err));
+            err = poll_err;
             break;
         }
-        err = 0;
 
         /* Update health file every ~10 seconds (100ms poll * 100) */
         if (++poll_count >= 100) {
@@ -1414,5 +1824,8 @@ cleanup:
     if (obj)
         bpf_object__close(obj);
 
+    /* #2 fix: POSIX convention — exit with 128+signum on signal termination */
+    if (exit_signal)
+        return 128 + (int)exit_signal;
     return err != 0 ? 1 : 0;
 }
