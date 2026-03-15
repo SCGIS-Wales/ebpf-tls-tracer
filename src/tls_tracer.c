@@ -513,12 +513,16 @@ static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
     if (av < 0 || av > 20)
         return 0;
 
-    /* Read correlation_id (4 bytes) — must be >= 0 */
+    /* Read correlation_id (4 bytes) — must be > 0.
+     * Issue 3 fix: Require correlation_id > 0 (not just >= 0) to reduce
+     * false positives from HTTP/2 binary frames where the bytes at this
+     * offset are often 0. Real Kafka clients use correlation_id starting
+     * from 1, incrementing per request. */
     int corr_id = (int)(((unsigned char)data[8] << 24) |
                         ((unsigned char)data[9] << 16) |
                         ((unsigned char)data[10] << 8) |
                         (unsigned char)data[11]);
-    if (corr_id < 0)
+    if (corr_id <= 0)
         return 0;
 
     /* Read client_id_length (2 bytes, -1 for null) */
@@ -1299,16 +1303,29 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
              data_len >= 6 && memmem(event->data, data_len, "LOGIN", 5) != NULL)))
             l7_proto = "imaps";
 
-        /* 8. Detect Kafka wire protocol (binary header structure) */
+        /* 8. Detect Kafka wire protocol (binary header structure).
+         *
+         * Issue 3 fix: HTTP/2 binary frames can match the Kafka wire format
+         * heuristic (both use big-endian length-prefixed framing). Guard
+         * against false positives by:
+         *   a) Skipping Kafka detection if protocol is already identified
+         *      (HTTPS/gRPC/WSS detected above via HTTP/2 frame checks)
+         *   b) Skipping if destination port is 443 or 8443 (Kafka over TLS
+         *      uses 9092/9093/9094, never standard HTTPS ports)
+         *   c) Requiring correlation_id > 0 (HTTP/2 frames often have 0) */
         int kafka_api_key = -1;
         int is_kafka_response = 0;
-        if (strcmp(l7_proto, "unknown") == 0 &&
+        __u16 dst_port = event->remote_port;
+        int kafka_port_ok = (dst_port != 443 && dst_port != 8443);
+
+        if (strcmp(l7_proto, "unknown") == 0 && kafka_port_ok &&
             detect_kafka_protocol(event->data, data_len, &kafka_api_key))
             l7_proto = "kafka";
 
         /* J-4 fix: Kafka response detection must happen BEFORE protocol is printed.
          * Previously this was dead code because l7_proto was already emitted. */
         if (kafka_api_key < 0 && strcmp(l7_proto, "unknown") == 0 &&
+            kafka_port_ok &&
             detect_kafka_response(event->data, data_len)) {
             l7_proto = "kafka";
             is_kafka_response = 1;
