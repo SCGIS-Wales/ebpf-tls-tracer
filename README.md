@@ -1,6 +1,6 @@
 # eBPF TLS Tracer
 
-An eBPF-based tool for intercepting and inspecting TLS/SSL traffic in real time on Linux. Ships as a **CLI binary**, a **container image** (`ghcr.io/scgis-wales/ebpf-tls-tracer`), and a **Helm chart** for Kubernetes DaemonSet deployment. Attaches uprobes to OpenSSL's `SSL_read`/`SSL_write` to capture plaintext data — without modifying applications or terminating TLS sessions.
+An eBPF-based tool for intercepting and inspecting TLS/SSL traffic in real time on Linux. Ships as a **CLI binary**, a **container image** (`ghcr.io/scgis-wales/ebpf-tls-tracer`), and a **Helm chart** for Kubernetes DaemonSet deployment. Attaches uprobes to OpenSSL's `SSL_read`/`SSL_write` to capture plaintext data - without modifying applications or terminating TLS sessions.
 
 ## Features
 
@@ -8,18 +8,18 @@ An eBPF-based tool for intercepting and inspecting TLS/SSL traffic in real time 
 - Intercept plaintext from `SSL_read`/`SSL_write` via eBPF uprobes
 - Capture source and destination IP:port (IPv4/IPv6) via `connect()` + `tcp_set_state` kprobes
 - Connection correlation via socket fd extraction (`conn_id` field)
-- TLS version detection (1.0–1.3) via `SSL_version` uprobe
+- TLS version detection (1.0-1.3) via `SSL_version` uprobe
 - TLS cipher suite capture via `SSL_get_current_cipher` uprobe
 - Mutual TLS (mTLS) detection via `SSL_get_certificate` uprobe
 
 **Protocol detection:**
-- HTTP/1.x — method, path, Host header, status code, User-Agent
-- HTTP/2 — frame parsing, RST_STREAM/GOAWAY error codes
-- gRPC — status codes (0–16), framing detection over HTTP/2
-- WebSocket — upgrade detection, close frame codes
-- Kafka — request/response frames, API key names (75 operations)
-- QUIC — UDP-based detection on ports 443/8443 (opt-in via `--quic`)
-- SMTP, IMAP, LDAP, AMQP, MQTT — via data signatures and well-known ports
+- HTTP/1.x - method, path, Host header, status code, User-Agent
+- HTTP/2 - frame parsing, RST_STREAM/GOAWAY error codes
+- gRPC - status codes (0-16), framing detection over HTTP/2
+- WebSocket - upgrade detection, close frame codes
+- Kafka - request/response frames, API key names (75 operations)
+- QUIC - UDP-based detection on ports 443/8443 (opt-in via `--quic`)
+- SMTP, IMAP, LDAP, AMQP, MQTT - via data signatures and well-known ports
 
 **Operations:**
 - JSON (NDJSON) and text output formats
@@ -27,7 +27,7 @@ An eBPF-based tool for intercepting and inspecting TLS/SSL traffic in real time 
 - Regex-based data sanitization (sensitive headers redacted by default)
 - Kubernetes metadata enrichment (pod name, namespace, container ID)
 - DNS hostname caching per connection
-- Low overhead — 4 MB BPF ring buffer with drop counting, line-buffered stdout
+- Low overhead - 4 MB BPF ring buffer with drop counting, line-buffered stdout
 
 ## Quick Start
 
@@ -159,7 +159,7 @@ Each event is a single self-contained JSON line (NDJSON). Fields are only presen
 | `k8s_pod` | string | Kubernetes pod name |
 | `k8s_namespace` | string | Kubernetes namespace |
 | `container_id` | string | Short container ID (12 chars) |
-| `grpc_status` | integer | gRPC status code (0–16) |
+| `grpc_status` | integer | gRPC status code (0-16) |
 | `grpc_status_name` | string | gRPC status name (`OK`, `UNAVAILABLE`, etc.) |
 | `h2_error_code` | integer | HTTP/2 RST_STREAM/GOAWAY error code |
 | `h2_error_name` | string | HTTP/2 error name (`NO_ERROR`, `CANCEL`, etc.) |
@@ -176,9 +176,9 @@ Each event is a single self-contained JSON line (NDJSON). Fields are only presen
 | Protocol | Detection Method |
 |---|---|
 | `https` | HTTP/1.x methods, HTTP/2 frames, or ports 443/8443 |
-| `grpc` | HTTP/2 DATA frames with gRPC framing, or ports 50051–50055 |
+| `grpc` | HTTP/2 DATA frames with gRPC framing, or ports 50051-50055 |
 | `wss` | `Upgrade: websocket` header or `101 Switching Protocols` |
-| `kafka` | Kafka wire protocol binary header, or ports 9092–9094 |
+| `kafka` | Kafka wire protocol binary header, or ports 9092-9094 |
 | `smtps` | EHLO/MAIL/RCPT commands, or ports 465/587 |
 | `imaps` | IMAP greeting/commands, or port 993 |
 | `quic` | UDP traffic to port 443/8443 (requires `--quic` flag) |
@@ -238,7 +238,7 @@ docker run --rm --privileged \
 
 ## Kubernetes Deployment
 
-TLS Tracer runs as a **DaemonSet** (one pod per node) with `hostPID: true` and `privileged: true`. eBPF hooks into the host kernel, capturing TLS traffic from **all pods and containers on the node** across all namespaces — no sidecars or application changes required.
+TLS Tracer runs as a **DaemonSet** (one pod per node) with `hostPID: true` and `privileged: true`. eBPF hooks into the host kernel, capturing TLS traffic from **all pods and containers on the node** across all namespaces - no sidecars or application changes required.
 
 Events are enriched with K8s metadata (pod name, namespace, container ID) via the downward API.
 
@@ -334,7 +334,7 @@ helm uninstall tls-tracer -n tls-tracer
 
 ## Amazon Linux 2023
 
-AL2023 on EKS 1.34 ships with kernel 6.12 — all eBPF features (BTF, uprobes, kprobes, BPF JIT) are enabled out of the box. No kernel configuration required.
+AL2023 on EKS 1.34 ships with kernel 6.12 - all eBPF features (BTF, uprobes, kprobes, BPF JIT) are enabled out of the box. No kernel configuration required.
 
 ```bash
 # Install and build on AL2023
@@ -404,7 +404,7 @@ sudo ./bin/tls_tracer -f json -v
 
 ## Performance
 
-eBPF uprobes add **~1–2 µs per SSL_read/SSL_write call** (entry + exit + data copy). At 1,700 TPS on an 8-vCPU node, total CPU overhead is typically **< 1%**:
+eBPF uprobes add **~1-2 µs per SSL_read/SSL_write call** (entry + exit + data copy). At 1,700 TPS on an 8-vCPU node, total CPU overhead is typically **< 1%**:
 
 | Component | Overhead per call | At 1,700 TPS |
 |---|---|---|
@@ -414,11 +414,11 @@ eBPF uprobes add **~1–2 µs per SSL_read/SSL_write call** (entry + exit + data
 | **Total** | **~4 µs** | **~6 ms/s (~0.08% CPU)** |
 
 **Design choices for low overhead:**
-- **4 MB shared ring buffer** — ~7% throughput overhead vs ~50% for per-CPU perf buffers on multi-core nodes ([benchmark](https://nakryiko.com/posts/bpf-ringbuf/))
-- **Adaptive notification** — ring buffer signals user-space only when consumer is idle, batching under load
-- **Per-PID K8s metadata cache** with TTL — avoids `/proc` reads on every event
-- **Rate-limited `/proc` reads** — capped at 50/s to prevent I/O storm under PID churn
-- **Variable-length events** — only copies actual data bytes, not fixed 16 KB buffers
+- **4 MB shared ring buffer** - ~7% throughput overhead vs ~50% for per-CPU perf buffers on multi-core nodes ([benchmark](https://nakryiko.com/posts/bpf-ringbuf/))
+- **Adaptive notification** - ring buffer signals user-space only when consumer is idle, batching under load
+- **Per-PID K8s metadata cache** with TTL - avoids `/proc` reads on every event
+- **Rate-limited `/proc` reads** - capped at 50/s to prevent I/O storm under PID churn
+- **Variable-length events** - only copies actual data bytes, not fixed 16 KB buffers
 
 **Kernel requirement:** Linux 6.1+ recommended. Kernels < 6.12.8 have a ring buffer race condition (CVE-2025-40319); the tracer warns at startup on affected versions.
 
