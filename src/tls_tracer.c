@@ -490,14 +490,52 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             print_json_string(meta.container_id);
         }
 
-        /* Protocol and Layer 7 fields */
+        /* Protocol detection: data signatures first, then well-known ports */
         const char *l7_proto = "unknown";
+
+        /* 1. Detect by data content (most reliable) */
         if (http.method[0])
             l7_proto = "https";
-        else if (data_len > 0 && event->direction == DIRECTION_READ) {
-            /* Check if response starts with "HTTP/" */
-            if (data_len >= 5 && strncmp(event->data, "HTTP/", 5) == 0)
-                l7_proto = "https";
+        else if (data_len >= 5 && strncmp(event->data, "HTTP/", 5) == 0)
+            l7_proto = "https";
+        else if (data_len >= 4 && (
+            /* gRPC: starts with binary frame (0x00 + 4-byte length) */
+            ((unsigned char)event->data[0] == 0x00 && data_len >= 5) ||
+            /* SMTP over TLS */
+            strncmp(event->data, "EHLO", 4) == 0 ||
+            strncmp(event->data, "MAIL", 4) == 0 ||
+            strncmp(event->data, "220 ", 4) == 0 ||
+            strncmp(event->data, "250 ", 4) == 0))
+            l7_proto = event->remote_port == 443 ? "grpc" : "smtps";
+        else if (data_len >= 4 && (
+            /* IMAP over TLS */
+            strncmp(event->data, "* OK", 4) == 0 ||
+            (event->data[0] >= 'A' && event->data[0] <= 'Z' &&
+             data_len >= 6 && strstr(event->data, "LOGIN") != NULL)))
+            l7_proto = "imaps";
+
+        /* 2. Fall back to well-known TLS port numbers (RFC/IANA assignments) */
+        if (strcmp(l7_proto, "unknown") == 0) {
+            __u16 port = event->remote_port;
+            switch (port) {
+            case 443:  l7_proto = "https";  break;  /* RFC 2818 */
+            case 8443: l7_proto = "https";  break;  /* Alt HTTPS */
+            case 465:  l7_proto = "smtps";  break;  /* RFC 8314 */
+            case 587:  l7_proto = "smtps";  break;  /* SMTP submission + STARTTLS */
+            case 993:  l7_proto = "imaps";  break;  /* RFC 8314 */
+            case 995:  l7_proto = "pop3s";  break;  /* RFC 8314 */
+            case 636:  l7_proto = "ldaps";  break;  /* RFC 4513 */
+            case 989:
+            case 990:  l7_proto = "ftps";   break;  /* RFC 4217 */
+            case 5223: l7_proto = "xmpps";  break;  /* XMPP over TLS */
+            case 6697: l7_proto = "ircs";   break;  /* IRC over TLS */
+            case 5671: l7_proto = "amqps";  break;  /* AMQP over TLS */
+            case 8883: l7_proto = "mqtts";  break;  /* MQTT over TLS */
+            case 9200:
+            case 9243: l7_proto = "https";  break;  /* Elasticsearch */
+            case 27017: l7_proto = "mongodb+srv"; break; /* MongoDB TLS */
+            default: break;
+            }
         }
         printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
 
