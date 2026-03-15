@@ -269,7 +269,15 @@ int probe_connect_return(struct pt_regs *ctx)
     ret = (int)PT_REGS_RC(ctx);
     /* connect returns 0 on success, or -EINPROGRESS for non-blocking */
     if (ret != 0 && ret != -115) {  /* -EINPROGRESS = -115 */
-        /* Emit a TCP connection error event */
+        /* Only emit error events for IP sockets (AF_INET/AF_INET6).
+         * Skip AF_UNIX, AF_NETLINK, etc. — they produce noise (e.g.
+         * ENOENT from DNS resolution via nscd sockets). */
+        __u16 sa_family = 0;
+        bpf_probe_read_user(&sa_family, sizeof(sa_family),
+                            &args->addr->sa_family);
+        if (sa_family != AF_INET && sa_family != AF_INET6)
+            goto cleanup;
+
         struct tls_event_t *event = get_event_buf();
         if (event) {
             event->timestamp_ns = bpf_ktime_get_ns();
@@ -282,17 +290,13 @@ int probe_connect_return(struct pt_regs *ctx)
             event->data_len = 0;
             bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
-            /* Try to get destination address from connect args */
-            __u16 sa_family = 0;
-            bpf_probe_read_user(&sa_family, sizeof(sa_family),
-                                &args->addr->sa_family);
             if (sa_family == AF_INET) {
                 struct sockaddr_in sin = {};
                 bpf_probe_read_user(&sin, sizeof(sin), args->addr);
                 event->addr_family = ADDR_FAMILY_IPV4;
                 event->remote_addr_v4 = sin.sin_addr.s_addr;
                 event->remote_port = bpf_ntohs(sin.sin_port);
-            } else if (sa_family == AF_INET6) {
+            } else {
                 struct sockaddr_in6 sin6 = {};
                 bpf_probe_read_user(&sin6, sizeof(sin6), args->addr);
                 event->addr_family = ADDR_FAMILY_IPV6;
