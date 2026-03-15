@@ -37,6 +37,7 @@ APP_NAME = os.environ.get("APP_NAME", "unknown")
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "unknown")
 NODE_NAME = os.environ.get("NODE_NAME", "unknown")
 MAX_RETRIES = 5
+MAX_LINE_LEN = 65536  # Skip lines larger than 64KB to prevent memory exhaustion (S6)
 LOG_FILE = "/var/log/tls-tracer/events.json"
 
 running = True
@@ -103,7 +104,16 @@ def flush_batch(s3_client, batch):
             log("ERROR", f"Unexpected error: {e}")
             return False
 
-    log("ERROR", f"Failed to upload after {MAX_RETRIES} attempts, dropping {len(batch)} records")
+    log("ERROR", f"Failed to upload after {MAX_RETRIES} attempts, "
+        f"writing {len(batch)} records to dead-letter file")
+    # Write failed batch to local dead-letter file to prevent data loss (R10)
+    try:
+        dlq_path = "/var/log/tls-tracer/dead-letter.json"
+        with open(dlq_path, "a") as dlq:
+            dlq.write(body)
+        log("INFO", f"Wrote {len(batch)} records to {dlq_path}")
+    except Exception as dlq_err:
+        log("ERROR", f"Dead-letter write failed: {dlq_err}, dropping {len(batch)} records")
     return False
 
 
@@ -127,6 +137,9 @@ def tail_file(path, offset):
             for line in f:
                 stripped = line.strip()
                 if stripped:
+                    if len(stripped) > MAX_LINE_LEN:
+                        log("WARN", f"Skipping oversized line ({len(stripped)} bytes)")
+                        continue
                     lines.append(stripped)
             new_offset = f.tell()
             return lines, new_offset

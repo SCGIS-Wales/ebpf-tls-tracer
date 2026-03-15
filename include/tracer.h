@@ -33,6 +33,7 @@ typedef int32_t  __s32;
 #define EVENT_CONNECT_ERROR 4
 #define EVENT_TLS_ERROR     5
 #define EVENT_QUIC_DETECTED 6
+#define EVENT_TLS_CLOSE     7  /* SSL_read returned 0: peer closed connection */
 
 /* Address family constants (match AF_INET/AF_INET6) */
 #define ADDR_FAMILY_IPV4    2
@@ -66,6 +67,7 @@ struct tls_event_t {
     __u32 tid;
     __u32 uid;
     __u32 data_len;
+    __u32 fd;                /* socket fd from SSL->rbio->num (connection correlation) */
     __u16 tls_version;
     __u8  direction;         /* DIRECTION_READ or DIRECTION_WRITE */
     __u8  event_type;
