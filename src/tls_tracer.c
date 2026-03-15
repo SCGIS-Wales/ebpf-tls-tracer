@@ -643,16 +643,22 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             const char *err_desc = "unknown";
             int ecode = (int)event->error_code;
             switch (ecode) {
-            case 111: err_desc = "connection_refused"; break;
-            case 110: err_desc = "connection_timed_out"; break;
-            case 113: err_desc = "no_route_to_host"; break;
-            case 101: err_desc = "network_unreachable"; break;
-            case 112: err_desc = "host_down"; break;
-            case 99:  err_desc = "address_not_available"; break;
-            case 98:  err_desc = "address_already_in_use"; break;
-            case 106: err_desc = "already_connected"; break;
-            case 114: err_desc = "already_in_progress"; break;
-            case 115: err_desc = "in_progress"; break;
+            case 2:   err_desc = "no_such_file"; break;       /* ENOENT */
+            case 13:  err_desc = "permission_denied"; break;  /* EACCES */
+            case 22:  err_desc = "invalid_argument"; break;   /* EINVAL */
+            case 97:  err_desc = "address_family_not_supported"; break; /* EAFNOSUPPORT */
+            case 98:  err_desc = "address_already_in_use"; break; /* EADDRINUSE */
+            case 99:  err_desc = "address_not_available"; break;  /* EADDRNOTAVAIL */
+            case 100: err_desc = "network_down"; break;       /* ENETDOWN */
+            case 101: err_desc = "network_unreachable"; break;/* ENETUNREACH */
+            case 104: err_desc = "connection_reset"; break;   /* ECONNRESET */
+            case 106: err_desc = "already_connected"; break;  /* EISCONN */
+            case 110: err_desc = "connection_timed_out"; break;/* ETIMEDOUT */
+            case 111: err_desc = "connection_refused"; break; /* ECONNREFUSED */
+            case 112: err_desc = "host_down"; break;          /* EHOSTDOWN */
+            case 113: err_desc = "no_route_to_host"; break;   /* EHOSTUNREACH */
+            case 114: err_desc = "already_in_progress"; break;/* EALREADY */
+            case 115: err_desc = "in_progress"; break;        /* EINPROGRESS */
             default: break;
             }
 
