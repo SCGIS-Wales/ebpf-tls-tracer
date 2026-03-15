@@ -32,11 +32,12 @@ class TestS3ShipperTailFile(unittest.TestCase):
             f.write('{"event":"first"}\n')
             f.write('{"event":"second"}\n')
 
-        lines, offset = s3_shipper.tail_file(self.log_file, 0)
+        lines, offset, inode = s3_shipper.tail_file(self.log_file, 0, None)
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0], '{"event":"first"}')
         self.assertEqual(lines[1], '{"event":"second"}')
         self.assertGreater(offset, 0)
+        self.assertIsNotNone(inode)
 
     def test_tail_incremental(self):
         """Should only read lines added after the last offset."""
@@ -45,14 +46,14 @@ class TestS3ShipperTailFile(unittest.TestCase):
         with open(self.log_file, "w") as f:
             f.write('{"event":"first"}\n')
 
-        lines, offset = s3_shipper.tail_file(self.log_file, 0)
+        lines, offset, inode = s3_shipper.tail_file(self.log_file, 0, None)
         self.assertEqual(len(lines), 1)
 
         # Append more data
         with open(self.log_file, "a") as f:
             f.write('{"event":"second"}\n')
 
-        lines, new_offset = s3_shipper.tail_file(self.log_file, offset)
+        lines, new_offset, _ = s3_shipper.tail_file(self.log_file, offset, inode)
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0], '{"event":"second"}')
         self.assertGreater(new_offset, offset)
@@ -64,11 +65,11 @@ class TestS3ShipperTailFile(unittest.TestCase):
         with open(self.log_file, "w") as f:
             f.write('{"event":"first"}\n')
 
-        lines, offset = s3_shipper.tail_file(self.log_file, 0)
+        lines, offset, inode = s3_shipper.tail_file(self.log_file, 0, None)
         self.assertEqual(len(lines), 1)
 
         # No new data
-        lines, same_offset = s3_shipper.tail_file(self.log_file, offset)
+        lines, same_offset, _ = s3_shipper.tail_file(self.log_file, offset, inode)
         self.assertEqual(len(lines), 0)
         self.assertEqual(same_offset, offset)
 
@@ -76,9 +77,10 @@ class TestS3ShipperTailFile(unittest.TestCase):
         """Should return empty list and offset 0 for missing file."""
         import s3_shipper
 
-        lines, offset = s3_shipper.tail_file("/nonexistent/path", 0)
+        lines, offset, inode = s3_shipper.tail_file("/nonexistent/path", 0, None)
         self.assertEqual(lines, [])
         self.assertEqual(offset, 0)
+        self.assertIsNone(inode)
 
     def test_tail_log_rotation(self):
         """Should reset offset when file shrinks (rotation)."""
@@ -87,13 +89,13 @@ class TestS3ShipperTailFile(unittest.TestCase):
         with open(self.log_file, "w") as f:
             f.write('{"event":"first"}\n' * 10)
 
-        _, offset = s3_shipper.tail_file(self.log_file, 0)
+        _, offset, inode = s3_shipper.tail_file(self.log_file, 0, None)
 
         # Simulate rotation: write smaller file
         with open(self.log_file, "w") as f:
             f.write('{"event":"rotated"}\n')
 
-        lines, new_offset = s3_shipper.tail_file(self.log_file, offset)
+        lines, new_offset, _ = s3_shipper.tail_file(self.log_file, offset, inode)
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0], '{"event":"rotated"}')
 
@@ -104,8 +106,64 @@ class TestS3ShipperTailFile(unittest.TestCase):
         with open(self.log_file, "w") as f:
             f.write('{"event":"first"}\n\n\n{"event":"second"}\n')
 
-        lines, _ = s3_shipper.tail_file(self.log_file, 0)
+        lines, _, _ = s3_shipper.tail_file(self.log_file, 0, None)
         self.assertEqual(len(lines), 2)
+
+    def test_tail_inode_change_detection(self):
+        """R10: should reset offset when inode changes (tee restart)."""
+        import s3_shipper
+
+        # Write enough data to get a large offset
+        with open(self.log_file, "w") as f:
+            for i in range(20):
+                f.write(f'{{"event":"line_{i}"}}\n')
+
+        _, offset, inode = s3_shipper.tail_file(self.log_file, 0, None)
+        self.assertGreater(offset, 100)
+
+        # Simulate tee restart: write a small new file
+        # Use a different path + rename to guarantee a different inode
+        alt_file = self.log_file + ".new"
+        with open(alt_file, "w") as f:
+            f.write('{"event":"after_restart"}\n')
+        os.unlink(self.log_file)
+        os.rename(alt_file, self.log_file)
+
+        lines, new_offset, new_inode = s3_shipper.tail_file(
+            self.log_file, offset, inode
+        )
+        # Either inode changed (reset to 0) or file shrunk (size < offset reset)
+        # In both cases, we should read the full new file content
+        self.assertGreaterEqual(len(lines), 1)
+        self.assertIn('{"event":"after_restart"}', lines)
+
+
+class TestS3ShipperParseIntEnv(unittest.TestCase):
+    """S8: test _parse_int_env validation."""
+
+    def test_valid_int(self):
+        import s3_shipper
+        with patch.dict(os.environ, {"TEST_VAR": "42"}):
+            val = s3_shipper._parse_int_env("TEST_VAR", 10)
+            self.assertEqual(val, 42)
+
+    def test_invalid_int_uses_default(self):
+        import s3_shipper
+        with patch.dict(os.environ, {"TEST_VAR": "abc"}):
+            val = s3_shipper._parse_int_env("TEST_VAR", 10)
+            self.assertEqual(val, 10)
+
+    def test_below_min_clamps(self):
+        import s3_shipper
+        with patch.dict(os.environ, {"TEST_VAR": "0"}):
+            val = s3_shipper._parse_int_env("TEST_VAR", 10, min_val=1)
+            self.assertEqual(val, 1)
+
+    def test_above_max_clamps(self):
+        import s3_shipper
+        with patch.dict(os.environ, {"TEST_VAR": "99999"}):
+            val = s3_shipper._parse_int_env("TEST_VAR", 10, max_val=100)
+            self.assertEqual(val, 100)
 
 
 class TestS3ShipperBuildKey(unittest.TestCase):
