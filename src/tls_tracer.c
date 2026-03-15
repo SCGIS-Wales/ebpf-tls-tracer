@@ -23,7 +23,7 @@
 
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
-#define MAX_PROBES         8
+#define MAX_PROBES         10
 #define MAX_SANITIZE_PATTERNS 32
 
 static volatile sig_atomic_t exiting = 0;
@@ -448,10 +448,10 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
         struct k8s_meta meta;
         get_k8s_meta((pid_t)event->pid, &meta);
 
-        /* HTTP Layer 7 parsing (only for WRITE direction) */
+        /* HTTP Layer 7 parsing (both directions — WRITE for requests, READ for responses) */
         struct http_info http;
         memset(&http, 0, sizeof(http));
-        if (event->direction == DIRECTION_WRITE && data_len > 0)
+        if (data_len > 0)
             parse_http_info(event->data, data_len, &http);
 
         /* Apply sanitization patterns to HTTP fields */
@@ -475,6 +475,12 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
                local_ip, event->local_port,
                remote_ip, event->remote_port,
                data_len);
+
+        /* DNS / hostname from HTTP Host header (best-effort) */
+        if (http.host[0]) {
+            printf(",\"dst_dns\":");
+            print_json_string(http.host);
+        }
 
         /* K8s fields (only if populated) */
         if (meta.pod_name[0]) {
@@ -758,13 +764,14 @@ int main(int argc, char **argv)
     if (cfg.verbose)
         fprintf(stderr, "BPF object loaded successfully.\n");
 
-    /* Attach kprobes for connection tracking (connect syscall) */
+    /* Attach kprobes for connection tracking (connect syscall + tcp_set_state) */
     const char *kprobe_names[] = {
         "probe_connect_enter",
         "probe_connect_return",
+        "probe_tcp_set_state",
     };
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         prog = bpf_object__find_program_by_name(obj, kprobe_names[i]);
         if (!prog) {
             if (cfg.verbose)
