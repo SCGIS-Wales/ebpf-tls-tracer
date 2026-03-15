@@ -1576,11 +1576,16 @@ static int find_ssl_library(char *path, size_t path_len)
         /* Host-mounted paths (K8s DaemonSet: host libs at /host/...) */
         "/host/usr/lib/x86_64-linux-gnu/libssl.so.3",
         "/host/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
+        "/host/usr/lib/aarch64-linux-gnu/libssl.so.3",
+        "/host/usr/lib/aarch64-linux-gnu/libssl.so.1.1",
         "/host/usr/lib64/libssl.so.3",
         "/host/usr/lib64/libssl.so.1.1",
-        /* Debian/Ubuntu (container or bare metal) */
+        /* Debian/Ubuntu x86_64 */
         "/usr/lib/x86_64-linux-gnu/libssl.so.3",
         "/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
+        /* Debian/Ubuntu aarch64 */
+        "/usr/lib/aarch64-linux-gnu/libssl.so.3",
+        "/usr/lib/aarch64-linux-gnu/libssl.so.1.1",
         /* RHEL/AL2023/Fedora */
         "/usr/lib64/libssl.so.3",
         "/usr/lib64/libssl.so.1.1",
@@ -1588,6 +1593,7 @@ static int find_ssl_library(char *path, size_t path_len)
         "/usr/lib/libssl.so.3",
         "/usr/lib/libssl.so.1.1",
         "/lib/x86_64-linux-gnu/libssl.so.3",
+        "/lib/aarch64-linux-gnu/libssl.so.3",
         "/lib64/libssl.so.3",
         NULL,
     };

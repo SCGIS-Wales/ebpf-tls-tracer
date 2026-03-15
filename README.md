@@ -31,10 +31,16 @@ An eBPF-based tool for intercepting and inspecting TLS/SSL traffic in real time 
 
 ## Quick Start
 
-**Pre-built binary** (x86_64 Linux):
+**Pre-built binary** (x86_64 and ARM64 Linux):
 ```bash
+# x86_64
 curl -LO https://github.com/SCGIS-Wales/ebpf-tls-tracer/releases/latest/download/tls_tracer-linux-x86_64.tar.gz
 tar xzf tls_tracer-linux-x86_64.tar.gz
+
+# ARM64 (aarch64)
+curl -LO https://github.com/SCGIS-Wales/ebpf-tls-tracer/releases/latest/download/tls_tracer-linux-aarch64.tar.gz
+tar xzf tls_tracer-linux-aarch64.tar.gz
+
 sudo ./tls_tracer -f json -v
 ```
 
@@ -57,7 +63,7 @@ sudo ./bin/tls_tracer -f json -v
 
 | Requirement | Details |
 |---|---|
-| **OS** | Linux x86_64 |
+| **OS** | Linux x86_64 or aarch64 (ARM64) |
 | **Kernel** | 5.5+ minimum, **6.1+ recommended** |
 | **Privileges** | Root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
 | **OpenSSL** | `libssl.so` installed (auto-detected) |
