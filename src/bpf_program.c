@@ -89,6 +89,27 @@ struct {
     __type(value, struct cipher_name_t);
 } cipher_name_map SEC(".maps");
 
+/* mTLS detection map: SSL pointer → whether client cert is present.
+ * Populated by SSL_get_certificate uprobe (non-NULL return = mTLS). */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);  /* SSL pointer cast to u64 */
+    __type(value, __u8);  /* 1 = mTLS (client cert present), 0 = one-way */
+} mtls_map SEC(".maps");
+
+/* Temp map for SSL_get_certificate args */
+struct ssl_cert_args_t {
+    void *ssl;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct ssl_cert_args_t);
+} ssl_cert_args_map SEC(".maps");
+
 /* Temp map for SSL_get_current_cipher args (SSL * → pid_tgid correlation) */
 struct ssl_cipher_args_t {
     void *ssl;  /* SSL * (first arg to SSL_get_current_cipher) */
@@ -156,6 +177,7 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     event->tls_version = 0;
     event->direction = 0;
     event->event_type = 0;
+    event->is_mtls = 0;
     event->error_code = 0;
     event->addr_family = 0;
     event->local_port = 0;
@@ -499,6 +521,50 @@ cleanup_cipher:
     return 0;
 }
 
+/* --- SSL_get_certificate probes: detect mTLS (client certificate presence) ---
+ * X509 *SSL_get_certificate(const SSL *ssl) returns the local certificate.
+ * If non-NULL on a client connection, the client is presenting a cert → mTLS. */
+
+SEC("uprobe/SSL_get_certificate")
+int probe_ssl_get_cert_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cert_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&ssl_cert_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/SSL_get_certificate")
+int probe_ssl_get_cert_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cert_args_t *args;
+
+    args = bpf_map_lookup_elem(&ssl_cert_args_map, &id);
+    if (!args)
+        return 0;
+
+    void *cert = (void *)PT_REGS_RC(ctx);
+    __u64 ssl_key = (__u64)(unsigned long)args->ssl;
+    __u8 is_mtls = cert ? 1 : 0;
+    bpf_map_update_elem(&mtls_map, &ssl_key, &is_mtls, BPF_ANY);
+
+    bpf_map_delete_elem(&ssl_cert_args_map, &id);
+    return 0;
+}
+
+/* --- Helper: check if connection is mTLS --- */
+
+static __always_inline __u8 get_mtls_status(void *ssl)
+{
+    __u64 key = (__u64)(unsigned long)ssl;
+    __u8 *val = bpf_map_lookup_elem(&mtls_map, &key);
+    if (val)
+        return *val;
+    return 0;  /* Default: unknown/one-way */
+}
+
 /* --- SSL_version probes: capture TLS version per SSL connection ---
  * int SSL_version(const SSL *s) returns TLS1_2_VERSION(0x0303) or
  * TLS1_3_VERSION(0x0304). Called by applications or internally. */
@@ -601,6 +667,7 @@ int probe_ssl_read_return(struct pt_regs *ctx)
 
     enrich_event_with_conn_info(event, id);
     enrich_event_with_cipher(event, args->ssl);
+    event->is_mtls = get_mtls_status(args->ssl);
 
     __u32 read_len = ret;
     if (read_len > MAX_DATA_LEN)
@@ -681,6 +748,7 @@ int probe_ssl_write_return(struct pt_regs *ctx)
 
     enrich_event_with_conn_info(event, id);
     enrich_event_with_cipher(event, args->ssl);
+    event->is_mtls = get_mtls_status(args->ssl);
 
     __u32 write_len = ret;
     if (write_len > MAX_DATA_LEN)
