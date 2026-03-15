@@ -4,6 +4,7 @@
 // All functions are pure (no global state, no side effects).
 
 #define _GNU_SOURCE  /* for memmem() */
+#include <stdio.h>    /* snprintf */
 #include <string.h>
 #include <strings.h>  /* strncasecmp */
 #include <ctype.h>
