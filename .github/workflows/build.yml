@@ -60,27 +60,23 @@ jobs:
           python3 -m unittest tests.test_s3_shipper tests.test_kinesis_shipper -v
 
       - name: SonarQube code analysis
+        if: ${{ secrets.SONAR_TOKEN != '' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         run: |
-          # Download and run sonar-scanner for C code analysis
-          export SONAR_HOST_URL="${{ vars.SONAR_HOST_URL || 'http://localhost:9000' }}"
-          export SONAR_TOKEN="${{ secrets.SONAR_TOKEN || '' }}"
-          if [ -n "${SONAR_TOKEN}" ]; then
-            echo "Running SonarQube analysis..."
-            wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610-linux-x64.zip -O /tmp/sonar.zip
-            unzip -q /tmp/sonar.zip -d /tmp
-            /tmp/sonar-scanner-*/bin/sonar-scanner \
-              -Dsonar.projectKey=ebpf-tls-cli \
-              -Dsonar.sources=src,include \
-              -Dsonar.tests=tests \
-              -Dsonar.language=c \
-              -Dsonar.host.url="${SONAR_HOST_URL}" \
-              -Dsonar.token="${SONAR_TOKEN}" \
-              -Dsonar.sourceEncoding=UTF-8
-            echo "SonarQube analysis complete"
-          else
-            echo "SONAR_TOKEN not set, skipping SonarQube analysis"
-            echo "To enable, add SONAR_TOKEN secret and SONAR_HOST_URL variable to the repository"
-          fi
+          echo "Running SonarQube analysis..."
+          wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610-linux-x64.zip -O /tmp/sonar.zip
+          unzip -q /tmp/sonar.zip -d /tmp
+          /tmp/sonar-scanner-*/bin/sonar-scanner \
+            -Dsonar.projectKey=ebpf-tls-cli \
+            -Dsonar.sources=src,include \
+            -Dsonar.tests=tests \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.login="${SONAR_TOKEN}" \
+            -Dsonar.sourceEncoding=UTF-8 \
+            -Dsonar.exclusions="**/build/**,**/bin/**,**/__pycache__/**"
+          echo "SonarQube analysis complete"
 
       - name: Package release artifacts
         run: |
