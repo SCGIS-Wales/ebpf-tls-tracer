@@ -116,6 +116,47 @@ jobs:
           name: tls_tracer-linux-amd64
           path: tls_tracer-linux-*.tar.gz
 
+  # ---------- ARM64 cross-build via QEMU ----------
+
+  build-arm64:
+    name: Build (arm64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Cross-build arm64 binary via Docker
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/build" -w /build \
+            debian:trixie-slim bash -c '
+              apt-get update && apt-get install -y --no-install-recommends \
+                clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev \
+                linux-libc-dev libc6-dev && \
+              make clean && make all && make test
+            '
+
+      - name: Package arm64 release artifacts
+        run: |
+          mkdir -p release
+          cp bin/tls_tracer release/
+          cp bin/bpf_program.o release/
+          cp README.md release/
+          cp LICENSE release/
+          cd release && tar czf ../tls_tracer-linux-aarch64.tar.gz *
+
+      - name: Upload arm64 build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls_tracer-linux-arm64
+          path: tls_tracer-linux-aarch64.tar.gz
+
   functional-test:
     runs-on: ubuntu-latest
     needs: build
@@ -921,7 +962,7 @@ jobs:
   github-release:
     name: GitHub Release
     if: needs.auto-tag.outputs.created == 'true'
-    needs: [auto-tag]
+    needs: [auto-tag, build-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -929,10 +970,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download build artifacts
+      - name: Download amd64 build artifacts
         uses: actions/download-artifact@v4
         with:
           name: tls_tracer-linux-amd64
+
+      - name: Download arm64 build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: tls_tracer-linux-arm64
 
       - name: Create checksums
         run: sha256sum tls_tracer-linux-*.tar.gz > checksums.txt
@@ -984,6 +1030,9 @@ jobs:
         with:
           ref: ${{ needs.auto-tag.outputs.tag }}
 
+      - name: Set up QEMU (for multi-arch builds)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -1005,10 +1054,11 @@ jobs:
             type=semver,pattern={{major}},value=${{ needs.auto-tag.outputs.tag }}
             type=raw,value=latest
 
-      - name: Build and push container image
+      - name: Build and push multi-arch container image
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
