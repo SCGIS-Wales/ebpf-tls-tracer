@@ -31,6 +31,9 @@ LDFLAGS    := -lbpf -lelf -lz -ldl
 # Source files
 BPF_SRC    := $(SRC_DIR)/bpf_program.c
 TRACER_SRC := $(SRC_DIR)/tls_tracer.c
+PROTO_SRC  := $(SRC_DIR)/protocol.c
+OUTPUT_SRC := $(SRC_DIR)/output.c
+K8S_SRC    := $(SRC_DIR)/k8s.c
 
 # Output files
 BPF_OBJ    := $(BIN_DIR)/bpf_program.o
@@ -60,12 +63,31 @@ $(BPF_OBJ): $(BPF_SRC) $(INCLUDE_DIR)/tracer.h | $(BIN_DIR)
 	@echo "  BPF     $@"
 	@$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
-# Compile user-space tracer
-$(BUILD_DIR)/tls_tracer.o: $(TRACER_SRC) $(INCLUDE_DIR)/tracer.h | $(BUILD_DIR)
+# Compile user-space tracer (multi-object)
+TRACER_HDRS := $(INCLUDE_DIR)/tracer.h $(INCLUDE_DIR)/config.h \
+               $(INCLUDE_DIR)/output.h $(INCLUDE_DIR)/protocol.h \
+               $(INCLUDE_DIR)/k8s.h
+
+$(BUILD_DIR)/tls_tracer.o: $(TRACER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 	@echo "  CC      $@"
 	@$(GCC) $(CFLAGS) -c $< -o $@
 
-$(TRACER_BIN): $(BUILD_DIR)/tls_tracer.o | $(BIN_DIR)
+$(BUILD_DIR)/protocol.o: $(PROTO_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/output.o: $(OUTPUT_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/k8s.o: $(K8S_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
+TRACER_OBJS := $(BUILD_DIR)/tls_tracer.o $(BUILD_DIR)/protocol.o \
+               $(BUILD_DIR)/output.o $(BUILD_DIR)/k8s.o
+
+$(TRACER_BIN): $(TRACER_OBJS) | $(BIN_DIR)
 	@echo "  LD      $@"
 	@$(GCC) -o $@ $^ $(LDFLAGS)
 
