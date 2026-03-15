@@ -1,7 +1,9 @@
 #ifndef TRACER_H
 #define TRACER_H
 
-#ifdef __KERNEL__
+/* BPF programs and libbpf user-space both use linux/types.h.
+ * Only fall back to stdint.h typedefs if linux/types.h is unavailable. */
+#if defined(__KERNEL__) || defined(__bpf__) || defined(__linux__)
 #include <linux/types.h>
 #else
 #include <stdint.h>

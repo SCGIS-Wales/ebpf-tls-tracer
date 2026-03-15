@@ -1,13 +1,44 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>
 #include <linux/ptrace.h>
-#include <linux/socket.h>
-#include <linux/in.h>
-#include <linux/in6.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
 #include "tracer.h"
+
+/* Minimal socket struct definitions for BPF compilation.
+ * BPF programs cannot include full kernel/glibc socket headers,
+ * so we define only what we need inline. */
+#define AF_INET     2
+#define AF_INET6    10
+
+struct sockaddr {
+    unsigned short sa_family;
+    char           sa_data[14];
+};
+
+struct in_addr {
+    __u32 s_addr;
+};
+
+struct sockaddr_in {
+    unsigned short sin_family;
+    __u16          sin_port;
+    struct in_addr sin_addr;
+    char           sin_zero[8];
+};
+
+struct in6_addr {
+    __u8 s6_addr[16];
+};
+
+struct sockaddr_in6 {
+    unsigned short sin6_family;
+    __u16          sin6_port;
+    __u32          sin6_flowinfo;
+    struct in6_addr sin6_addr;
+    __u32          sin6_scope_id;
+};
 
 /* Per-thread map to stash SSL_read/SSL_write arguments between entry and return */
 struct ssl_args_t {
@@ -50,6 +81,40 @@ struct {
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } tls_events SEC(".maps");
+
+/* Per-CPU scratch buffer for tls_event_t (too large for 512-byte BPF stack).
+ * Each CPU gets its own copy, so no locking needed. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct tls_event_t);
+} event_buf SEC(".maps");
+
+/* --- Helper: get zeroed event buffer from per-CPU map --- */
+
+static __always_inline struct tls_event_t *get_event_buf(void)
+{
+    __u32 zero = 0;
+    struct tls_event_t *event = bpf_map_lookup_elem(&event_buf, &zero);
+    if (!event)
+        return 0;
+
+    /* Zero the metadata fields (not the data buffer — it gets overwritten) */
+    event->timestamp_ns = 0;
+    event->pid = 0;
+    event->tid = 0;
+    event->uid = 0;
+    event->data_len = 0;
+    event->tls_version = 0;
+    event->direction = 0;
+    event->event_type = 0;
+    event->addr_family = 0;
+    event->local_port = 0;
+    event->remote_port = 0;
+    event->remote_addr_v4 = 0;
+    return event;
+}
 
 /* --- Helper: populate event with connection info if available --- */
 
@@ -159,25 +224,27 @@ int probe_ssl_read_return(struct pt_regs *ctx)
     if (ret <= 0)
         goto cleanup;
 
-    struct tls_event_t event = {};
-    event.timestamp_ns = bpf_ktime_get_ns();
-    event.pid = id >> 32;
-    event.tid = (__u32)id;
-    event.uid = bpf_get_current_uid_gid();
-    event.direction = DIRECTION_READ;
-    event.event_type = EVENT_TLS_DATA;
-    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup;
 
-    /* Enrich with connection IP/port info */
-    enrich_event_with_conn_info(&event, id);
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->direction = DIRECTION_READ;
+    event->event_type = EVENT_TLS_DATA;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    enrich_event_with_conn_info(event, id);
 
     __u32 read_len = ret;
     if (read_len > MAX_DATA_LEN)
         read_len = MAX_DATA_LEN;
-    event.data_len = read_len;
+    event->data_len = read_len;
 
-    if (bpf_probe_read_user(event.data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0)
-        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0)
+        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
 
 cleanup:
     bpf_map_delete_elem(&ssl_args_map, &id);
@@ -215,25 +282,27 @@ int probe_ssl_write_return(struct pt_regs *ctx)
     if (ret <= 0)
         goto cleanup;
 
-    struct tls_event_t event = {};
-    event.timestamp_ns = bpf_ktime_get_ns();
-    event.pid = id >> 32;
-    event.tid = (__u32)id;
-    event.uid = bpf_get_current_uid_gid();
-    event.direction = DIRECTION_WRITE;
-    event.event_type = EVENT_TLS_DATA;
-    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup;
 
-    /* Enrich with connection IP/port info */
-    enrich_event_with_conn_info(&event, id);
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->direction = DIRECTION_WRITE;
+    event->event_type = EVENT_TLS_DATA;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    enrich_event_with_conn_info(event, id);
 
     __u32 write_len = ret;
     if (write_len > MAX_DATA_LEN)
         write_len = MAX_DATA_LEN;
-    event.data_len = write_len;
+    event->data_len = write_len;
 
-    if (bpf_probe_read_user(event.data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0)
-        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0)
+        bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event, sizeof(*event));
 
 cleanup:
     bpf_map_delete_elem(&ssl_args_map, &id);
