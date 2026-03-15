@@ -463,7 +463,7 @@ jobs:
             fi
 
             # Check for expected fields (required)
-            for field in timestamp pid comm direction dst_ip dst_port data_len transport protocol tls_cipher; do
+            for field in timestamp pid comm direction dst_ip dst_port data_len transport protocol tls_auth; do
               if echo "${FIRST_LINE}" | grep -q "\"${field}\""; then
                 echo "Field '${field}' present in JSON"
               else
@@ -547,6 +547,50 @@ jobs:
             else
               echo "Note: No TLS cipher suite captured (SSL_get_current_cipher may not have been called)"
             fi
+
+            # Check for TLS auth mode (one-way vs mTLS)
+            TLS_AUTH=$(echo "${ALL_JSON}" | grep '"tls_auth"' | head -3 || true)
+            if [ -n "${TLS_AUTH}" ]; then
+              echo "PASS: TLS auth mode present in events:"
+              echo "${TLS_AUTH}" | head -3
+            else
+              echo "Note: No tls_auth field found"
+            fi
+
+            # Check for User-Agent
+            UA_EVENTS=$(echo "${ALL_JSON}" | grep '"user_agent"' | head -3 || true)
+            if [ -n "${UA_EVENTS}" ]; then
+              echo "PASS: User-Agent captured:"
+              echo "${UA_EVENTS}" | head -3
+            else
+              echo "Note: No User-Agent captured"
+            fi
+
+            # Check for Kafka protocol detection
+            KAFKA_EVENTS=$(echo "${ALL_JSON}" | grep '"kafka"' | head -3 || true)
+            if [ -n "${KAFKA_EVENTS}" ]; then
+              echo "PASS: Kafka protocol events captured:"
+              echo "${KAFKA_EVENTS}" | head -3
+            else
+              echo "Note: No Kafka events captured (no Kafka traffic in test)"
+            fi
+
+            # Summary of all detected JSON field types
+            echo ""
+            echo "=== Complete field inventory across all events ==="
+            echo "${ALL_JSON}" | head -50 | python3 -c "
+import sys, json
+fields = set()
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith('{'):
+        try:
+            obj = json.loads(line)
+            fields.update(obj.keys())
+        except: pass
+for f in sorted(fields):
+    print(f'  - {f}')
+" 2>/dev/null || echo "  (python3 JSON parsing unavailable)"
           else
             echo ""
             echo "WARNING: No JSON events captured"
