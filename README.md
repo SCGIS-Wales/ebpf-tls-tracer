@@ -15,47 +15,71 @@ Each captured event includes the **remote IP address** (IPv4 or IPv6) and **port
 - **Low overhead** — uses eBPF perf buffers for efficient kernel-to-user data transfer
 - **Graceful shutdown** with proper resource cleanup on Ctrl+C / SIGTERM
 
-## Prerequisites
+## Quick Start
 
-### Linux Kernel Requirements
+**Option 1 — Pre-built binary** (x86_64 Linux):
 
-**Minimum kernel version: 5.5** (for `bpf_probe_read_user()`). Recommended: **6.1+** for full feature support.
-
-The following kernel configuration options **must be enabled** (all are enabled by default on most modern distributions):
-
-| Config Option | Purpose | Required Since |
-|---|---|---|
-| `CONFIG_BPF=y` | Core BPF subsystem | 4.1 |
-| `CONFIG_BPF_SYSCALL=y` | `bpf()` system call | 4.4 |
-| `CONFIG_BPF_JIT=y` | JIT compiler for BPF programs | 4.1 |
-| `CONFIG_BPF_EVENTS=y` | BPF-based tracing events | 4.4 |
-| `CONFIG_KPROBE_EVENTS=y` | kprobe-based tracing (for IP capture) | 4.1 |
-| `CONFIG_UPROBE_EVENTS=y` | uprobe-based tracing (for SSL hooks) | 4.1 |
-| `CONFIG_DEBUG_INFO_BTF=y` | BTF type info (for CO-RE portability) | 5.2 |
-
-**Verify on your system:**
+Download from [GitHub Releases](https://github.com/SCGIS-Wales/ebpf_tls_cli/releases), then:
 
 ```bash
-# Check kernel version
-uname -r
-
-# Check BTF support (required for modern libbpf)
-ls -la /sys/kernel/btf/vmlinux
-
-# Check BPF JIT
-cat /proc/sys/net/core/bpf_jit_enable   # Should be 1 or 2
-
-# Check kernel config (if available)
-grep -E 'CONFIG_BPF|CONFIG_UPROBE|CONFIG_KPROBE' /boot/config-$(uname -r)
+tar xzf tls_tracer-linux-x86_64.tar.gz
+sudo ./tls_tracer -v
 ```
 
-### Runtime Requirements
+**Option 2 — Docker** (any Linux with kernel 5.5+):
 
-- **Root privileges** or capabilities `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN`
-- **OpenSSL** (`libssl.so`) installed on the target system (auto-detected)
-- **debugfs / tracefs** mounted (usually at `/sys/kernel/debug` or `/sys/kernel/tracing`)
+```bash
+docker pull ghcr.io/scgis-wales/ebpf_tls_cli:latest
+sudo docker run --rm --privileged --pid=host ghcr.io/scgis-wales/ebpf_tls_cli:latest -v
+```
 
-### Build Dependencies
+**Option 3 — Build from source** (see [Building from Source](#building-from-source) below).
+
+## Requirements for Running (CLI)
+
+These are what you need on the **target machine** where the tool will execute:
+
+| Requirement | Details |
+|---|---|
+| **OS** | Linux (x86_64) |
+| **Kernel** | 5.5+ minimum, **6.1+ recommended** |
+| **Privileges** | Root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
+| **OpenSSL** | `libssl.so` must be installed (auto-detected) |
+| **Runtime libs** | `libbpf`, `libelf`, `zlib` |
+| **Filesystems** | debugfs/tracefs mounted (standard on modern distros) |
+
+The following kernel config options must be enabled (they are by default on Ubuntu, Debian, AL2023, Fedora, RHEL 9+):
+
+| Config Option | Purpose |
+|---|---|
+| `CONFIG_BPF=y` | Core BPF subsystem |
+| `CONFIG_BPF_SYSCALL=y` | `bpf()` system call |
+| `CONFIG_BPF_JIT=y` | JIT compiler for BPF programs |
+| `CONFIG_KPROBE_EVENTS=y` | kprobe-based tracing (for IP capture) |
+| `CONFIG_UPROBE_EVENTS=y` | uprobe-based tracing (for SSL hooks) |
+| `CONFIG_DEBUG_INFO_BTF=y` | BTF type info |
+
+**Verify your system:**
+
+```bash
+uname -r                                    # Kernel version (need 5.5+)
+ls /sys/kernel/btf/vmlinux                  # BTF support
+cat /proc/sys/net/core/bpf_jit_enable       # BPF JIT (should be 1 or 2)
+```
+
+**Install runtime dependencies:**
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install libbpf1 libelf1 zlib1g libssl3
+
+# AL2023/RHEL/Fedora
+sudo dnf install libbpf elfutils-libelf zlib openssl-libs
+```
+
+## Building from Source
+
+These are what you need on the **build machine** (can be different from the target):
 
 | Package (Debian/Ubuntu) | Package (RHEL/AL2023/Fedora) | Purpose |
 |---|---|---|
@@ -63,12 +87,10 @@ grep -E 'CONFIG_BPF|CONFIG_UPROBE|CONFIG_KPROBE' /boot/config-$(uname -r)
 | `llvm` | `llvm` | BPF target support |
 | `gcc` | `gcc` | User-space compiler |
 | `make` | `make` | Build system |
-| `libbpf-dev` | `libbpf-devel` | BPF user-space library |
+| `libbpf-dev` | `libbpf-devel` | BPF user-space library (headers + .so) |
 | `libelf-dev` | `elfutils-libelf-devel` | ELF parsing |
 | `zlib1g-dev` | `zlib-devel` | Compression |
-| `linux-libc-dev` | `kernel-headers` | Kernel headers |
-
-## Building
+| `linux-libc-dev` | `kernel-headers` | Kernel headers for BPF compilation |
 
 ```bash
 # Debian/Ubuntu
