@@ -203,7 +203,7 @@ jobs:
         uses: helm/kind-action@v1
         with:
           cluster_name: tls-tracer-ci
-          node_image: kindest/node:v1.35.2
+          node_image: kindest/node:v1.35.1
           wait: 60s
 
       - name: Verify Kubernetes version
