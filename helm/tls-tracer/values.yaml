@@ -3,13 +3,47 @@
 # Deploys as a DaemonSet on every node. Each pod uses eBPF to capture
 # outbound TLS traffic from all processes on the node, including pods
 # in any namespace.
+#
+# Configuration sections:
+#   1. Identity & Naming
+#   2. Image
+#   3. Tracer Settings
+#   4. AWS S3 Log Shipping (sidecar)
+#   5. AWS Kinesis Firehose (sidecar)
+#   6. Service Account & IRSA
+#   7. Pod Configuration
+
+# --- 1. Identity & Naming ---
+
+# Company prefix applied to all resource names and namespace.
+# Example: companyPrefix: "acme-" → resources named "acme-tls-tracer-*"
+companyPrefix: ""
+
+# Metadata for log enrichment and S3/Kinesis path construction
+metadata:
+  # AWS account ID (used in S3/Kinesis paths)
+  awsAccountId: ""
+  # AWS region
+  awsRegion: "eu-west-1"
+  # Application name (e.g., "apigee", "my-app")
+  applicationName: ""
+  # Kubernetes cluster name (EKS cluster name)
+  clusterName: ""
+  # Kubernetes namespace being monitored
+  targetNamespace: ""
+  # Free-text environment label (e.g., "production", "staging")
+  environment: ""
+
+# --- 2. Image ---
 
 image:
   repository: ghcr.io/scgis-wales/ebpf_tls_cli
   tag: "latest"
   pullPolicy: IfNotPresent
 
-# Output format: "json" (recommended for K8s) or "text"
+# --- 3. Tracer Settings ---
+
+# Output format: always "json" for structured logs
 outputFormat: json
 
 # Enable verbose logging (probe attach status, library path)
@@ -24,7 +58,93 @@ filterUid: 0
 # Custom path to libssl.so on the host (empty = auto-detect)
 sslLibPath: ""
 
-# Resource limits
+# URL sanitization patterns (case-insensitive regex)
+# Matches in HTTP paths and Host headers are replaced with [REDACTED]
+# Each entry is a POSIX extended regex (ERE)
+sanitizePatterns:
+  - "apikey=[^&]*"
+  # - "secret=[^&]*"
+  # - "password=[^&]*"
+  # - "token=[^&]*"
+  # - "access_key=[^&]*"
+
+# --- 4. AWS S3 Log Shipping ---
+# Runs a Python sidecar that ships JSON logs to S3 using Apache Hive
+# directory structure. Uses IRSA for authentication.
+
+s3:
+  enabled: false
+  # S3 bucket name (required if enabled)
+  bucket: ""
+  # S3 key prefix (Hive-style partitioning is appended automatically)
+  # Final path: s3://<bucket>/<prefix>/account=<id>/region=<region>/
+  #   cluster=<name>/namespace=<ns>/app=<app>/year=YYYY/month=MM/day=DD/
+  #   hour=HH/<hostname>-<timestamp>.json
+  prefix: "tls-tracer-logs"
+  # IAM role ARN for S3 sidecar (overrides the service account role).
+  # If empty, the sidecar inherits the service account's IRSA role.
+  # The role must trust the same OIDC provider and service account.
+  roleArn: ""
+  # Flush interval in seconds
+  flushIntervalSeconds: 60
+  # Maximum batch size (lines) before flush
+  batchSize: 1000
+  # Resources for S3 sidecar
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 25m
+      memory: 64Mi
+
+# --- 5. AWS Kinesis Firehose ---
+# Runs a Python sidecar that forwards JSON logs to Kinesis Firehose.
+# Uses IRSA for authentication.
+
+kinesis:
+  enabled: false
+  # Kinesis Firehose delivery stream name (required if enabled)
+  deliveryStreamName: ""
+  # AWS region for Kinesis (defaults to metadata.awsRegion)
+  region: ""
+  # IAM role ARN for Kinesis sidecar (overrides the service account role).
+  # If empty, the sidecar inherits the service account's IRSA role.
+  # The role must trust the same OIDC provider and service account.
+  roleArn: ""
+  # Batch size (number of records per PutRecordBatch call)
+  batchSize: 500
+  # Flush interval in seconds
+  flushIntervalSeconds: 30
+  # Resources for Kinesis sidecar
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 25m
+      memory: 64Mi
+
+# --- 6. Service Account & IRSA ---
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+    # For IRSA (IAM Roles for Service Accounts), set:
+    # eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/tls-tracer-role"
+    #
+    # This is the default role for the pod. If you need separate roles for
+    # S3 and Kinesis sidecars, set s3.roleArn and kinesis.roleArn above.
+    # Each role's trust policy must allow the same OIDC provider + this
+    # service account (the IRSA webhook injects the shared OIDC token).
+    #
+    # Required IAM permissions (if using a single combined role):
+    #   S3:      s3:PutObject, s3:GetBucketLocation
+    #   Kinesis: firehose:PutRecord, firehose:PutRecordBatch
+
+# --- 7. Pod Configuration ---
+
 resources:
   limits:
     cpu: 200m
@@ -33,18 +153,9 @@ resources:
     cpu: 50m
     memory: 64Mi
 
-# Node selector (e.g., to run only on specific nodes)
 nodeSelector: {}
 
-# Tolerations (e.g., to run on control-plane nodes)
 tolerations:
   - operator: Exists
 
-# Pod annotations
 podAnnotations: {}
-
-# Service account
-serviceAccount:
-  create: true
-  name: ""
-  annotations: {}

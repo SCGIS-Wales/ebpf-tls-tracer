@@ -28,7 +28,8 @@ COPY Makefile .
 RUN make all && make test
 
 # --- Runtime stage ---
-FROM debian:trixie-slim
+# Python 3.14 on Debian trixie — gives us Python + pip out of the box
+FROM python:3.14-slim-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -37,12 +38,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libelf1 \
     zlib1g \
     libssl3t64 \
+    && pip install --no-cache-dir boto3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/tls_tracer
 
 COPY --from=builder /build/bin/tls_tracer ./tls_tracer
 COPY --from=builder /build/bin/bpf_program.o ./bpf_program.o
+COPY scripts/s3_shipper.py ./scripts/s3_shipper.py
+COPY scripts/kinesis_shipper.py ./scripts/kinesis_shipper.py
 
 ENTRYPOINT ["./tls_tracer"]
 CMD ["--help"]
