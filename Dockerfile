@@ -28,7 +28,8 @@ COPY Makefile .
 RUN make all && make test
 
 # --- Runtime stage ---
-FROM debian:trixie-slim
+# Python 3.14 on Debian trixie — gives us Python + pip out of the box
+FROM python:3.14-slim-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -37,16 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libelf1 \
     zlib1g \
     libssl3t64 \
-    python3 \
-    python3-pip \
-    python3-venv \
-    && python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir boto3 \
-    && apt-get purge -y python3-pip python3-venv \
-    && apt-get autoremove -y \
+    && pip install --no-cache-dir boto3 \
     && rm -rf /var/lib/apt/lists/*
-
-ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /opt/tls_tracer
 
