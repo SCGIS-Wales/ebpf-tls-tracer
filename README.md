@@ -133,7 +133,32 @@ Each event is a single self-contained JSON line (NDJSON). Fields are only presen
 ### Example
 
 ```json
-{"timestamp":"2026-03-15T10:30:00.123456Z","timestamp_ns":123456789,"pid":1234,"tid":1234,"uid":1000,"comm":"curl","direction":"REQUEST","src_ip":"10.0.5.23","src_port":54321,"dst_ip":"93.184.216.34","dst_port":443,"data_len":78,"conn_id":"1234:7","dst_dns":"example.com","tls_version":"1.3","tls_cipher":"TLS_AES_256_GCM_SHA384","tls_auth":"one-way","transport":"tls","protocol":"https","http_version":"2","http_method":"GET","http_path":"/api/v1/status","http_host":"example.com","user_agent":"curl/8.5.0"}
+{
+  "timestamp": "2026-03-15T10:30:00.123456Z",
+  "timestamp_ns": 123456789,
+  "pid": 1234,
+  "tid": 1234,
+  "uid": 1000,
+  "comm": "curl",
+  "direction": "REQUEST",
+  "src_ip": "10.0.5.23",
+  "src_port": 54321,
+  "dst_ip": "93.184.216.34",
+  "dst_port": 443,
+  "data_len": 78,
+  "conn_id": "1234:7",
+  "dst_dns": "example.com",
+  "tls_version": "1.3",
+  "tls_cipher": "TLS_AES_256_GCM_SHA384",
+  "tls_auth": "one-way",
+  "transport": "tls",
+  "protocol": "https",
+  "http_version": "2",
+  "http_method": "GET",
+  "http_path": "/api/v1/status",
+  "http_host": "example.com",
+  "user_agent": "curl/8.5.0"
+}
 ```
 
 ### Field Reference
