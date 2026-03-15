@@ -49,6 +49,12 @@ spec:
             - name: usr-src
               mountPath: /usr/src
               readOnly: true
+            - name: host-ssl
+              mountPath: /host/usr/lib64
+              readOnly: true
+            - name: host-ssl-x86
+              mountPath: /host/usr/lib/x86_64-linux-gnu
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -81,3 +87,11 @@ spec:
         - name: usr-src
           hostPath:
             path: /usr/src
+        - name: host-ssl
+          hostPath:
+            path: /usr/lib64
+            type: DirectoryOrCreate
+        - name: host-ssl-x86
+          hostPath:
+            path: /usr/lib/x86_64-linux-gnu
+            type: DirectoryOrCreate

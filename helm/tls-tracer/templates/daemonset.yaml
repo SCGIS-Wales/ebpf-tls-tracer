@@ -130,10 +130,10 @@ spec:
             - name: bpffs
               mountPath: /sys/fs/bpf
             - name: host-ssl
-              mountPath: /usr/lib64
+              mountPath: /host/usr/lib64
               readOnly: true
             - name: host-ssl-x86
-              mountPath: /usr/lib/x86_64-linux-gnu
+              mountPath: /host/usr/lib/x86_64-linux-gnu
               readOnly: true
             {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
             - name: log-pipe
