@@ -70,7 +70,7 @@ struct tls_event_t {
     __u8  direction;         /* DIRECTION_READ or DIRECTION_WRITE */
     __u8  event_type;
     __u8  addr_family;       /* ADDR_FAMILY_IPV4 or ADDR_FAMILY_IPV6 */
-    __u8  _pad[1];
+    __u8  is_mtls;           /* 1 = mutual TLS (client cert present), 0 = one-way */
     __s16 error_code;        /* errno for connect errors, SSL ret for TLS errors */
     __u16 local_port;
     __u16 remote_port;

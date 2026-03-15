@@ -120,6 +120,7 @@ static void test_zero_init(void)
     ASSERT_EQ(event.direction, 0, "direction should be 0 (READ)");
     ASSERT_EQ(event.event_type, 0, "event_type should be 0");
     ASSERT_EQ(event.addr_family, 0, "addr_family should be 0");
+    ASSERT_EQ(event.is_mtls, 0, "is_mtls should be 0");
     ASSERT_EQ(event.error_code, 0, "error_code should be 0");
     ASSERT_EQ(event.remote_port, 0, "remote_port should be 0");
     ASSERT_EQ(event.local_port, 0, "local_port should be 0");

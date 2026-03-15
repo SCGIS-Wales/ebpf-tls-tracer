@@ -23,7 +23,7 @@
 
 #define PERF_BUFFER_PAGES  64
 #define PERF_POLL_TIMEOUT  100
-#define MAX_PROBES         14
+#define MAX_PROBES         16
 #define MAX_SANITIZE_PATTERNS 32
 
 static volatile sig_atomic_t exiting = 0;
@@ -935,6 +935,9 @@ static void handle_event(void *ctx, int cpu __attribute__((unused)),
             print_json_string(cipher_safe);
         }
 
+        /* TLS authentication mode: one-way or mutual (mTLS) */
+        printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
+
         printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
 
         /* HTTP version: from request line or inferred from HTTP/2 detection */
@@ -1276,8 +1279,10 @@ int main(int argc, char **argv)
         "probe_ssl_version_return",
         "probe_ssl_get_cipher_enter",
         "probe_ssl_get_cipher_return",
+        "probe_ssl_get_cert_enter",
+        "probe_ssl_get_cert_return",
     };
-    int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1};
+    int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
     const char *func_names[] = {
         "SSL_read",
         "SSL_read",
@@ -1287,10 +1292,12 @@ int main(int argc, char **argv)
         "SSL_version",
         "SSL_get_current_cipher",
         "SSL_get_current_cipher",
+        "SSL_get_certificate",
+        "SSL_get_certificate",
     };
 
     int uprobe_count = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 10; i++) {
         prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
         if (!prog) {
             fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
@@ -1326,7 +1333,7 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 8);
+        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 10);
 
     /* Set up perf buffer */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");

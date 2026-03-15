@@ -474,7 +474,7 @@ jobs:
             # Check for enriched fields (best-effort — may not appear on every event)
             echo ""
             echo "=== Checking enriched fields across all events ==="
-            for field in src_ip src_port dst_dns http_version tls_version tls_cipher http_method http_path http_host user_agent; do
+            for field in src_ip src_port dst_dns http_version tls_version tls_cipher tls_auth http_method http_path http_host user_agent; do
               if echo "${JSON_LINES}" | grep -q "\"${field}\""; then
                 echo "Enriched field '${field}' found in events"
               else
