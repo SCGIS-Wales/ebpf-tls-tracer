@@ -709,26 +709,26 @@ int probe_ssl_read_return(struct pt_regs *ctx)
     int ssl_fd = get_ssl_fd(args->ssl);
 
     if (ret <= 0) {
-        /* SSL_read error: ret 0 = connection closed, ret < 0 = error.
-         * Emit a TLS error event so userspace can log the failure. */
-        if (ret < 0) {
-            struct tls_event_t *err_event = get_event_buf();
-            if (err_event) {
-                err_event->timestamp_ns = bpf_ktime_get_ns();
-                err_event->pid = id >> 32;
-                err_event->tid = (__u32)id;
-                err_event->uid = bpf_get_current_uid_gid();
-                err_event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
-                err_event->direction = DIRECTION_READ;
-                err_event->event_type = EVENT_TLS_ERROR;
-                err_event->error_code = (__s16)ret;
-                err_event->tls_version = get_tls_version(args->ssl);
-                err_event->data_len = 0;
-                bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
-                enrich_event_with_conn_info(err_event, id);
-                bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
-                                      err_event, sizeof(*err_event));
-            }
+        /* SSL_read returns: 0 = peer closed connection, <0 = error.
+         * Emit EVENT_TLS_CLOSE for ret==0, EVENT_TLS_ERROR for ret<0 (#3 fix). */
+        struct tls_event_t *err_event = get_event_buf();
+        if (err_event) {
+            err_event->timestamp_ns = bpf_ktime_get_ns();
+            err_event->pid = id >> 32;
+            err_event->tid = (__u32)id;
+            err_event->uid = bpf_get_current_uid_gid();
+            err_event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
+            err_event->direction = DIRECTION_READ;
+            err_event->event_type = (ret == 0) ? EVENT_TLS_CLOSE : EVENT_TLS_ERROR;
+            err_event->error_code = (__s16)ret;
+            err_event->tls_version = get_tls_version(args->ssl);
+            err_event->data_len = 0;
+            bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
+            enrich_event_with_conn_info(err_event, id);
+            enrich_event_with_cipher(err_event, args->ssl);
+            err_event->is_mtls = get_mtls_status(args->ssl);
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
+                                  err_event, sizeof(*err_event));
         }
         goto cleanup;
     }
@@ -797,25 +797,25 @@ int probe_ssl_write_return(struct pt_regs *ctx)
     int ssl_fd = get_ssl_fd(args->ssl);
 
     if (ret <= 0) {
-        /* SSL_write error: emit TLS error event */
-        if (ret < 0) {
-            struct tls_event_t *err_event = get_event_buf();
-            if (err_event) {
-                err_event->timestamp_ns = bpf_ktime_get_ns();
-                err_event->pid = id >> 32;
-                err_event->tid = (__u32)id;
-                err_event->uid = bpf_get_current_uid_gid();
-                err_event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
-                err_event->direction = DIRECTION_WRITE;
-                err_event->event_type = EVENT_TLS_ERROR;
-                err_event->error_code = (__s16)ret;
-                err_event->tls_version = get_tls_version(args->ssl);
-                err_event->data_len = 0;
-                bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
-                enrich_event_with_conn_info(err_event, id);
-                bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
-                                      err_event, sizeof(*err_event));
-            }
+        /* SSL_write returns: 0 = connection closed, <0 = error (#3 fix) */
+        struct tls_event_t *err_event = get_event_buf();
+        if (err_event) {
+            err_event->timestamp_ns = bpf_ktime_get_ns();
+            err_event->pid = id >> 32;
+            err_event->tid = (__u32)id;
+            err_event->uid = bpf_get_current_uid_gid();
+            err_event->fd = ssl_fd >= 0 ? (__u32)ssl_fd : 0;
+            err_event->direction = DIRECTION_WRITE;
+            err_event->event_type = (ret == 0) ? EVENT_TLS_CLOSE : EVENT_TLS_ERROR;
+            err_event->error_code = (__s16)ret;
+            err_event->tls_version = get_tls_version(args->ssl);
+            err_event->data_len = 0;
+            bpf_get_current_comm(&err_event->comm, sizeof(err_event->comm));
+            enrich_event_with_conn_info(err_event, id);
+            enrich_event_with_cipher(err_event, args->ssl);
+            err_event->is_mtls = get_mtls_status(args->ssl);
+            bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU,
+                                  err_event, sizeof(*err_event));
         }
         goto cleanup;
     }
