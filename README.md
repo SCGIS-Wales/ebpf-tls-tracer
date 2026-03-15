@@ -144,6 +144,7 @@ Each event is a single self-contained JSON line (NDJSON). Fields are only presen
 | `dst_ip` / `dst_port` | string/int | Remote IP address and port |
 | `data_len` | integer | Captured plaintext data length |
 | `conn_id` | string | Connection identifier (`pid:fd`) for event correlation |
+| `host_ip` | string | EC2/node IP address (from `HOST_IP` env var or auto-detected) |
 | `dst_dns` | string | Hostname from HTTP Host header (cached per connection) |
 | `tls_version` | string | TLS version: `1.0`, `1.1`, `1.2`, `1.3` |
 | `tls_cipher` | string | Negotiated cipher suite (e.g., `TLS_AES_256_GCM_SHA384`) |

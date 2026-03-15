@@ -590,7 +590,7 @@ jobs:
             # Check for enriched fields (best-effort — may not appear on every event)
             echo ""
             echo "=== Checking enriched fields across all events ==="
-            for field in src_ip src_port dst_dns http_version tls_version tls_cipher tls_auth http_method http_path http_host user_agent; do
+            for field in src_ip src_port dst_dns http_version tls_version tls_cipher tls_auth http_method http_path http_host user_agent host_ip k8s_pod k8s_namespace container_id; do
               if echo "${JSON_LINES}" | grep -q "\"${field}\""; then
                 echo "Enriched field '${field}' found in events"
               else
@@ -680,6 +680,43 @@ jobs:
               echo "${UA_EVENTS}" | head -3
             else
               echo "Note: No User-Agent captured"
+            fi
+
+            # Check for host_ip (EC2/node IP enrichment)
+            HOST_IP_EVENTS=$(echo "${ALL_JSON}" | grep '"host_ip"' | head -3 || true)
+            if [ -n "${HOST_IP_EVENTS}" ]; then
+              echo "PASS: host_ip field present (node/EC2 IP enrichment working):"
+              echo "${HOST_IP_EVENTS}" | head -1 | python3 -c "import sys,json; e=json.load(sys.stdin); print(f'  host_ip={e[\"host_ip\"]}')" 2>/dev/null || true
+            else
+              echo "Note: No host_ip field (HOST_IP env var not set or no non-loopback interface found)"
+            fi
+
+            # Check for K8s metadata enrichment (pod name, namespace, container ID)
+            echo ""
+            echo "=== Checking K8s metadata enrichment ==="
+            K8S_POD=$(echo "${ALL_JSON}" | grep '"k8s_pod"' | head -3 || true)
+            if [ -n "${K8S_POD}" ]; then
+              echo "PASS: k8s_pod field present (pod name detected from /proc/<pid>/environ):"
+              echo "${K8S_POD}" | head -1 | python3 -c "import sys,json; e=json.load(sys.stdin); print(f'  k8s_pod={e.get(\"k8s_pod\",\"-\")}, k8s_namespace={e.get(\"k8s_namespace\",\"-\")}')" 2>/dev/null || true
+            else
+              echo "Note: No k8s_pod field — the originating pod may not have POD_NAME env var set"
+              echo "      (The test pod apigee-test-client has it set via downward API, but events"
+              echo "       may come from other processes on the node that don't have it)"
+            fi
+
+            K8S_NS=$(echo "${ALL_JSON}" | grep '"k8s_namespace"' | head -3 || true)
+            if [ -n "${K8S_NS}" ]; then
+              echo "PASS: k8s_namespace field present"
+            else
+              echo "Note: No k8s_namespace field"
+            fi
+
+            CONTAINER_ID=$(echo "${ALL_JSON}" | grep '"container_id"' | head -3 || true)
+            if [ -n "${CONTAINER_ID}" ]; then
+              echo "PASS: container_id field present (detected from /proc/<pid>/cgroup):"
+              echo "${CONTAINER_ID}" | head -1 | python3 -c "import sys,json; e=json.load(sys.stdin); print(f'  container_id={e.get(\"container_id\",\"-\")}')" 2>/dev/null || true
+            else
+              echo "Note: No container_id field (cgroup format may not match expected patterns)"
             fi
 
             # Check for Kafka protocol detection
