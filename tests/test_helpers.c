@@ -214,9 +214,11 @@ static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
     if (ak < 0 || ak > 74) return 0;
     int av = (int)(short)(((unsigned char)data[6] << 8) | (unsigned char)data[7]);
     if (av < 0 || av > 20) return 0;
+    /* H-3 fix: corr_id must be > 0 (not just >= 0) to match tls_tracer.c.
+     * Issue 3 fix: correlation_id == 0 causes false positives from HTTP/2 frames. */
     int corr_id = (int)(((unsigned char)data[8] << 24) | ((unsigned char)data[9] << 16) |
                         ((unsigned char)data[10] << 8) | (unsigned char)data[11]);
-    if (corr_id < 0) return 0;
+    if (corr_id <= 0) return 0;
     int cid_len = (int)(short)(((unsigned char)data[12] << 8) | (unsigned char)data[13]);
     if (cid_len < -1 || cid_len > 1024) return 0;
     if (cid_len > 0 && len < (unsigned)(14 + cid_len)) return 0;

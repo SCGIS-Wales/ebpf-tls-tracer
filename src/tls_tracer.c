@@ -20,6 +20,8 @@
 #include <arpa/inet.h>
 #include <limits.h>  /* for ULONG_MAX */
 #include <sys/stat.h>  /* for mkdir() */
+#include <sys/utsname.h>  /* for uname() — C-3 kernel version check */
+#include <fcntl.h>     /* for O_RDONLY — H-4 bounded /proc read */
 #include <dlfcn.h>     /* dlopen/dlsym for R1-REL OpenSSL version check */
 #include <ifaddrs.h>   /* getifaddrs() for host IP auto-detection */
 #include <net/if.h>    /* IFF_LOOPBACK */
@@ -293,35 +295,37 @@ struct k8s_meta {
 };
 
 /* Read an environment variable from /proc/<pid>/environ */
+/* H-4 fix: Limit read to 4KB to reduce information exposure.
+ * The tracer runs as root with hostPID:true and could read secrets from
+ * other processes' environ. Bounded read limits the window. Uses raw
+ * open/read instead of getdelim to avoid unbounded heap allocation. */
 static int read_proc_env(pid_t pid, const char *var_name, char *buf, size_t buflen)
 {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
-    FILE *f = fopen(path, "r");
-    if (!f)
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
         return -1;
 
-    size_t var_len = strlen(var_name);
-    char *block = NULL;
-    size_t block_len = 0;
-    ssize_t n = getdelim(&block, &block_len, '\0', f);
+    char block[4096];
+    ssize_t n = read(fd, block, sizeof(block) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    block[n] = '\0';
 
-    while (n > 0) {
-        if ((size_t)n > var_len && block[var_len] == '=' &&
-            strncmp(block, var_name, var_len) == 0) {
-            snprintf(buf, buflen, "%s", block + var_len + 1);
-            /* Remove trailing newline/null artifacts */
-            size_t len = strlen(buf);
-            while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-                buf[--len] = '\0';
-            free(block);
-            fclose(f);
+    size_t var_len = strlen(var_name);
+    char *p = block;
+    char *end = block + n;
+    while (p < end) {
+        size_t entry_len = strnlen(p, (size_t)(end - p));
+        if (entry_len > var_len && p[var_len] == '=' &&
+            strncmp(p, var_name, var_len) == 0) {
+            snprintf(buf, buflen, "%s", p + var_len + 1);
             return 0;
         }
-        n = getdelim(&block, &block_len, '\0', f);
+        p += entry_len + 1;
     }
-    free(block);
-    fclose(f);
     return -1;
 }
 
@@ -361,13 +365,8 @@ static int read_container_id(pid_t pid, char *buf, size_t buflen)
                     end = strchr(id_start, '\n');
                 if (end) {
                     size_t id_len = (size_t)(end - id_start);
-                    if (id_len >= buflen)
-                        id_len = buflen - 1;
-                    strncpy(buf, id_start, id_len);
-                    buf[id_len] = '\0';
-                    /* Truncate to first 12 chars (short container ID) */
-                    if (strlen(buf) > 12)
-                        buf[12] = '\0';
+                    if (id_len > 12) id_len = 12;  /* short container ID */
+                    snprintf(buf, buflen, "%.*s", (int)id_len, id_start);
                     fclose(f);
                     return 0;
                 }
@@ -387,8 +386,7 @@ static int read_container_id(pid_t pid, char *buf, size_t buflen)
                 }
             }
             if (is_hex) {
-                strncpy(buf, id, 12);
-                buf[12] = '\0';
+                snprintf(buf, buflen, "%.12s", id);
                 fclose(f);
                 return 0;
             }
@@ -476,6 +474,27 @@ static void k8s_cache_store(pid_t pid, const struct k8s_meta *meta)
     k8s_cache[idx].last_seen = now;
     k8s_cache[idx].meta = *meta;
     k8s_cache[idx].valid = 1;
+}
+
+/* M-3 fix: Rate-limited wrapper for get_k8s_meta to prevent /proc I/O storm
+ * under high PID churn (e.g. Kubernetes Jobs, CronJobs, init containers). */
+#define MAX_PROC_READS_PER_SEC 50
+static time_t last_proc_read_sec = 0;
+static int proc_reads_this_sec = 0;
+
+static void get_k8s_meta_ratelimited(pid_t pid, struct k8s_meta *meta)
+{
+    time_t now = time(NULL);
+    if (now != last_proc_read_sec) {
+        last_proc_read_sec = now;
+        proc_reads_this_sec = 0;
+    }
+    if (proc_reads_this_sec >= MAX_PROC_READS_PER_SEC) {
+        memset(meta, 0, sizeof(*meta));
+        return;
+    }
+    proc_reads_this_sec++;
+    get_k8s_meta(pid, meta);
 }
 
 /* --- HTTP Layer 7 parsing --- */
@@ -796,10 +815,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
         while (ver_end < data_end && *ver_end != ' ' && *ver_end != '\r')
             ver_end++;
         size_t ver_len = (size_t)(ver_end - ver_start);
-        if (ver_len > 0 && ver_len < sizeof(info->version)) {
-            strncpy(info->version, ver_start, ver_len);
-            info->version[ver_len] = '\0';
-        }
+        if (ver_len > 0 && ver_len < sizeof(info->version))
+            snprintf(info->version, sizeof(info->version), "%.*s", (int)ver_len, ver_start);
         /* Parse status code: "HTTP/1.1 200 OK" → 200 */
         if (ver_end < data_end && *ver_end == ' ') {
             const char *status_start = ver_end + 1;
@@ -821,9 +838,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
     for (int i = 0; methods[i]; i++) {
         size_t mlen = strlen(methods[i]);
         if (len >= mlen && strncmp(data, methods[i], mlen) == 0) {
-            /* Copy method (without trailing space) */
-            strncpy(info->method, methods[i], mlen - 1);
-            info->method[mlen - 1] = '\0';
+            /* M-1 fix: use snprintf instead of strncpy for guaranteed NUL-termination */
+            snprintf(info->method, sizeof(info->method), "%.*s", (int)(mlen - 1), methods[i]);
 
             /* Extract path: from after method to next space or \r\n */
             const char *path_start = data + mlen;
@@ -833,10 +849,7 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
                    *path_end != '\r' && *path_end != '\n')
                 path_end++;
             size_t path_len = (size_t)(path_end - path_start);
-            if (path_len >= sizeof(info->path))
-                path_len = sizeof(info->path) - 1;
-            strncpy(info->path, path_start, path_len);
-            info->path[path_len] = '\0';
+            snprintf(info->path, sizeof(info->path), "%.*s", (int)path_len, path_start);
             found = 1;
             break;
         }
@@ -861,10 +874,7 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
             while (ver_end < s_end && *ver_end != '\r' && *ver_end != '\n' && *ver_end != ' ')
                 ver_end++;
             size_t ver_len = (size_t)(ver_end - http_ver);
-            if (ver_len >= sizeof(info->version))
-                ver_len = sizeof(info->version) - 1;
-            strncpy(info->version, http_ver, ver_len);
-            info->version[ver_len] = '\0';
+            snprintf(info->version, sizeof(info->version), "%.*s", (int)ver_len, http_ver);
         }
     }
 
@@ -893,10 +903,7 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
                 while (val_end < end && *val_end != '\r' && *val_end != '\n')
                     val_end++;
                 size_t ua_len = (size_t)(val_end - val);
-                if (ua_len >= sizeof(info->user_agent))
-                    ua_len = sizeof(info->user_agent) - 1;
-                strncpy(info->user_agent, val, ua_len);
-                info->user_agent[ua_len] = '\0';
+                snprintf(info->user_agent, sizeof(info->user_agent), "%.*s", (int)ua_len, val);
             } else if (remaining >= 8 && strncasecmp(hdr, "Upgrade:", 8) == 0) {
                 const char *val = hdr + 8;
                 while (val < end && (*val == ' ' || *val == '\t'))
@@ -923,10 +930,7 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
         while (host_end < end && *host_end != '\r' && *host_end != '\n')
             host_end++;
         size_t host_len = (size_t)(host_end - host_hdr);
-        if (host_len >= sizeof(info->host))
-            host_len = sizeof(info->host) - 1;
-        strncpy(info->host, host_hdr, host_len);
-        info->host[host_len] = '\0';
+        snprintf(info->host, sizeof(info->host), "%.*s", (int)host_len, host_hdr);
     }
 }
 
@@ -1150,7 +1154,7 @@ static int handle_event(void *ctx, void *data, size_t size)
         /* K8s metadata enrichment (R-3 fix: cached per PID to avoid /proc I/O storm) */
         struct k8s_meta meta;
         if (!k8s_cache_lookup((pid_t)event->pid, &meta)) {
-            get_k8s_meta((pid_t)event->pid, &meta);
+            get_k8s_meta_ratelimited((pid_t)event->pid, &meta);
             k8s_cache_store((pid_t)event->pid, &meta);
         }
 
@@ -1873,6 +1877,23 @@ int main(int argc, char **argv)
     /* P4-PERF: Use line-buffered stdout instead of per-event fflush.
      * This achieves the same line-at-a-time semantics with fewer syscalls. */
     setlinebuf(stdout);
+
+    /* C-3 fix: Log kernel version for CVE-2025-40319 ring buffer race condition.
+     * Warn if kernel < 6.12.8 which may be affected. */
+    {
+        struct utsname uts;
+        if (uname(&uts) == 0) {
+            fprintf(stderr, "Kernel: %s\n", uts.release);
+            int major = 0, minor = 0, patch = 0;
+            if (sscanf(uts.release, "%d.%d.%d", &major, &minor, &patch) >= 2) {
+                if (major < 6 || (major == 6 && minor < 12) ||
+                    (major == 6 && minor == 12 && patch < 8))
+                    fprintf(stderr, "Warning: Kernel %s may be affected by CVE-2025-40319 "
+                            "(BPF ring buffer race condition). Consider upgrading to >= 6.12.8.\n",
+                            uts.release);
+            }
+        }
+    }
 
     /* R-7 fix: Pre-flight checks for required kernel features.
      * These give clear, actionable errors instead of cryptic libbpf failures. */

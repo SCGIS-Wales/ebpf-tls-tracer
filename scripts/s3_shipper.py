@@ -150,6 +150,21 @@ def flush_batch(s3_client, batch):
     return False
 
 
+def rotate_log_if_needed(path, max_bytes=200 * 1024 * 1024):
+    """H-6 fix: Truncate log file after successful upload if it exceeds threshold.
+    Prevents disk exhaustion and pod eviction from emptyDir sizeLimit."""
+    try:
+        size = os.path.getsize(path)
+        if size > max_bytes:
+            with open(path, 'w') as f:
+                f.truncate(0)
+            log("INFO", f"Rotated {path} (was {size // (1024*1024)}MB)")
+            return 0  # Reset offset since file was truncated
+    except OSError:
+        pass
+    return None  # No rotation needed
+
+
 def tail_file(path, offset, last_inode):
     """Read new lines from file starting at offset. Returns (lines, new_offset, inode).
 
@@ -211,7 +226,11 @@ def main():
 
         now = time.time()
         if len(batch) >= BATCH_SIZE or (now - last_flush >= FLUSH_INTERVAL and batch):
-            flush_batch(s3, batch)
+            if flush_batch(s3, batch):
+                # H-6 fix: rotate log after successful upload to prevent disk exhaustion
+                new_offset = rotate_log_if_needed(LOG_FILE)
+                if new_offset is not None:
+                    offset = new_offset
             batch = []
             last_flush = now
 

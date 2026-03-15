@@ -25,6 +25,8 @@ spec:
           image: ghcr.io/scgis-wales/ebpf-tls-tracer:latest
           args: ["-f", "json", "-v"]
           securityContext:
+            # H-2: privileged:true required for eBPF bpf() syscall and probe attachment.
+            # seccompProfile is not set because privileged:true overrides seccomp.
             privileged: true
             readOnlyRootFilesystem: true
           volumeMounts:
