@@ -21,6 +21,8 @@
 #include <limits.h>  /* for ULONG_MAX */
 #include <sys/stat.h>  /* for mkdir() */
 #include <dlfcn.h>     /* dlopen/dlsym for R1-REL OpenSSL version check */
+#include <ifaddrs.h>   /* getifaddrs() for host IP auto-detection */
+#include <net/if.h>    /* IFF_LOOPBACK */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "tracer.h"
@@ -153,6 +155,7 @@ struct config {
     int             data_only;
     int             verbose;
     int             enable_quic;    /* P5-PERF: optional QUIC probe (--quic flag) */
+    char            host_ip[INET6_ADDRSTRLEN];  /* EC2/node host IP for JSON enrichment */
     struct sanitize_pattern sanitize[MAX_SANITIZE_PATTERNS];
     int             sanitize_count;
 };
@@ -1028,6 +1031,8 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
+            if (c->host_ip[0])
+                printf(",\"host_ip\":\"%s\"", c->host_ip);
             printf(",\"event_type\":\"tcp_error\","
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"error_code\":%d,\"error\":\"%s\"}\n",
@@ -1053,6 +1058,8 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
+            if (c->host_ip[0])
+                printf(",\"host_ip\":\"%s\"", c->host_ip);
             printf(",\"event_type\":\"tls_close\","
                    "\"direction\":\"%s\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
@@ -1094,6 +1101,8 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
+            if (c->host_ip[0])
+                printf(",\"host_ip\":\"%s\"", c->host_ip);
             printf(",\"event_type\":\"tls_error\","
                    "\"direction\":\"%s\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
@@ -1122,6 +1131,8 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                    (unsigned long long)event->timestamp_ns,
                    event->pid, event->tid, event->uid);
             print_json_string_n(event->comm, MAX_COMM_LEN);
+            if (c->host_ip[0])
+                printf(",\"host_ip\":\"%s\"", c->host_ip);
             printf(",\"event_type\":\"quic_detected\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -1157,6 +1168,8 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
                (unsigned long long)event->timestamp_ns,
                event->pid, event->tid, event->uid);
         print_json_string_n(event->comm, MAX_COMM_LEN);
+        if (c->host_ip[0])
+            printf(",\"host_ip\":\"%s\"", c->host_ip);
         printf(",\"direction\":\"%s\","
                "\"src_ip\":\"%s\",\"src_port\":%u,"
                "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -1665,6 +1678,52 @@ static void validate_openssl_version(const char *ssl_lib_path)
     dlclose(handle);
 }
 
+/* Detect the host/node IP address for JSON event enrichment.
+ * Priority: 1) HOST_IP env var (set via K8s downward API status.hostIP)
+ *           2) First non-loopback IPv4 address from network interfaces
+ * On EC2 with hostNetwork:true, this gives the instance's VPC IP. */
+static void detect_host_ip(char *buf, size_t buflen)
+{
+    buf[0] = '\0';
+
+    /* 1. Check HOST_IP environment variable (K8s downward API) */
+    const char *env_ip = getenv("HOST_IP");
+    if (env_ip && env_ip[0]) {
+        snprintf(buf, buflen, "%s", env_ip);
+        return;
+    }
+
+    /* Also check NODE_IP (alternative naming convention) */
+    env_ip = getenv("NODE_IP");
+    if (env_ip && env_ip[0]) {
+        snprintf(buf, buflen, "%s", env_ip);
+        return;
+    }
+
+    /* 2. Auto-detect: first non-loopback IPv4 address */
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == -1)
+        return;
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr)
+            continue;
+        /* Skip loopback and down interfaces */
+        if (ifa->ifa_flags & IFF_LOOPBACK)
+            continue;
+        if (!(ifa->ifa_flags & IFF_UP))
+            continue;
+
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, buf, buflen);
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+}
+
 int main(int argc, char **argv)
 {
     struct bpf_object *obj = NULL;
@@ -1792,6 +1851,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "Using SSL library: %s\n", cfg.ssl_lib);
 
     validate_openssl_version(cfg.ssl_lib);
+
+    /* Detect host/node IP for JSON enrichment (EC2 instance IP) */
+    detect_host_ip(cfg.host_ip, sizeof(cfg.host_ip));
+    if (cfg.host_ip[0] && cfg.verbose)
+        fprintf(stderr, "Host IP: %s\n", cfg.host_ip);
 
     /* Set up signal handlers (R6 fix: use sigaction for reliable signal handling).
      * signal() has undefined behavior on some systems — the handler may be reset
