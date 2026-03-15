@@ -361,34 +361,39 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
         }
     }
 
-    if (!found)
-        return;
-
-    /* Extract HTTP version from request line: "METHOD /path HTTP/1.1\r\n" */
-    const char *http_ver = NULL;
-    const char *p = data;
-    const char *end = data + len;
-    /* Scan for "HTTP/" in the request line (before first \r\n) */
-    for (const char *s = p; s < end - 8; s++) {
-        if (*s == '\r' || *s == '\n')
-            break;
-        if (strncmp(s, "HTTP/", 5) == 0) {
-            http_ver = s + 5;
-            break;
+    /* Extract HTTP version from request line if we found a method */
+    if (found) {
+        const char *http_ver = NULL;
+        const char *s = data;
+        const char *s_end = data + len;
+        /* Scan for "HTTP/" in the request line (before first \r\n) */
+        for (; s < s_end - 8; s++) {
+            if (*s == '\r' || *s == '\n')
+                break;
+            if (strncmp(s, "HTTP/", 5) == 0) {
+                http_ver = s + 5;
+                break;
+            }
+        }
+        if (http_ver) {
+            const char *ver_end = http_ver;
+            while (ver_end < s_end && *ver_end != '\r' && *ver_end != '\n' && *ver_end != ' ')
+                ver_end++;
+            size_t ver_len = (size_t)(ver_end - http_ver);
+            if (ver_len >= sizeof(info->version))
+                ver_len = sizeof(info->version) - 1;
+            strncpy(info->version, http_ver, ver_len);
+            info->version[ver_len] = '\0';
         }
     }
-    if (http_ver) {
-        const char *ver_end = http_ver;
-        while (ver_end < end && *ver_end != '\r' && *ver_end != '\n' && *ver_end != ' ')
-            ver_end++;
-        size_t ver_len = (size_t)(ver_end - http_ver);
-        if (ver_len >= sizeof(info->version))
-            ver_len = sizeof(info->version) - 1;
-        strncpy(info->version, http_ver, ver_len);
-        info->version[ver_len] = '\0';
-    }
+
+    /* For responses (HTTP/x.x status line), we still parse headers below */
+    if (!found && !info->version[0])
+        return;
 
     /* Scan headers for Host and Upgrade: websocket */
+    const char *p = data;
+    const char *end = data + len;
     const char *host_hdr = NULL;
     while (p < end - 6) {
         if (*p == '\n' || p == data) {
@@ -993,7 +998,7 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 4);
+        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 6);
 
     /* Set up perf buffer */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");

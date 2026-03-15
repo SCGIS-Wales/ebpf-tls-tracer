@@ -396,7 +396,11 @@ jobs:
             echo "=== Checking enriched fields across all events ==="
             for field in src_ip src_port dst_dns http_version tls_version http_method http_path http_host; do
               if echo "${JSON_LINES}" | grep -q "\"${field}\""; then
-                SAMPLE=$(echo "${JSON_LINES}" | grep "\"${field}\"" | head -1 | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'{field}={d.get(\"${field}\",\"-\")}') " 2>/dev/null || true)
+                SAMPLE=$(echo "${JSON_LINES}" | grep "\"${field}\"" | head -1 | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+f = '${field}'
+print(f'{f}={d.get(f, \"-\")}')" 2>/dev/null || true)
                 echo "Enriched field '${field}' found: ${SAMPLE}"
               else
                 echo "Note: '${field}' not present (may not apply to captured traffic)"
