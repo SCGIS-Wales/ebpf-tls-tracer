@@ -33,6 +33,7 @@ BPF_SRC    := $(SRC_DIR)/bpf_program.c
 TRACER_SRC := $(SRC_DIR)/tls_tracer.c
 PROTO_SRC  := $(SRC_DIR)/protocol.c
 OUTPUT_SRC := $(SRC_DIR)/output.c
+FILTER_SRC := $(SRC_DIR)/filter.c
 K8S_SRC    := $(SRC_DIR)/k8s.c
 
 # Output files
@@ -44,6 +45,8 @@ TEST_SRC   := $(TEST_DIR)/test_tracer.c
 TEST_BIN   := $(BUILD_DIR)/test_tracer
 TEST_HELPERS_SRC := $(TEST_DIR)/test_helpers.c
 TEST_HELPERS_BIN := $(BUILD_DIR)/test_helpers
+TEST_FILTER_SRC := $(TEST_DIR)/test_filter.c
+TEST_FILTER_BIN := $(BUILD_DIR)/test_filter
 
 # Install paths
 PREFIX     ?= /usr/local
@@ -66,7 +69,7 @@ $(BPF_OBJ): $(BPF_SRC) $(INCLUDE_DIR)/tracer.h | $(BIN_DIR)
 # Compile user-space tracer (multi-object)
 TRACER_HDRS := $(INCLUDE_DIR)/tracer.h $(INCLUDE_DIR)/config.h \
                $(INCLUDE_DIR)/output.h $(INCLUDE_DIR)/protocol.h \
-               $(INCLUDE_DIR)/k8s.h
+               $(INCLUDE_DIR)/filter.h $(INCLUDE_DIR)/k8s.h
 
 $(BUILD_DIR)/tls_tracer.o: $(TRACER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 	@echo "  CC      $@"
@@ -80,12 +83,16 @@ $(BUILD_DIR)/output.o: $(OUTPUT_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 	@echo "  CC      $@"
 	@$(GCC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/filter.o: $(FILTER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/k8s.o: $(K8S_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 	@echo "  CC      $@"
 	@$(GCC) $(CFLAGS) -c $< -o $@
 
 TRACER_OBJS := $(BUILD_DIR)/tls_tracer.o $(BUILD_DIR)/protocol.o \
-               $(BUILD_DIR)/output.o $(BUILD_DIR)/k8s.o
+               $(BUILD_DIR)/output.o $(BUILD_DIR)/filter.o $(BUILD_DIR)/k8s.o
 
 $(TRACER_BIN): $(TRACER_OBJS) | $(BIN_DIR)
 	@echo "  LD      $@"
@@ -109,11 +116,22 @@ $(TEST_HELPERS_BIN): $(BUILD_DIR)/test_helpers.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	@$(GCC) -o $@ $^
 
-test: $(TEST_BIN) $(TEST_HELPERS_BIN)
+# Filter unit tests (needs filter.o and protocol.o for function definitions)
+$(BUILD_DIR)/test_filter.o: $(TEST_FILTER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -Wno-unused-function -c $< -o $@
+
+$(TEST_FILTER_BIN): $(BUILD_DIR)/test_filter.o $(BUILD_DIR)/filter.o $(BUILD_DIR)/protocol.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	@$(GCC) -o $@ $^
+
+test: $(TEST_BIN) $(TEST_HELPERS_BIN) $(TEST_FILTER_BIN)
 	@echo "  TEST    Running struct/constant tests..."
 	@./$(TEST_BIN)
 	@echo "  TEST    Running helper function tests..."
 	@./$(TEST_HELPERS_BIN)
+	@echo "  TEST    Running filter tests..."
+	@./$(TEST_FILTER_BIN)
 
 # Install
 install: all

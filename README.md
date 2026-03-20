@@ -26,6 +26,7 @@ eBPF TLS Tracer attaches to OpenSSL at the kernel level to capture **decrypted**
 - [How It Works](#how-it-works)
 - [Protocol Detection](#protocol-detection)
 - [CLI Reference](#cli-reference)
+  - [Traffic Filtering](#traffic-filtering)
 - [JSON Output Schema](#json-output-schema)
 - [Kubernetes Deployment](#kubernetes-deployment)
   - [Helm Chart](#helm-chart)
@@ -161,6 +162,10 @@ sudo ./bin/tls_tracer [OPTIONS]
 | `-d` | `--data-only` | Print only captured data (no metadata headers) |
 | `-s` | `--sanitize REGEX` | Add sanitisation regex pattern (case-insensitive, repeatable) |
 | `-q` | `--quic` | Enable QUIC/UDP detection probe (off by default to avoid overhead) |
+| `-n` | `--net MODE:CIDR` | Filter by CIDR range or keyword (repeatable). MODE is `include` or `exclude`. CIDR examples: `10.0.0.0/8`, `fc00::/7`. Keywords: `private`, `public`, `loopback` |
+| `-P` | `--proto MODE:PROTO` | Filter by protocol (repeatable). PROTO: `tcp`, `udp`, `http`, `https`, `non-https` |
+| `-m` | `--method MODE:METHOD` | Filter by HTTP method (repeatable). METHOD: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT` |
+| `-D` | `--dir MODE:DIR` | Filter by traffic direction (repeatable). DIR: `inbound`, `outbound` |
 | `-v` | `--verbose` | Verbose output (library path, probe status, ring buffer info) |
 | `-h` | `--help` | Show help message |
 
@@ -173,6 +178,110 @@ sudo ./bin/tls_tracer -u 1000                   # Filter by user ID
 sudo ./bin/tls_tracer --quic                    # Enable QUIC/UDP detection
 sudo ./bin/tls_tracer -l /path/to/libssl.so     # Custom OpenSSL path
 sudo ./bin/tls_tracer -s 'secret=[^&]*'         # Add extra sanitisation pattern
+```
+
+### Traffic Filtering
+
+Traffic filters let you narrow captured events by network range, protocol, HTTP method, and direction. Each filter uses the format `MODE:VALUE` where MODE is `include` (only show matching) or `exclude` (hide matching). Multiple filter categories combine with AND logic.
+
+**Mixing include and exclude within the same category is an error** — all `--net` filters must use the same mode, all `--proto` filters must use the same mode, etc.
+
+#### CIDR / Network Filters (`--net`)
+
+Filter by destination IP address using CIDR notation or keywords:
+
+```bash
+# Only show traffic to private RFC 1918/6598/4193 ranges
+sudo ./bin/tls_tracer --net include:private
+
+# Only show traffic to public (non-private) IPs
+sudo ./bin/tls_tracer --net include:public
+
+# Exclude loopback traffic
+sudo ./bin/tls_tracer --net exclude:loopback
+
+# Multiple specific CIDRs
+sudo ./bin/tls_tracer --net include:10.0.0.0/8 --net include:172.16.0.0/12
+
+# IPv6 CIDR
+sudo ./bin/tls_tracer --net include:2001:db8::/32
+```
+
+**Keywords:**
+
+| Keyword | Expands To |
+|---|---|
+| `private` | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (RFC 6598), `fc00::/7` (RFC 4193) |
+| `public` | Everything NOT in the private ranges above |
+| `loopback` | `127.0.0.0/8`, `::1/128` |
+
+#### Protocol Filters (`--proto`)
+
+Filter by transport or application-layer protocol:
+
+```bash
+# Only HTTPS (TLS) traffic
+sudo ./bin/tls_tracer --proto include:https
+
+# Only UDP/QUIC traffic
+sudo ./bin/tls_tracer --proto include:udp --quic
+
+# Exclude plain HTTP
+sudo ./bin/tls_tracer --proto exclude:http
+
+# Multiple protocols (OR within category)
+sudo ./bin/tls_tracer --proto include:tcp --proto include:udp
+```
+
+| Protocol | Matches |
+|---|---|
+| `tcp` | All TCP-based events (TLS, connect errors, etc.) |
+| `udp` | QUIC/UDP events (requires `--quic`) |
+| `http` | Plaintext HTTP (port 80/8080, non-TLS) |
+| `https` | TLS traffic (all `EVENT_TLS_DATA` events) |
+| `non-https` | Everything except HTTPS/TLS |
+
+#### HTTP Method Filters (`--method`)
+
+Filter by HTTP request method (only applies to events with a detected HTTP method; non-HTTP events pass through):
+
+```bash
+# Only GET requests
+sudo ./bin/tls_tracer --method include:GET
+
+# Exclude DELETE and PATCH
+sudo ./bin/tls_tracer --method exclude:DELETE --method exclude:PATCH
+
+# Only POST and PUT
+sudo ./bin/tls_tracer --method include:POST --method include:PUT
+```
+
+#### Direction Filters (`--dir`)
+
+Filter by traffic direction (inbound = responses/reads, outbound = requests/writes):
+
+```bash
+# Only inbound (response) traffic
+sudo ./bin/tls_tracer --dir include:inbound
+
+# Only outbound (request) traffic
+sudo ./bin/tls_tracer --dir include:outbound
+```
+
+#### Combined Filters
+
+All filter categories combine with **AND logic** — an event must pass every configured filter category:
+
+```bash
+# Public HTTPS GET requests only
+sudo ./bin/tls_tracer --net include:public --proto include:https --method include:GET
+
+# Exclude private network traffic, only show outbound
+sudo ./bin/tls_tracer --net exclude:private --dir include:outbound
+
+# HTTPS POST/PUT to specific subnet
+sudo ./bin/tls_tracer --net include:10.0.0.0/8 --proto include:https \
+  --method include:POST --method include:PUT
 ```
 
 ---

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp */
 #include <signal.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -29,6 +30,7 @@
 #include <bpf/bpf.h>
 #include "tracer.h"
 #include "config.h"
+#include "filter.h"
 #include "output.h"
 #include "k8s.h"
 #include "protocol.h"
@@ -270,18 +272,31 @@ static void usage(const char *prog)
         "  -d, --data-only        Print only captured data (no headers)\n"
         "  -s, --sanitize REGEX   Sanitize URLs matching REGEX (case-insensitive, repeatable)\n"
         "  -q, --quic             Enable QUIC/UDP detection probe (off by default)\n"
+        "  -n, --net MODE:CIDR    Filter by CIDR range or keyword (repeatable)\n"
+        "                         MODE is 'include' or 'exclude'\n"
+        "                         CIDR is an IP range (e.g. 10.0.0.0/8, fc00::/7)\n"
+        "                         Keywords: private, public, loopback\n"
+        "  -P, --proto MODE:PROTO Filter by protocol (repeatable)\n"
+        "                         PROTO: tcp, udp, http, https, non-https\n"
+        "  -m, --method MODE:MTH  Filter by HTTP method (repeatable)\n"
+        "                         MTH: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT\n"
+        "  -D, --dir MODE:DIR     Filter by traffic direction (repeatable)\n"
+        "                         DIR: inbound, outbound\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help message\n"
         "\n"
         "Examples:\n"
-        "  %s                     Trace all TLS traffic\n"
-        "  %s -p 1234             Trace TLS traffic for PID 1234\n"
-        "  %s -f json             Output in JSON format\n"
-        "  %s -x -p 1234          Hex dump of TLS data for PID 1234\n"
-        "  %s -s 'apikey=[^&]*'   Redact API keys from logged URLs\n"
+        "  %s                               Trace all TLS traffic\n"
+        "  %s -p 1234                       Trace TLS traffic for PID 1234\n"
+        "  %s -f json                       Output in JSON format\n"
+        "  %s --net include:private          Only private network traffic\n"
+        "  %s --net exclude:10.0.0.0/8       Exclude 10.x.x.x traffic\n"
+        "  %s --proto include:https --method include:GET  Only HTTPS GETs\n"
+        "  %s --dir include:inbound          Only inbound (response) traffic\n"
+        "  %s -s 'apikey=[^&]*'             Redact API keys from logged URLs\n"
         "\n"
         "Requires root privileges (or CAP_BPF + CAP_PERFMON).\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 /* R1-REL: Validate OpenSSL version for struct offset compatibility.
@@ -401,13 +416,17 @@ int main(int argc, char **argv)
         {"data-only", no_argument,       NULL, 'd'},
         {"sanitize",  required_argument, NULL, 's'},
         {"quic",      no_argument,       NULL, 'q'},
+        {"net",       required_argument, NULL, 'n'},
+        {"proto",     required_argument, NULL, 'P'},
+        {"method",    required_argument, NULL, 'm'},
+        {"dir",       required_argument, NULL, 'D'},
         {"verbose",   no_argument,       NULL, 'v'},
         {"help",      no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qvh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qn:P:m:D:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': {
             char *endp;
@@ -457,6 +476,92 @@ int main(int argc, char **argv)
         case 'q':
             cfg.enable_quic = 1;
             break;
+        case 'n': {
+            enum filter_mode mode;
+            const char *value;
+            if (parse_filter_arg(optarg, &mode, &value) != 0)
+                return 1;
+            if (cfg.filter.cidr_mode != FILTER_MODE_NONE && cfg.filter.cidr_mode != mode) {
+                fprintf(stderr, "Error: Cannot mix include and exclude in --net filters\n");
+                return 1;
+            }
+            cfg.filter.cidr_mode = mode;
+            /* Check if value is a keyword or CIDR */
+            if (strcasecmp(value, "private") == 0 || strcasecmp(value, "public") == 0 ||
+                strcasecmp(value, "loopback") == 0) {
+                if (expand_keyword_cidrs(value, &cfg.filter) != 0)
+                    return 1;
+            } else {
+                if (cfg.filter.cidr_count >= MAX_FILTER_CIDRS) {
+                    fprintf(stderr, "Error: Too many CIDR filters (max %d)\n", MAX_FILTER_CIDRS);
+                    return 1;
+                }
+                if (parse_cidr(value, &cfg.filter.cidrs[cfg.filter.cidr_count]) != 0) {
+                    fprintf(stderr, "Error: Invalid CIDR '%s'\n", value);
+                    return 1;
+                }
+                cfg.filter.cidr_count++;
+            }
+            break;
+        }
+        case 'P': {
+            enum filter_mode mode;
+            const char *value;
+            if (parse_filter_arg(optarg, &mode, &value) != 0)
+                return 1;
+            if (cfg.filter.proto_mode != FILTER_MODE_NONE && cfg.filter.proto_mode != mode) {
+                fprintf(stderr, "Error: Cannot mix include and exclude in --proto filters\n");
+                return 1;
+            }
+            cfg.filter.proto_mode = mode;
+            unsigned int flag = parse_proto_name(value);
+            if (flag == 0) {
+                fprintf(stderr, "Error: Unknown protocol '%s'"
+                                " (use tcp, udp, http, https, non-https)\n", value);
+                return 1;
+            }
+            cfg.filter.proto_flags |= flag;
+            break;
+        }
+        case 'm': {
+            enum filter_mode mode;
+            const char *value;
+            if (parse_filter_arg(optarg, &mode, &value) != 0)
+                return 1;
+            if (cfg.filter.method_mode != FILTER_MODE_NONE && cfg.filter.method_mode != mode) {
+                fprintf(stderr, "Error: Cannot mix include and exclude in --method filters\n");
+                return 1;
+            }
+            cfg.filter.method_mode = mode;
+            if (cfg.filter.method_count >= MAX_FILTER_METHODS) {
+                fprintf(stderr, "Error: Too many method filters (max %d)\n", MAX_FILTER_METHODS);
+                return 1;
+            }
+            snprintf(cfg.filter.methods[cfg.filter.method_count],
+                     sizeof(cfg.filter.methods[0]), "%s", value);
+            cfg.filter.method_count++;
+            break;
+        }
+        case 'D': {
+            enum filter_mode mode;
+            const char *value;
+            if (parse_filter_arg(optarg, &mode, &value) != 0)
+                return 1;
+            if (cfg.filter.dir_mode != FILTER_MODE_NONE && cfg.filter.dir_mode != mode) {
+                fprintf(stderr, "Error: Cannot mix include and exclude in --dir filters\n");
+                return 1;
+            }
+            cfg.filter.dir_mode = mode;
+            if (strcasecmp(value, "inbound") == 0)
+                cfg.filter.dir_flags |= DIR_FILTER_INBOUND;
+            else if (strcasecmp(value, "outbound") == 0)
+                cfg.filter.dir_flags |= DIR_FILTER_OUTBOUND;
+            else {
+                fprintf(stderr, "Error: Unknown direction '%s' (use inbound or outbound)\n", value);
+                return 1;
+            }
+            break;
+        }
         case 'v':
             cfg.verbose = 1;
             break;
