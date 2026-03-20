@@ -23,10 +23,18 @@ BPF_CFLAGS := -O2 -g -target bpf \
               $(if $(SYS_INC),-isystem $(SYS_INC)) \
               -Wall -Werror
 
-# User-space compilation flags
+# Version (from git tag or 'dev')
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+
+# User-space compilation flags (hardened for enterprise use)
 CFLAGS     := -O2 -g -Wall -Wextra -Werror \
-              -I$(INCLUDE_DIR)
-LDFLAGS    := -lbpf -lelf -lz -ldl
+              -I$(INCLUDE_DIR) \
+              -fstack-protector-strong \
+              -D_FORTIFY_SOURCE=2 \
+              -Wformat=2 -Wformat-security \
+              -fPIE \
+              -DVERSION=\"$(VERSION)\"
+LDFLAGS    := -lbpf -lelf -lz -ldl -pie -Wl,-z,relro,-z,now
 
 # Source files
 BPF_SRC    := $(SRC_DIR)/bpf_program.c

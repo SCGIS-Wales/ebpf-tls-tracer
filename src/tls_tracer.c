@@ -35,11 +35,19 @@
 #include "k8s.h"
 #include "protocol.h"
 
+#ifndef VERSION
+#define VERSION "dev"
+#endif
+
 #define RING_POLL_TIMEOUT  100
 #define MAX_PROBES         32
 
 static volatile sig_atomic_t exiting = 0;
 static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+signum (#2 fix) */
+
+/* Event statistics counters (printed to stderr on exit) */
+static __u64 stat_events_captured = 0;
+static __u64 stat_events_filtered = 0;
 
 /* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
  * R-1 fix: Uses open-addressing hash table for O(1) lookup instead of O(n)
@@ -282,7 +290,11 @@ static void usage(const char *prog)
         "                         MTH: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT\n"
         "  -D, --dir MODE:DIR     Filter by traffic direction (repeatable)\n"
         "                         DIR: inbound, outbound\n"
+        "  -H, --headers-only     Capture HTTP headers only (truncate at body boundary)\n"
+        "  -c, --max-events N     Exit after capturing N events\n"
+        "  -t, --duration SECS    Exit after SECS seconds\n"
         "  -v, --verbose          Verbose output\n"
+        "  -V, --version          Show version and exit\n"
         "  -h, --help             Show this help message\n"
         "\n"
         "Examples:\n"
@@ -408,25 +420,29 @@ int main(int argc, char **argv)
     int link_count = 0;
 
     static const struct option long_opts[] = {
-        {"pid",       required_argument, NULL, 'p'},
-        {"uid",       required_argument, NULL, 'u'},
-        {"lib",       required_argument, NULL, 'l'},
-        {"format",    required_argument, NULL, 'f'},
-        {"hex",       no_argument,       NULL, 'x'},
-        {"data-only", no_argument,       NULL, 'd'},
-        {"sanitize",  required_argument, NULL, 's'},
-        {"quic",      no_argument,       NULL, 'q'},
-        {"net",       required_argument, NULL, 'n'},
-        {"proto",     required_argument, NULL, 'P'},
-        {"method",    required_argument, NULL, 'm'},
-        {"dir",       required_argument, NULL, 'D'},
-        {"verbose",   no_argument,       NULL, 'v'},
-        {"help",      no_argument,       NULL, 'h'},
+        {"pid",          required_argument, NULL, 'p'},
+        {"uid",          required_argument, NULL, 'u'},
+        {"lib",          required_argument, NULL, 'l'},
+        {"format",       required_argument, NULL, 'f'},
+        {"hex",          no_argument,       NULL, 'x'},
+        {"data-only",    no_argument,       NULL, 'd'},
+        {"sanitize",     required_argument, NULL, 's'},
+        {"quic",         no_argument,       NULL, 'q'},
+        {"net",          required_argument, NULL, 'n'},
+        {"proto",        required_argument, NULL, 'P'},
+        {"method",       required_argument, NULL, 'm'},
+        {"dir",          required_argument, NULL, 'D'},
+        {"headers-only", no_argument,       NULL, 'H'},
+        {"max-events",   required_argument, NULL, 'c'},
+        {"duration",     required_argument, NULL, 't'},
+        {"verbose",      no_argument,       NULL, 'v'},
+        {"version",      no_argument,       NULL, 'V'},
+        {"help",         no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qn:P:m:D:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qn:P:m:D:Hc:t:vVh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': {
             char *endp;
@@ -562,9 +578,37 @@ int main(int argc, char **argv)
             }
             break;
         }
+        case 'H':
+            cfg.headers_only = 1;
+            break;
+        case 'c': {
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > UINT_MAX || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid max-events '%s'\n", optarg);
+                return 1;
+            }
+            cfg.max_events = (__u64)val;
+            break;
+        }
+        case 't': {
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 86400 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid duration '%s' (1-86400 seconds)\n", optarg);
+                return 1;
+            }
+            cfg.duration = (int)val;
+            break;
+        }
         case 'v':
             cfg.verbose = 1;
             break;
+        case 'V':
+            printf("tls_tracer %s\n", VERSION);
+            return 0;
         case 'h':
             usage(argv[0]);
             return 0;
@@ -623,6 +667,13 @@ int main(int argc, char **argv)
     detect_host_ip(cfg.host_ip, sizeof(cfg.host_ip));
     if (cfg.host_ip[0] && cfg.verbose)
         fprintf(stderr, "Host IP: %s\n", cfg.host_ip);
+
+    /* Detect AWS ECS runtime environment */
+    if (getenv("ECS_CONTAINER_METADATA_URI_V4") || getenv("ECS_CONTAINER_METADATA_URI")) {
+        cfg.ecs_detected = 1;
+        if (cfg.verbose)
+            fprintf(stderr, "Runtime: AWS ECS detected\n");
+    }
 
     /* Set up signal handlers (R6 fix: use sigaction for reliable signal handling).
      * signal() has undefined behavior on some systems — the handler may be reset
@@ -920,12 +971,28 @@ int main(int argc, char **argv)
 
     /* Main event loop (#1 fix: don't mask poll errors) */
     int poll_count = 0;
+    time_t start_time = time(NULL);
     while (!exiting) {
         int poll_err = ring_buffer__poll(rb, RING_POLL_TIMEOUT);
         if (poll_err < 0 && poll_err != -EINTR) {
             fprintf(stderr, "Error: Polling ring buffer failed: %s\n",
                     strerror(-poll_err));
             err = poll_err;
+            break;
+        }
+
+        /* Check max-events limit */
+        if (cfg.max_events > 0 && stat_events_captured >= cfg.max_events) {
+            if (cfg.verbose)
+                fprintf(stderr, "Reached max-events limit (%llu)\n",
+                        (unsigned long long)cfg.max_events);
+            break;
+        }
+
+        /* Check duration limit */
+        if (cfg.duration > 0 && (time(NULL) - start_time) >= cfg.duration) {
+            if (cfg.verbose)
+                fprintf(stderr, "Reached duration limit (%d seconds)\n", cfg.duration);
             break;
         }
 
@@ -944,8 +1011,33 @@ int main(int argc, char **argv)
     if (health_file)
         unlink(health_file);
 
-    if (cfg.verbose)
-        fprintf(stderr, "\nExiting...\n");
+    /* Print event statistics on exit */
+    {
+        time_t elapsed = time(NULL) - start_time;
+        __u64 dropped = 0;
+        /* Read BPF dropped_events per-CPU array to get total drops */
+        int drop_fd = bpf_object__find_map_fd_by_name(obj, "dropped_events");
+        if (drop_fd >= 0) {
+            int nr_cpus = libbpf_num_possible_cpus();
+            if (nr_cpus > 0 && nr_cpus <= 1024) {
+                __u64 *per_cpu = calloc((size_t)nr_cpus, sizeof(__u64));
+                if (per_cpu) {
+                    __u32 key = 0;
+                    if (bpf_map_lookup_elem(drop_fd, &key, per_cpu) == 0) {
+                        for (int i = 0; i < nr_cpus; i++)
+                            dropped += per_cpu[i];
+                    }
+                    free(per_cpu);
+                }
+            }
+        }
+        fprintf(stderr, "\nEvents captured: %llu, filtered: %llu, dropped: %llu, "
+                "runtime: %llds\n",
+                (unsigned long long)stat_events_captured,
+                (unsigned long long)stat_events_filtered,
+                (unsigned long long)dropped,
+                (long long)elapsed);
+    }
 
 cleanup:
     if (rb)
