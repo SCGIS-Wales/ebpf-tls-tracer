@@ -39,6 +39,14 @@ struct config {
     int             ecs_detected;   /* 1 if running on AWS ECS (detected via env var) */
     struct sanitize_pattern sanitize[MAX_SANITIZE_PATTERNS];
     int             sanitize_count;
+    __u32           ring_buffer_mb; /* ring buffer size in MB (must be power-of-2, default 4) */
+    int             aggregate;      /* enable session aggregation */
+    int             aggregate_only; /* suppress per-event output, only emit summaries */
+    int             aggregate_timeout; /* idle timeout in seconds (default: 30) */
+    char            pcap_path[256]; /* pcap-ng output file path (empty = disabled) */
+    int             pcap_snaplen;   /* max bytes per packet in pcap (default: 4096) */
+    int             metrics_port;   /* Prometheus metrics port (0 = disabled) */
+    char            metrics_path[64]; /* metrics HTTP path (default: /metrics) */
     struct traffic_filter filter;
 };
 

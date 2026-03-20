@@ -14,6 +14,9 @@
 #include "filter.h"
 #include "protocol.h"
 #include "k8s.h"
+#include "session.h"
+#include "pcap.h"
+#include "metrics.h"
 
 /* Event statistics (defined in tls_tracer.c, accessed here) */
 extern __u64 stat_events_captured;
@@ -150,6 +153,29 @@ int handle_event(void *ctx, void *data, size_t size)
     }
 
     stat_events_captured++;
+
+    /* Update Prometheus metrics counters */
+    if (c->metrics_port > 0)
+        metrics_update_event(event);
+
+    /* Write to PCAP file (data events only) */
+    if (c->pcap_path[0] && event->event_type == EVENT_TLS_DATA)
+        pcap_write_event_from_tls(c->pcap_path, event);
+
+    /* Session aggregation: update session tracking */
+    if (c->aggregate) {
+        session_update(event, &http_early, c);
+
+        /* Emit summary immediately on close/error */
+        if (event->event_type == EVENT_TLS_CLOSE)
+            session_close(event, SESSION_CLOSE_NORMAL, session_emit_json, c);
+        else if (event->event_type == EVENT_TLS_ERROR)
+            session_close(event, SESSION_CLOSE_ERROR, session_emit_json, c);
+
+        /* Suppress per-event output if aggregate-only mode */
+        if (c->aggregate_only)
+            return 0;
+    }
 
     char addr_buf[128];
     format_addr(event, addr_buf, sizeof(addr_buf));
@@ -564,6 +590,12 @@ int handle_event(void *ctx, void *data, size_t size)
 
         /* TLS authentication mode: one-way or mutual (mTLS) */
         printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
+
+        /* TLS library (omit for OpenSSL for backward compat) */
+        if (event->tls_library == TLS_LIB_GNUTLS)
+            printf(",\"tls_library\":\"gnutls\"");
+        else if (event->tls_library == TLS_LIB_WOLFSSL)
+            printf(",\"tls_library\":\"wolfssl\"");
 
         printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
 

@@ -34,20 +34,23 @@
 #include "output.h"
 #include "k8s.h"
 #include "protocol.h"
+#include "session.h"
+#include "pcap.h"
+#include "metrics.h"
 
 #ifndef VERSION
 #define VERSION "dev"
 #endif
 
 #define RING_POLL_TIMEOUT  100
-#define MAX_PROBES         32
+#define MAX_PROBES         64
 
 static volatile sig_atomic_t exiting = 0;
 static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+signum (#2 fix) */
 
-/* Event statistics counters (printed to stderr on exit) */
-static __u64 stat_events_captured = 0;
-static __u64 stat_events_filtered = 0;
+/* Event statistics counters (printed to stderr on exit, read by metrics thread) */
+__u64 stat_events_captured = 0;
+__u64 stat_events_filtered = 0;
 
 /* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
  * R-1 fix: Uses open-addressing hash table for O(1) lookup instead of O(n)
@@ -156,6 +159,10 @@ static struct config cfg = {
     .verbose         = 0,
     .enable_quic     = 0,
     .sanitize_count  = 0,
+    .ring_buffer_mb  = 4,
+    .aggregate_timeout = 30,
+    .pcap_snaplen    = 4096,
+    .metrics_path    = "/metrics",
 };
 
 static void sig_handler(int signo)
@@ -262,6 +269,117 @@ static int find_ssl_library(char *path, size_t path_len)
     return -1;
 }
 
+static int find_gnutls_library(char *path, size_t path_len)
+{
+    const char *candidates[] = {
+        "/host/usr/lib/x86_64-linux-gnu/libgnutls.so.30",
+        "/host/usr/lib/aarch64-linux-gnu/libgnutls.so.30",
+        "/host/usr/lib64/libgnutls.so.30",
+        "/usr/lib/x86_64-linux-gnu/libgnutls.so.30",
+        "/usr/lib/aarch64-linux-gnu/libgnutls.so.30",
+        "/usr/lib64/libgnutls.so.30",
+        "/usr/lib/libgnutls.so.30",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int find_wolfssl_library(char *path, size_t path_len)
+{
+    const char *candidates[] = {
+        "/host/usr/lib/x86_64-linux-gnu/libwolfssl.so",
+        "/host/usr/lib/aarch64-linux-gnu/libwolfssl.so",
+        "/host/usr/lib64/libwolfssl.so",
+        "/usr/lib/x86_64-linux-gnu/libwolfssl.so",
+        "/usr/lib/aarch64-linux-gnu/libwolfssl.so",
+        "/usr/lib64/libwolfssl.so",
+        "/usr/lib/libwolfssl.so",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Probe specification for library-specific uprobe attachment */
+struct probe_spec {
+    const char *bpf_name;
+    const char *func_name;
+    int is_retprobe;
+};
+
+static const struct probe_spec gnutls_probes[] = {
+    {"probe_gnutls_recv_enter",       "gnutls_record_recv",       0},
+    {"probe_gnutls_recv_return",      "gnutls_record_recv",       1},
+    {"probe_gnutls_send_enter",       "gnutls_record_send",       0},
+    {"probe_gnutls_send_return",      "gnutls_record_send",       1},
+    {"probe_gnutls_transport_enter",  "gnutls_transport_get_int", 0},
+    {"probe_gnutls_transport_return", "gnutls_transport_get_int", 1},
+};
+
+static const struct probe_spec wolfssl_probes[] = {
+    {"probe_wolfssl_read_enter",    "wolfSSL_read",   0},
+    {"probe_wolfssl_read_return",   "wolfSSL_read",   1},
+    {"probe_wolfssl_write_enter",   "wolfSSL_write",  0},
+    {"probe_wolfssl_write_return",  "wolfSSL_write",  1},
+    {"probe_wolfssl_getfd_enter",   "wolfSSL_get_fd", 0},
+    {"probe_wolfssl_getfd_return",  "wolfSSL_get_fd", 1},
+};
+
+/* Attach probes for a specific TLS library.
+ * Returns the number of probes successfully attached. */
+static int attach_library_probes(struct bpf_object *obj,
+                                  const struct probe_spec *probes,
+                                  int probe_count,
+                                  const char *lib_path,
+                                  const char *lib_name,
+                                  struct bpf_link **links,
+                                  int *link_count,
+                                  int verbose)
+{
+    int attached = 0;
+    for (int i = 0; i < probe_count; i++) {
+        struct bpf_program *p = bpf_object__find_program_by_name(obj, probes[i].bpf_name);
+        if (!p) {
+            if (verbose)
+                fprintf(stderr, "Note: BPF program '%s' not found for %s\n",
+                        probes[i].bpf_name, lib_name);
+            continue;
+        }
+        LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
+            .retprobe = probes[i].is_retprobe,
+            .func_name = probes[i].func_name,
+        );
+        links[*link_count] = bpf_program__attach_uprobe_opts(
+            p, -1, lib_path, 0, &uprobe_opts);
+        if (!links[*link_count] || libbpf_get_error(links[*link_count])) {
+            links[*link_count] = NULL;
+            if (verbose)
+                fprintf(stderr, "Warning: Could not attach %s uprobe for %s (%s)\n",
+                        probes[i].func_name, lib_name,
+                        probes[i].is_retprobe ? "return" : "entry");
+            continue;
+        }
+        (*link_count)++;
+        attached++;
+    }
+    return attached;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -291,6 +409,14 @@ static void usage(const char *prog)
         "  -D, --dir MODE:DIR     Filter by traffic direction (repeatable)\n"
         "                         DIR: inbound, outbound\n"
         "  -H, --headers-only     Capture HTTP headers only (truncate at body boundary)\n"
+        "  -r, --ring-buffer-size MB  Ring buffer size in MB (power-of-2, 1-64, default: 4)\n"
+        "  -A, --aggregate        Enable session aggregation (emit summaries on close/timeout)\n"
+        "      --aggregate-timeout SECS  Idle timeout before summary emission (default: 30)\n"
+        "      --aggregate-only   Only emit session summaries, suppress per-event output\n"
+        "      --pcap FILE        Write captured events to pcap-ng file\n"
+        "      --pcap-snaplen N   Max bytes per packet in pcap (default: 4096)\n"
+        "      --metrics-port PORT  Enable Prometheus metrics endpoint on PORT\n"
+        "      --metrics-path PATH  HTTP path for metrics (default: /metrics)\n"
         "  -c, --max-events N     Exit after capturing N events\n"
         "  -t, --duration SECS    Exit after SECS seconds\n"
         "  -v, --verbose          Verbose output\n"
@@ -416,6 +542,7 @@ int main(int argc, char **argv)
     struct bpf_program *prog;
     struct bpf_link *links[MAX_PROBES] = {0};
     struct ring_buffer *rb = NULL;
+    struct pcap_handle *pcap = NULL;
     int err = 0;
     int link_count = 0;
 
@@ -435,6 +562,14 @@ int main(int argc, char **argv)
         {"headers-only", no_argument,       NULL, 'H'},
         {"max-events",   required_argument, NULL, 'c'},
         {"duration",     required_argument, NULL, 't'},
+        {"ring-buffer-size", required_argument, NULL, 'r'},
+        {"aggregate",    no_argument,       NULL, 'A'},
+        {"aggregate-timeout", required_argument, NULL, 1001},
+        {"aggregate-only", no_argument,     NULL, 1002},
+        {"pcap",         required_argument, NULL, 1003},
+        {"pcap-snaplen", required_argument, NULL, 1004},
+        {"metrics-port", required_argument, NULL, 1005},
+        {"metrics-path", required_argument, NULL, 1006},
         {"verbose",      no_argument,       NULL, 'v'},
         {"version",      no_argument,       NULL, 'V'},
         {"help",         no_argument,       NULL, 'h'},
@@ -442,7 +577,7 @@ int main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qn:P:m:D:Hc:t:vVh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qn:P:m:D:Hc:t:r:AvVh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': {
             char *endp;
@@ -603,6 +738,68 @@ int main(int argc, char **argv)
             cfg.duration = (int)val;
             break;
         }
+        case 'r': {
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 64 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid ring-buffer-size '%s' (1-64 MB)\n", optarg);
+                return 1;
+            }
+            /* Must be power of 2 */
+            if ((val & (val - 1)) != 0) {
+                fprintf(stderr, "Error: ring-buffer-size must be a power of 2 (got %lu)\n", val);
+                return 1;
+            }
+            cfg.ring_buffer_mb = (__u32)val;
+            break;
+        }
+        case 'A':
+            cfg.aggregate = 1;
+            break;
+        case 1001: {  /* --aggregate-timeout */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 3600 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid aggregate-timeout '%s' (1-3600 seconds)\n", optarg);
+                return 1;
+            }
+            cfg.aggregate_timeout = (int)val;
+            break;
+        }
+        case 1002:  /* --aggregate-only */
+            cfg.aggregate = 1;
+            cfg.aggregate_only = 1;
+            break;
+        case 1003:  /* --pcap */
+            snprintf(cfg.pcap_path, sizeof(cfg.pcap_path), "%s", optarg);
+            break;
+        case 1004: {  /* --pcap-snaplen */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 65535 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid pcap-snaplen '%s'\n", optarg);
+                return 1;
+            }
+            cfg.pcap_snaplen = (int)val;
+            break;
+        }
+        case 1005: {  /* --metrics-port */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 65535 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid metrics-port '%s'\n", optarg);
+                return 1;
+            }
+            cfg.metrics_port = (int)val;
+            break;
+        }
+        case 1006:  /* --metrics-path */
+            snprintf(cfg.metrics_path, sizeof(cfg.metrics_path), "%s", optarg);
+            break;
         case 'v':
             cfg.verbose = 1;
             break;
@@ -809,6 +1006,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Override ring buffer size before loading (must be between open and load) */
+    {
+        struct bpf_map *rb_map = bpf_object__find_map_by_name(obj, "tls_events");
+        if (rb_map) {
+            err = bpf_map__set_max_entries(rb_map, cfg.ring_buffer_mb * 1024 * 1024);
+            if (err) {
+                fprintf(stderr, "Warning: Could not set ring buffer size to %u MB: %s\n",
+                        cfg.ring_buffer_mb, strerror(-err));
+            }
+        }
+    }
+
     err = bpf_object__load(obj);
     if (err) {
         fprintf(stderr, "Error: Failed to load BPF object: %s\n",
@@ -916,7 +1125,39 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 10);
+        fprintf(stderr, "Attached %d/%d OpenSSL probes.\n", uprobe_count, 10);
+
+    /* Auto-detect and attach GnuTLS probes */
+    {
+        char gnutls_lib[256] = "";
+        if (find_gnutls_library(gnutls_lib, sizeof(gnutls_lib)) == 0) {
+            int n = attach_library_probes(obj, gnutls_probes,
+                        sizeof(gnutls_probes) / sizeof(gnutls_probes[0]),
+                        gnutls_lib, "GnuTLS", links, &link_count, cfg.verbose);
+            if (n > 0 && cfg.verbose)
+                fprintf(stderr, "Attached %d/%d GnuTLS probes (%s)\n",
+                        n, (int)(sizeof(gnutls_probes) / sizeof(gnutls_probes[0])),
+                        gnutls_lib);
+        } else if (cfg.verbose) {
+            fprintf(stderr, "GnuTLS library not found (optional)\n");
+        }
+    }
+
+    /* Auto-detect and attach wolfSSL probes */
+    {
+        char wolfssl_lib[256] = "";
+        if (find_wolfssl_library(wolfssl_lib, sizeof(wolfssl_lib)) == 0) {
+            int n = attach_library_probes(obj, wolfssl_probes,
+                        sizeof(wolfssl_probes) / sizeof(wolfssl_probes[0]),
+                        wolfssl_lib, "wolfSSL", links, &link_count, cfg.verbose);
+            if (n > 0 && cfg.verbose)
+                fprintf(stderr, "Attached %d/%d wolfSSL probes (%s)\n",
+                        n, (int)(sizeof(wolfssl_probes) / sizeof(wolfssl_probes[0])),
+                        wolfssl_lib);
+        } else if (cfg.verbose) {
+            fprintf(stderr, "wolfSSL library not found (optional)\n");
+        }
+    }
 
     /* Set up ring buffer (H-1: migrated from perf_buffer for reliability) */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");
@@ -935,7 +1176,34 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Ring buffer: 4 MB\n");
+        fprintf(stderr, "Ring buffer: %u MB\n", cfg.ring_buffer_mb);
+
+    /* Open PCAP file if requested */
+    if (cfg.pcap_path[0]) {
+        pcap = pcap_open(cfg.pcap_path);
+        if (!pcap) {
+            fprintf(stderr, "Error: Failed to open pcap file '%s'\n", cfg.pcap_path);
+            err = 1;
+            goto cleanup;
+        }
+        if (cfg.verbose)
+            fprintf(stderr, "PCAP output: %s (snaplen=%d)\n",
+                    cfg.pcap_path, cfg.pcap_snaplen);
+    }
+
+    /* Start Prometheus metrics server if requested */
+    if (cfg.metrics_port > 0) {
+        metrics_set_ring_buffer_size((__u64)cfg.ring_buffer_mb * 1024 * 1024);
+        if (metrics_start(cfg.metrics_port, cfg.metrics_path) != 0) {
+            fprintf(stderr, "Error: Failed to start metrics server on port %d\n",
+                    cfg.metrics_port);
+            err = 1;
+            goto cleanup;
+        }
+        if (cfg.verbose)
+            fprintf(stderr, "Metrics: http://0.0.0.0:%d%s\n",
+                    cfg.metrics_port, cfg.metrics_path);
+    }
 
     /* Print startup banner */
     if (!cfg.data_only && cfg.format == FMT_TEXT) {
@@ -996,8 +1264,17 @@ int main(int argc, char **argv)
             break;
         }
 
+        /* Periodic tasks every ~10 poll cycles (~1 second) */
+        poll_count++;
+
+        /* Session sweep: emit summaries for idle connections */
+        if (cfg.aggregate && poll_count % 10 == 0) {
+            session_sweep(time(NULL), cfg.aggregate_timeout,
+                          session_emit_json, &cfg);
+        }
+
         /* Update health file every ~10 seconds (100ms poll * 100) */
-        if (health_file && ++poll_count >= 100) {
+        if (health_file && poll_count >= 100) {
             poll_count = 0;
             hf = fopen(health_file, "w");
             if (hf) {
@@ -1040,6 +1317,10 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    if (cfg.metrics_port > 0)
+        metrics_stop();
+    if (pcap)
+        pcap_close(pcap);
     if (rb)
         ring_buffer__free(rb);
     for (int i = 0; i < link_count; i++) {
