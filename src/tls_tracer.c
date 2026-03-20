@@ -296,7 +296,7 @@ static void usage(const char *prog)
         "  %s -s 'apikey=[^&]*'             Redact API keys from logged URLs\n"
         "\n"
         "Requires root privileges (or CAP_BPF + CAP_PERFMON).\n",
-        prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 /* R1-REL: Validate OpenSSL version for struct offset compatibility.
