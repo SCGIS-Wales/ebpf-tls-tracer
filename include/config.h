@@ -32,7 +32,11 @@ struct config {
     int             data_only;
     int             verbose;
     int             enable_quic;
+    int             headers_only;   /* truncate at HTTP body boundary */
+    __u64           max_events;     /* exit after N events (0 = unlimited) */
+    int             duration;       /* exit after N seconds (0 = unlimited) */
     char            host_ip[INET6_ADDRSTRLEN];
+    int             ecs_detected;   /* 1 if running on AWS ECS (detected via env var) */
     struct sanitize_pattern sanitize[MAX_SANITIZE_PATTERNS];
     int             sanitize_count;
     struct traffic_filter filter;

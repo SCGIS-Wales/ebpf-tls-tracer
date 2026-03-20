@@ -166,7 +166,11 @@ sudo ./bin/tls_tracer [OPTIONS]
 | `-P` | `--proto MODE:PROTO` | Filter by protocol (repeatable). PROTO: `tcp`, `udp`, `http`, `https`, `non-https` |
 | `-m` | `--method MODE:METHOD` | Filter by HTTP method (repeatable). METHOD: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT` |
 | `-D` | `--dir MODE:DIR` | Filter by traffic direction (repeatable). DIR: `inbound`, `outbound` |
+| `-H` | `--headers-only` | Capture HTTP headers only (truncate at body boundary, for PCI-DSS/GDPR) |
+| `-c` | `--max-events N` | Exit after capturing N events |
+| `-t` | `--duration SECS` | Exit after SECS seconds |
 | `-v` | `--verbose` | Verbose output (library path, probe status, ring buffer info) |
+| `-V` | `--version` | Show version and exit |
 | `-h` | `--help` | Show help message |
 
 **Examples:**
@@ -336,6 +340,7 @@ Each event is a single self-contained NDJSON line. Fields are **only present whe
 | `data_len` | integer | Captured plaintext byte count |
 | `conn_id` | string | Connection identifier (`pid:fd`) for event correlation |
 | `dst_dns` | string | Hostname from HTTP Host header (cached per connection) |
+| `host_ip` | string | Node/host IP address (via `HOST_IP` env var or auto-detected) |
 
 ### TLS Posture Fields
 
@@ -499,6 +504,60 @@ If you prefer not to use Helm, raw Kubernetes manifests are available in [`deplo
 
 ---
 
+## AWS ECS Deployment
+
+TLS Tracer can run on **Amazon ECS (EC2 launch type)** as a privileged daemon task. Fargate is not supported because eBPF requires direct kernel access.
+
+### Prerequisites
+
+| Requirement | Details |
+|---|---|
+| Launch type | **EC2** (not Fargate — eBPF needs kernel access) |
+| Instance AMI | Amazon Linux 2023 (kernel 6.1+, BTF enabled) |
+| Network mode | `host` (required for full network visibility) |
+| PID mode | `host` (required to trace all container processes) |
+| Privileges | `privileged: true` in container definition |
+
+### Task Definition
+
+An example task definition is provided at [`deploy/ecs/task-definition.json`](deploy/ecs/task-definition.json).
+
+```bash
+# Register the task definition
+aws ecs register-task-definition --cli-input-json file://deploy/ecs/task-definition.json
+
+# Create a daemon service (one task per EC2 instance)
+aws ecs create-service \
+  --cluster my-cluster \
+  --service-name tls-tracer \
+  --task-definition tls-tracer \
+  --scheduling-strategy DAEMON \
+  --launch-type EC2
+```
+
+### CloudWatch Logs
+
+The task definition configures `awslogs` log driver by default. Events are streamed as NDJSON to the `/ecs/tls-tracer` log group. Use CloudWatch Logs Insights to query:
+
+```
+fields @timestamp, dst_ip, dst_port, protocol, http_method, http_path
+| filter protocol = "https"
+| sort @timestamp desc
+| limit 50
+```
+
+### ECS Metadata Enrichment
+
+When running on ECS, the tracer detects the `ECS_CONTAINER_METADATA_URI_V4` environment variable and includes `"runtime":"ecs"` in JSON events. The ECS task metadata (task ARN, cluster name) can be enriched downstream via CloudWatch Logs or a log shipper that reads the ECS metadata endpoint.
+
+### Limitations
+
+- **Fargate is not supported** — eBPF requires `CAP_SYS_ADMIN` and kernel access unavailable on Fargate.
+- **K8s metadata fields** (`k8s_pod`, `k8s_namespace`) are not populated on ECS — use ECS task metadata instead.
+- **Network mode must be `host`** — `awsvpc` mode isolates network namespaces, limiting visibility to the task's own traffic.
+
+---
+
 ## Data Sanitisation & Redaction
 
 Sensitive HTTP headers are **automatically redacted** (replaced with `[REDACTED]`) before events reach stdout:
@@ -534,7 +593,7 @@ eBPF uprobes add approximately **1–2 µs per `SSL_read`/`SSL_write` call**. At
 - **Rate-limited `/proc` reads** — capped at 50/s to prevent I/O storms under PID churn.
 - **Variable-length events** — only copies actual data bytes, not fixed 16 KB buffers.
 
-> **Kernel note:** Linux 6.1+ is recommended. Kernels prior to 6.12.8 contain a ring buffer race condition (CVE-2025-40319); the tracer emits a warning at startup on affected versions.
+> **Kernel note:** Linux **6.12.8+** is recommended. Kernels prior to 6.12.8 contain a ring buffer race condition ([CVE-2025-40319](https://nvd.nist.gov/vuln/detail/CVE-2025-40319)); the tracer emits a warning at startup on affected versions. Minimum supported kernel is 5.5+.
 
 ---
 
@@ -635,7 +694,7 @@ sudo ./bin/tls_tracer -f json -v
 │                                                                  │
 │  BPF Maps                                                        │
 │    ├── ssl_args_map       (HASH)         per-thread SSL args     │
-│    ├── conn_info_map      (LRU_HASH)     pid_tgid → addresses   │
+│    ├── conn_info_map      (LRU_HASH)     {pid,fd} → addresses   │
 │    ├── ssl_version_map    (LRU_HASH)     SSL* → TLS version     │
 │    ├── cipher_name_map    (LRU_HASH)     SSL* → cipher name     │
 │    ├── mtls_map           (LRU_HASH)     SSL* → mTLS flag       │
@@ -662,6 +721,7 @@ ebpf-tls-tracer/
 ├── include/
 │   ├── tracer.h              # Shared structs (kernel + user space)
 │   ├── config.h              # Configuration constants
+│   ├── filter.h              # Traffic filter data structures
 │   ├── k8s.h                 # Kubernetes metadata interface
 │   ├── output.h              # Output formatting interface
 │   └── protocol.h            # Protocol detection interface
@@ -670,10 +730,12 @@ ebpf-tls-tracer/
 │   ├── tls_tracer.c          # User-space CLI entry point
 │   ├── protocol.c            # L7 protocol detection engine
 │   ├── output.c              # JSON / text event formatting
+│   ├── filter.c              # Traffic filtering (CIDR, protocol, method, direction)
 │   └── k8s.c                 # Kubernetes metadata enrichment
 ├── tests/
 │   ├── test_tracer.c         # Struct and constant tests (16 tests)
 │   ├── test_helpers.c        # Helper function tests (46 tests)
+│   ├── test_filter.c         # Traffic filter tests
 │   ├── test_s3_shipper.py    # S3 log shipper tests
 │   └── test_kinesis_shipper.py  # Kinesis shipper tests
 ├── scripts/
@@ -698,7 +760,7 @@ ebpf-tls-tracer/
 | Requirement | Details |
 |---|---|
 | **Operating system** | Linux x86_64 or aarch64 (ARM64) |
-| **Kernel** | 5.5+ minimum; **6.1+ recommended** |
+| **Kernel** | 5.5+ minimum; **6.12.8+ recommended** (see CVE-2025-40319) |
 | **Privileges** | Root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
 | **OpenSSL** | `libssl.so` installed (auto-detected) |
 | **Runtime libraries** | `libbpf`, `libelf`, `zlib` |
@@ -723,6 +785,49 @@ sudo apt-get install libbpf1 libelf1 zlib1g libssl3
 # AL2023 / RHEL / Fedora
 sudo dnf install libbpf elfutils-libelf zlib openssl-libs
 ```
+
+---
+
+## Security Scanning
+
+The CI pipeline integrates multiple security scanning tools suitable for enterprise security evaluation:
+
+| Tool | Purpose | CI Workflow |
+|---|---|---|
+| **CodeQL** | Static Application Security Testing (SAST) for C/C++ and Python | `codeql.yml` |
+| **Semgrep** | Pattern-based SAST with community rules | `semgrep.yml` |
+| **Trivy** | Container image vulnerability scanning | `build.yml` |
+| **AddressSanitizer** | Runtime memory error detection (buffer overflow, use-after-free) | `build.yml` |
+| **UndefinedBehaviorSanitizer** | Runtime UB detection (integer overflow, null deref) | `build.yml` |
+| **SonarQube** | Code quality and security analysis (optional, requires external server) | `build.yml` |
+| **libbpf CVE check** | Detects vulnerable libbpf 1.5.0 (CVE-2025-29481) | `build.yml` |
+| **OpenSSL CVE check** | Warns about CVE-2025-15467 affected versions | `build.yml` |
+
+### Running Locally
+
+```bash
+# AddressSanitizer + UBSan build
+make clean
+make CFLAGS="-O1 -g -Wall -Wextra -Werror -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer" \
+     LDFLAGS="-lbpf -lelf -lz -ldl -fsanitize=address,undefined" test
+
+# Container image scan with Trivy
+docker build -t tls_tracer:scan .
+trivy image --severity CRITICAL,HIGH tls_tracer:scan
+
+# Semgrep scan
+semgrep scan --config auto src/ include/
+```
+
+### Build Hardening
+
+The binary is compiled with full hardening flags:
+
+- `-fstack-protector-strong` — Stack canaries for buffer overflow detection
+- `-D_FORTIFY_SOURCE=2` — Runtime buffer overflow checks in libc functions
+- `-fPIE` / `-pie` — Position-independent executable (ASLR support)
+- `-Wl,-z,relro,-z,now` — Full RELRO (GOT hardening against overwrite attacks)
+- `-Wformat=2 -Wformat-security` — Format string vulnerability detection
 
 ---
 
