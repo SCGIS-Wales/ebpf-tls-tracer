@@ -131,7 +131,7 @@ $(BUILD_DIR)/test_tracer.o: $(TEST_DIR)/test_tracer.c $(INCLUDE_DIR)/tracer.h | 
 
 $(TEST_BIN): $(BUILD_DIR)/test_tracer.o | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(GCC) -o $@ $^
+	@$(GCC) -o $@ $^ $(LDFLAGS)
 
 # Helper function tests (JSON, HTTP, Kafka, sanitize, addr formatting)
 $(BUILD_DIR)/test_helpers.o: $(TEST_HELPERS_SRC) $(INCLUDE_DIR)/tracer.h | $(BUILD_DIR)
@@ -140,7 +140,7 @@ $(BUILD_DIR)/test_helpers.o: $(TEST_HELPERS_SRC) $(INCLUDE_DIR)/tracer.h | $(BUI
 
 $(TEST_HELPERS_BIN): $(BUILD_DIR)/test_helpers.o | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(GCC) -o $@ $^
+	@$(GCC) -o $@ $^ $(LDFLAGS)
 
 # Filter unit tests (needs filter.o and protocol.o for function definitions)
 $(BUILD_DIR)/test_filter.o: $(TEST_FILTER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
@@ -149,7 +149,7 @@ $(BUILD_DIR)/test_filter.o: $(TEST_FILTER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 
 $(TEST_FILTER_BIN): $(BUILD_DIR)/test_filter.o $(BUILD_DIR)/filter.o $(BUILD_DIR)/protocol.o | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(GCC) -o $@ $^
+	@$(GCC) -o $@ $^ $(LDFLAGS)
 
 test: $(TEST_BIN) $(TEST_HELPERS_BIN) $(TEST_FILTER_BIN)
 	@echo "  TEST    Running struct/constant tests..."
