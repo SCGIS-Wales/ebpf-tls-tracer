@@ -199,6 +199,7 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     event->direction = 0;
     event->event_type = 0;
     event->is_mtls = 0;
+    event->tls_library = TLS_LIB_OPENSSL;
     event->error_code = 0;
     event->addr_family = 0;
     event->local_port = 0;
@@ -970,6 +971,394 @@ int probe_ssl_write_return(struct pt_regs *ctx)
 
 cleanup:
     bpf_map_delete_elem(&ssl_args_map, &id);
+    return 0;
+}
+
+/* ========================================================================
+ * GnuTLS probes: trace gnutls_record_recv/send and gnutls_transport_get_int
+ * for FD extraction. All probes emit to the same tls_events ring buffer.
+ * ======================================================================== */
+
+/* GnuTLS args map: stash {session, buf, size} per thread */
+struct gnutls_args_t {
+    void *session;  /* gnutls_session_t */
+    void *buf;
+    int   size;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct gnutls_args_t);
+} gnutls_args_map SEC(".maps");
+
+/* GnuTLS FD map: session pointer → fd (populated by gnutls_transport_get_int) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);  /* gnutls_session_t cast to u64 */
+    __type(value, int);
+} gnutls_fd_map SEC(".maps");
+
+/* gnutls_transport_get_int: captures the FD associated with a session */
+struct gnutls_transport_args_t {
+    void *session;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct gnutls_transport_args_t);
+} gnutls_transport_args_map SEC(".maps");
+
+SEC("uprobe/gnutls_transport_get_int")
+int probe_gnutls_transport_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_transport_args_t args = {};
+    args.session = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&gnutls_transport_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/gnutls_transport_get_int")
+int probe_gnutls_transport_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_transport_args_t *args;
+    args = bpf_map_lookup_elem(&gnutls_transport_args_map, &id);
+    if (!args)
+        return 0;
+
+    int fd = (int)PT_REGS_RC(ctx);
+    if (fd >= 0) {
+        __u64 key = (__u64)(unsigned long)args->session;
+        bpf_map_update_elem(&gnutls_fd_map, &key, &fd, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&gnutls_transport_args_map, &id);
+    return 0;
+}
+
+static __always_inline int get_gnutls_fd(void *session)
+{
+    __u64 key = (__u64)(unsigned long)session;
+    int *fd = bpf_map_lookup_elem(&gnutls_fd_map, &key);
+    if (fd && *fd >= 0)
+        return *fd;
+    return -1;
+}
+
+/* gnutls_record_recv: ssize_t gnutls_record_recv(gnutls_session_t, void *buf, size_t len) */
+SEC("uprobe/gnutls_record_recv")
+int probe_gnutls_recv_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t args = {};
+    args.session = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&gnutls_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/gnutls_record_recv")
+int probe_gnutls_recv_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t *args = bpf_map_lookup_elem(&gnutls_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_gnutls_recv;
+
+    int fd = get_gnutls_fd(args->session);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_gnutls_recv;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_READ;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_GNUTLS;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 read_len = ret;
+    if (read_len > MAX_DATA_LEN)
+        read_len = MAX_DATA_LEN;
+    event->data_len = read_len;
+
+    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_gnutls_recv:
+    bpf_map_delete_elem(&gnutls_args_map, &id);
+    return 0;
+}
+
+/* gnutls_record_send: ssize_t gnutls_record_send(gnutls_session_t, const void *buf, size_t len) */
+SEC("uprobe/gnutls_record_send")
+int probe_gnutls_send_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t args = {};
+    args.session = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&gnutls_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/gnutls_record_send")
+int probe_gnutls_send_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t *args = bpf_map_lookup_elem(&gnutls_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_gnutls_send;
+
+    int fd = get_gnutls_fd(args->session);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_gnutls_send;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_WRITE;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_GNUTLS;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 write_len = ret;
+    if (write_len > MAX_DATA_LEN)
+        write_len = MAX_DATA_LEN;
+    event->data_len = write_len;
+
+    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_gnutls_send:
+    bpf_map_delete_elem(&gnutls_args_map, &id);
+    return 0;
+}
+
+/* ========================================================================
+ * wolfSSL probes: trace wolfSSL_read/wolfSSL_write and wolfSSL_get_fd
+ * ======================================================================== */
+
+struct wolfssl_args_t {
+    void *ssl;   /* WOLFSSL * */
+    void *buf;
+    int   size;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct wolfssl_args_t);
+} wolfssl_args_map SEC(".maps");
+
+/* wolfSSL FD map: ssl pointer → fd (populated by wolfSSL_get_fd) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, int);
+} wolfssl_fd_map SEC(".maps");
+
+struct wolfssl_getfd_args_t {
+    void *ssl;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct wolfssl_getfd_args_t);
+} wolfssl_getfd_args_map SEC(".maps");
+
+/* wolfSSL_get_fd: int wolfSSL_get_fd(const WOLFSSL *ssl) */
+SEC("uprobe/wolfSSL_get_fd")
+int probe_wolfssl_getfd_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_getfd_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&wolfssl_getfd_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/wolfSSL_get_fd")
+int probe_wolfssl_getfd_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_getfd_args_t *args;
+    args = bpf_map_lookup_elem(&wolfssl_getfd_args_map, &id);
+    if (!args)
+        return 0;
+
+    int fd = (int)PT_REGS_RC(ctx);
+    if (fd >= 0) {
+        __u64 key = (__u64)(unsigned long)args->ssl;
+        bpf_map_update_elem(&wolfssl_fd_map, &key, &fd, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&wolfssl_getfd_args_map, &id);
+    return 0;
+}
+
+static __always_inline int get_wolfssl_fd(void *ssl)
+{
+    __u64 key = (__u64)(unsigned long)ssl;
+    int *fd = bpf_map_lookup_elem(&wolfssl_fd_map, &key);
+    if (fd && *fd >= 0)
+        return *fd;
+    return -1;
+}
+
+/* wolfSSL_read: int wolfSSL_read(WOLFSSL *ssl, void *data, int sz) */
+SEC("uprobe/wolfSSL_read")
+int probe_wolfssl_read_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&wolfssl_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/wolfSSL_read")
+int probe_wolfssl_read_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t *args = bpf_map_lookup_elem(&wolfssl_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_wolfssl_read;
+
+    int fd = get_wolfssl_fd(args->ssl);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_wolfssl_read;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_READ;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_WOLFSSL;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 read_len = ret;
+    if (read_len > MAX_DATA_LEN)
+        read_len = MAX_DATA_LEN;
+    event->data_len = read_len;
+
+    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_wolfssl_read:
+    bpf_map_delete_elem(&wolfssl_args_map, &id);
+    return 0;
+}
+
+/* wolfSSL_write: int wolfSSL_write(WOLFSSL *ssl, const void *data, int sz) */
+SEC("uprobe/wolfSSL_write")
+int probe_wolfssl_write_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&wolfssl_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/wolfSSL_write")
+int probe_wolfssl_write_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t *args = bpf_map_lookup_elem(&wolfssl_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_wolfssl_write;
+
+    int fd = get_wolfssl_fd(args->ssl);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_wolfssl_write;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_WRITE;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_WOLFSSL;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 write_len = ret;
+    if (write_len > MAX_DATA_LEN)
+        write_len = MAX_DATA_LEN;
+    event->data_len = write_len;
+
+    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_wolfssl_write:
+    bpf_map_delete_elem(&wolfssl_args_map, &id);
     return 0;
 }
 
