@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include "output.h"
 #include "config.h"
+#include "filter.h"
 #include "protocol.h"
 #include "k8s.h"
 
@@ -108,6 +109,16 @@ int handle_event(void *ctx, void *data, size_t size)
     __u32 data_len = event->data_len;
     if (data_len > MAX_DATA_LEN)
         data_len = MAX_DATA_LEN;
+
+    /* Early HTTP parse for traffic filter (method filter needs HTTP info) */
+    struct http_info http_early;
+    memset(&http_early, 0, sizeof(http_early));
+    if (data_len > 0)
+        parse_http_info(event->data, data_len, &http_early);
+
+    /* Apply traffic filters (CIDR, protocol, method, direction) */
+    if (filter_event(&c->filter, event, &http_early) == 0)
+        return 0;
 
     char addr_buf[128];
     format_addr(event, addr_buf, sizeof(addr_buf));
@@ -295,10 +306,8 @@ int handle_event(void *ctx, void *data, size_t size)
         }
 
         /* HTTP Layer 7 parsing (both directions — WRITE for requests, READ for responses) */
-        struct http_info http;
-        memset(&http, 0, sizeof(http));
-        if (data_len > 0)
-            parse_http_info(event->data, data_len, &http);
+        /* Reuse early HTTP parse from filter stage */
+        struct http_info http = http_early;
 
         /* Apply sanitization patterns to HTTP fields */
         if (http.path[0])

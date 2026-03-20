@@ -2,6 +2,7 @@
 #define CONFIG_H
 
 #include "tracer.h"
+#include "filter.h"
 #include <regex.h>
 #include <arpa/inet.h>  /* INET6_ADDRSTRLEN */
 
@@ -34,6 +35,7 @@ struct config {
     char            host_ip[INET6_ADDRSTRLEN];
     struct sanitize_pattern sanitize[MAX_SANITIZE_PATTERNS];
     int             sanitize_count;
+    struct traffic_filter filter;
 };
 
 /* DNS cache: hostname lookup/store per {pid, fd} connection */
