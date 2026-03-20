@@ -26,6 +26,7 @@ struct sanitize_pattern {
 struct config {
     enum output_fmt format;
     char            ssl_lib[256];
+    char            boringssl_bin[256]; /* path to binary with statically-linked BoringSSL (e.g., Envoy) */
     __u32           filter_pid;
     __u32           filter_uid;
     int             hex_dump;

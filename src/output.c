@@ -596,6 +596,8 @@ int handle_event(void *ctx, void *data, size_t size)
             printf(",\"tls_library\":\"gnutls\"");
         else if (event->tls_library == TLS_LIB_WOLFSSL)
             printf(",\"tls_library\":\"wolfssl\"");
+        else if (event->tls_library == TLS_LIB_BORINGSSL)
+            printf(",\"tls_library\":\"boringssl\"");
 
         printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
 

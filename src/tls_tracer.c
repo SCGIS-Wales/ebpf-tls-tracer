@@ -24,6 +24,8 @@
 #include <sys/utsname.h>  /* for uname() — C-3 kernel version check */
 #include <fcntl.h>     /* for O_RDONLY — H-4 bounded /proc read */
 #include <dlfcn.h>     /* dlopen/dlsym for R1-REL OpenSSL version check */
+#include <gelf.h>      /* ELF symbol parsing for BoringSSL binary verification */
+#include <libelf.h>
 #include <ifaddrs.h>   /* getifaddrs() for host IP auto-detection */
 #include <net/if.h>    /* IFF_LOOPBACK */
 #include <bpf/libbpf.h>
@@ -315,6 +317,121 @@ static int find_wolfssl_library(char *path, size_t path_len)
     return -1;
 }
 
+/* Find binary with statically-linked BoringSSL (e.g., Envoy for Apigee Hybrid).
+ * Unlike shared libraries, BoringSSL is compiled directly into the binary.
+ * Search common Envoy/Istio/Apigee paths in K8s DaemonSet and host contexts. */
+static int find_boringssl_binary(char *path, size_t path_len)
+{
+    const char *candidates[] = {
+        /* K8s DaemonSet with host filesystem at /host */
+        "/host/usr/local/bin/envoy",
+        "/host/usr/bin/envoy",
+        /* Direct access (container or host) */
+        "/usr/local/bin/envoy",
+        "/usr/bin/envoy",
+        /* Apigee-specific paths */
+        "/host/opt/apigee/bin/envoy",
+        "/opt/apigee/bin/envoy",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Verify a binary contains required SSL symbols using ELF parsing.
+ * Returns 0 if all required symbols found, -1 if any missing.
+ * Used to detect stripped binaries before attempting uprobe attachment. */
+static int verify_boringssl_symbols(const char *binary_path, int verbose)
+{
+    const char *required[] = {"SSL_read", "SSL_write"};
+    const char *optional[] = {"SSL_get_fd", "SSL_version",
+                               "SSL_get_current_cipher", "SSL_get_certificate"};
+    int required_count = 2;
+    int optional_count = 4;
+
+    int bin_fd = open(binary_path, O_RDONLY);
+    if (bin_fd < 0)
+        return -1;
+
+    if (elf_version(EV_CURRENT) == EV_NONE) {
+        close(bin_fd);
+        return -1;
+    }
+
+    Elf *elf = elf_begin(bin_fd, ELF_C_READ, NULL);
+    if (!elf) {
+        close(bin_fd);
+        return -1;
+    }
+
+    /* Scan all symbol tables (.symtab and .dynsym) */
+    int found_required[2] = {0, 0};
+    int found_optional[4] = {0, 0, 0, 0};
+
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(elf, scn)) != NULL) {
+        GElf_Shdr shdr;
+        if (gelf_getshdr(scn, &shdr) == NULL)
+            continue;
+        if (shdr.sh_type != SHT_SYMTAB && shdr.sh_type != SHT_DYNSYM)
+            continue;
+
+        Elf_Data *data = elf_getdata(scn, NULL);
+        if (!data)
+            continue;
+
+        int num_syms = (int)(shdr.sh_size / shdr.sh_entsize);
+        for (int i = 0; i < num_syms; i++) {
+            GElf_Sym sym;
+            if (gelf_getsym(data, i, &sym) == NULL)
+                continue;
+
+            const char *name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+            if (!name)
+                continue;
+
+            for (int r = 0; r < required_count; r++) {
+                if (strcmp(name, required[r]) == 0)
+                    found_required[r] = 1;
+            }
+            for (int o = 0; o < optional_count; o++) {
+                if (strcmp(name, optional[o]) == 0)
+                    found_optional[o] = 1;
+            }
+        }
+    }
+
+    elf_end(elf);
+    close(bin_fd);
+
+    int all_required = 1;
+    for (int r = 0; r < required_count; r++) {
+        if (!found_required[r]) {
+            fprintf(stderr, "Error: Required symbol '%s' not found in %s\n",
+                    required[r], binary_path);
+            all_required = 0;
+        }
+    }
+
+    if (verbose) {
+        for (int r = 0; r < required_count; r++)
+            fprintf(stderr, "  %s: %s %s\n", found_required[r] ? "Found" : "MISSING",
+                    required[r], found_required[r] ? "" : "(REQUIRED)");
+        for (int o = 0; o < optional_count; o++)
+            fprintf(stderr, "  %s: %s %s\n", found_optional[o] ? "Found" : "Missing",
+                    optional[o], found_optional[o] ? "" : "(optional)");
+    }
+
+    return all_required ? 0 : -1;
+}
+
 /* Probe specification for library-specific uprobe attachment */
 struct probe_spec {
     const char *bpf_name;
@@ -338,6 +455,28 @@ static const struct probe_spec wolfssl_probes[] = {
     {"probe_wolfssl_write_return",  "wolfSSL_write",  1},
     {"probe_wolfssl_getfd_enter",   "wolfSSL_get_fd", 0},
     {"probe_wolfssl_getfd_return",  "wolfSSL_get_fd", 1},
+};
+
+/* BoringSSL probes: attach to statically-linked binary (e.g., Envoy).
+ * Same function names as OpenSSL (API-compatible), but mapped to
+ * BoringSSL-specific BPF programs with syscall-based fd correlation. */
+static const struct probe_spec boringssl_probes[] = {
+    {"probe_boringssl_read_enter",    "SSL_read",    0},
+    {"probe_boringssl_read_return",   "SSL_read",    1},
+    {"probe_boringssl_write_enter",   "SSL_write",   0},
+    {"probe_boringssl_write_return",  "SSL_write",   1},
+    {"probe_boringssl_getfd_enter",   "SSL_get_fd",  0},
+    {"probe_boringssl_getfd_return",  "SSL_get_fd",  1},
+};
+
+/* Optional BoringSSL probes — attach if symbols present, no error if missing */
+static const struct probe_spec boringssl_optional_probes[] = {
+    {"probe_boringssl_version_enter",  "SSL_version",             0},
+    {"probe_boringssl_version_return", "SSL_version",             1},
+    {"probe_boringssl_cipher_enter",   "SSL_get_current_cipher",  0},
+    {"probe_boringssl_cipher_return",  "SSL_get_current_cipher",  1},
+    {"probe_boringssl_cert_enter",     "SSL_get_certificate",     0},
+    {"probe_boringssl_cert_return",    "SSL_get_certificate",     1},
 };
 
 /* Attach probes for a specific TLS library.
@@ -393,6 +532,9 @@ static void usage(const char *prog)
         "  -p, --pid PID          Filter by process ID\n"
         "  -u, --uid UID          Filter by user ID\n"
         "  -l, --lib PATH         Path to libssl.so (auto-detected by default)\n"
+        "  -B, --boringssl-bin PATH  Path to binary with statically-linked BoringSSL\n"
+        "                            (e.g., /usr/local/bin/envoy for Apigee Hybrid/Istio).\n"
+        "                            Auto-detects common Envoy paths if not specified.\n"
         "  -f, --format FMT       Output format: text (default) or json\n"
         "  -x, --hex              Show hex dump of captured data\n"
         "  -d, --data-only        Print only captured data (no headers)\n"
@@ -570,6 +712,7 @@ int main(int argc, char **argv)
         {"pcap-snaplen", required_argument, NULL, 1004},
         {"metrics-port", required_argument, NULL, 1005},
         {"metrics-path", required_argument, NULL, 1006},
+        {"boringssl-bin", required_argument, NULL, 'B'},
         {"verbose",      no_argument,       NULL, 'v'},
         {"version",      no_argument,       NULL, 'V'},
         {"help",         no_argument,       NULL, 'h'},
@@ -577,7 +720,7 @@ int main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qn:P:m:D:Hc:t:r:AvVh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:B:f:xds:qn:P:m:D:Hc:t:r:AvVh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': {
             char *endp;
@@ -603,6 +746,9 @@ int main(int argc, char **argv)
         }
         case 'l':
             snprintf(cfg.ssl_lib, sizeof(cfg.ssl_lib), "%s", optarg);
+            break;
+        case 'B':
+            snprintf(cfg.boringssl_bin, sizeof(cfg.boringssl_bin), "%s", optarg);
             break;
         case 'f':
             if (strcmp(optarg, "json") == 0)
@@ -838,11 +984,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Find SSL library */
+    /* Find SSL library (OpenSSL).
+     * Not fatal if BoringSSL binary is specified/detected — allows running
+     * on systems where only Envoy with statically-linked BoringSSL exists. */
     if (cfg.ssl_lib[0] == '\0') {
         if (find_ssl_library(cfg.ssl_lib, sizeof(cfg.ssl_lib)) != 0) {
-            fprintf(stderr, "Error: Could not find libssl.so. Specify with --lib PATH.\n");
-            return 1;
+            if (cfg.boringssl_bin[0]) {
+                if (cfg.verbose)
+                    fprintf(stderr, "OpenSSL not found (using BoringSSL binary instead)\n");
+            } else {
+                /* Check if auto-detect finds a BoringSSL binary */
+                char tmp_boring[256] = "";
+                if (find_boringssl_binary(tmp_boring, sizeof(tmp_boring)) == 0) {
+                    if (cfg.verbose)
+                        fprintf(stderr, "OpenSSL not found, but found BoringSSL binary: %s\n", tmp_boring);
+                } else {
+                    fprintf(stderr, "Error: Could not find libssl.so. "
+                            "Specify with --lib PATH or --boringssl-bin PATH.\n");
+                    return 1;
+                }
+            }
         }
     } else {
         /* Use open() instead of access() to avoid TOCTOU race (CWE-367) */
@@ -855,10 +1016,11 @@ int main(int argc, char **argv)
         close(fd);
     }
 
-    if (cfg.verbose)
-        fprintf(stderr, "Using SSL library: %s\n", cfg.ssl_lib);
-
-    validate_openssl_version(cfg.ssl_lib);
+    if (cfg.ssl_lib[0]) {
+        if (cfg.verbose)
+            fprintf(stderr, "Using SSL library: %s\n", cfg.ssl_lib);
+        validate_openssl_version(cfg.ssl_lib);
+    }
 
     /* Detect host/node IP for JSON enrichment (EC2 instance IP) */
     detect_host_ip(cfg.host_ip, sizeof(cfg.host_ip));
@@ -1061,71 +1223,73 @@ int main(int argc, char **argv)
             fprintf(stderr, "Attached kprobe: %s\n", kprobe_names[i]);
     }
 
-    /* Attach uprobes to SSL functions */
-    const char *uprobe_names[] = {
-        "probe_ssl_read_enter",
-        "probe_ssl_read_return",
-        "probe_ssl_write_enter",
-        "probe_ssl_write_return",
-        "probe_ssl_version_enter",
-        "probe_ssl_version_return",
-        "probe_ssl_get_cipher_enter",
-        "probe_ssl_get_cipher_return",
-        "probe_ssl_get_cert_enter",
-        "probe_ssl_get_cert_return",
-    };
-    int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
-    const char *func_names[] = {
-        "SSL_read",
-        "SSL_read",
-        "SSL_write",
-        "SSL_write",
-        "SSL_version",
-        "SSL_version",
-        "SSL_get_current_cipher",
-        "SSL_get_current_cipher",
-        "SSL_get_certificate",
-        "SSL_get_certificate",
-    };
-
+    /* Attach uprobes to OpenSSL functions (skip if no OpenSSL library found) */
     int uprobe_count = 0;
-    for (int i = 0; i < 10; i++) {
-        prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
-        if (!prog) {
-            fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
-                    uprobe_names[i]);
+    if (cfg.ssl_lib[0]) {
+        const char *uprobe_names[] = {
+            "probe_ssl_read_enter",
+            "probe_ssl_read_return",
+            "probe_ssl_write_enter",
+            "probe_ssl_write_return",
+            "probe_ssl_version_enter",
+            "probe_ssl_version_return",
+            "probe_ssl_get_cipher_enter",
+            "probe_ssl_get_cipher_return",
+            "probe_ssl_get_cert_enter",
+            "probe_ssl_get_cert_return",
+        };
+        int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
+        const char *func_names[] = {
+            "SSL_read",
+            "SSL_read",
+            "SSL_write",
+            "SSL_write",
+            "SSL_version",
+            "SSL_version",
+            "SSL_get_current_cipher",
+            "SSL_get_current_cipher",
+            "SSL_get_certificate",
+            "SSL_get_certificate",
+        };
+
+        for (int i = 0; i < 10; i++) {
+            prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
+            if (!prog) {
+                fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
+                        uprobe_names[i]);
+                err = 1;
+                goto cleanup;
+            }
+
+            LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
+                .retprobe = is_retprobe[i],
+                .func_name = func_names[i],
+            );
+
+            links[link_count] = bpf_program__attach_uprobe_opts(
+                prog, -1, cfg.ssl_lib, 0, &uprobe_opts);
+
+            if (!links[link_count] || libbpf_get_error(links[link_count])) {
+                links[link_count] = NULL;
+                fprintf(stderr, "Warning: Could not attach uprobe for %s (%s). "
+                        "Ensure libssl has debug symbols or is not stripped.\n",
+                        func_names[i], is_retprobe[i] ? "return" : "entry");
+                continue;
+            }
+            link_count++;
+            uprobe_count++;
+        }
+
+        if (uprobe_count == 0) {
+            fprintf(stderr, "Error: Could not attach any OpenSSL probes. "
+                    "Check that the SSL library path is correct and has symbols.\n");
             err = 1;
             goto cleanup;
         }
 
-        LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
-            .retprobe = is_retprobe[i],
-            .func_name = func_names[i],
-        );
-
-        links[link_count] = bpf_program__attach_uprobe_opts(
-            prog, -1, cfg.ssl_lib, 0, &uprobe_opts);
-
-        if (!links[link_count] || libbpf_get_error(links[link_count])) {
-            links[link_count] = NULL;
-            fprintf(stderr, "Warning: Could not attach uprobe for %s (%s). "
-                    "Ensure libssl has debug symbols or is not stripped.\n",
-                    func_names[i], is_retprobe[i] ? "return" : "entry");
-            continue;
-        }
-        link_count++;
-        uprobe_count++;
+        if (cfg.verbose)
+            fprintf(stderr, "Attached %d/%d OpenSSL probes.\n", uprobe_count, 10);
     }
-
-    if (uprobe_count == 0) {
-        fprintf(stderr, "Error: Could not attach any SSL probes. "
-                "Check that the SSL library path is correct and has symbols.\n");
-        err = 1;
-        goto cleanup;
-    }
-
-    if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d OpenSSL probes.\n", uprobe_count, 10);
 
     /* Auto-detect and attach GnuTLS probes */
     {
@@ -1156,6 +1320,94 @@ int main(int argc, char **argv)
                         wolfssl_lib);
         } else if (cfg.verbose) {
             fprintf(stderr, "wolfSSL library not found (optional)\n");
+        }
+    }
+
+    /* Auto-detect and attach BoringSSL probes (statically-linked in binary).
+     * BoringSSL is used by Envoy (Apigee Hybrid / Istio ingress gateway).
+     * Unlike shared libraries, uprobes attach to the binary itself. */
+    {
+        char boringssl_bin[256] = "";
+        int boringssl_explicit = (cfg.boringssl_bin[0] != '\0');
+
+        if (boringssl_explicit) {
+            snprintf(boringssl_bin, sizeof(boringssl_bin), "%s", cfg.boringssl_bin);
+            int bfd = open(boringssl_bin, O_RDONLY);
+            if (bfd < 0) {
+                fprintf(stderr, "Error: Cannot access BoringSSL binary '%s': %s\n",
+                        boringssl_bin, strerror(errno));
+                err = 1;
+                goto cleanup;
+            }
+            close(bfd);
+        } else {
+            find_boringssl_binary(boringssl_bin, sizeof(boringssl_bin));
+        }
+
+        if (boringssl_bin[0]) {
+            if (verify_boringssl_symbols(boringssl_bin, cfg.verbose) == 0) {
+                int n = attach_library_probes(obj, boringssl_probes,
+                            (int)(sizeof(boringssl_probes) / sizeof(boringssl_probes[0])),
+                            boringssl_bin, "BoringSSL", links, &link_count, cfg.verbose);
+                /* Also try optional probes (version, cipher, cert) — no error if missing */
+                int n2 = attach_library_probes(obj, boringssl_optional_probes,
+                            (int)(sizeof(boringssl_optional_probes) / sizeof(boringssl_optional_probes[0])),
+                            boringssl_bin, "BoringSSL (optional)", links, &link_count, 0);
+
+                if (n > 0)
+                    fprintf(stderr, "Attached %d+%d BoringSSL probes (%s)\n",
+                            n, n2, boringssl_bin);
+                else if (boringssl_explicit) {
+                    fprintf(stderr, "Error: Could not attach any BoringSSL probes to %s\n",
+                            boringssl_bin);
+                    err = 1;
+                    goto cleanup;
+                }
+            } else if (boringssl_explicit) {
+                fprintf(stderr, "Error: %s is missing required SSL symbols (binary may be stripped).\n"
+                        "Hint: Check with: readelf -s %s | grep SSL_read\n",
+                        boringssl_bin, boringssl_bin);
+                err = 1;
+                goto cleanup;
+            } else if (cfg.verbose) {
+                fprintf(stderr, "Note: Found %s but SSL symbols missing (stripped?), skipping BoringSSL\n",
+                        boringssl_bin);
+            }
+        } else if (cfg.verbose) {
+            fprintf(stderr, "BoringSSL binary not found (optional)\n");
+        }
+    }
+
+    /* Attach BoringSSL syscall-based fd correlation kprobes.
+     * These are lightweight — only a single map lookup per syscall,
+     * and only match for threads currently inside a BoringSSL SSL call. */
+    {
+        const char *boringssl_kprobe_names[] = {
+            "probe_boringssl_sys_write",
+            "probe_boringssl_sys_writev",
+            "probe_boringssl_sys_sendmsg",
+        };
+        for (int i = 0; i < 3; i++) {
+            struct bpf_program *kp = bpf_object__find_program_by_name(obj,
+                                        boringssl_kprobe_names[i]);
+            if (!kp) {
+                if (cfg.verbose)
+                    fprintf(stderr, "Note: BoringSSL kprobe '%s' not found\n",
+                            boringssl_kprobe_names[i]);
+                continue;
+            }
+            links[link_count] = bpf_program__attach(kp);
+            if (!links[link_count] || libbpf_get_error(links[link_count])) {
+                links[link_count] = NULL;
+                if (cfg.verbose)
+                    fprintf(stderr, "Warning: Could not attach BoringSSL kprobe '%s'\n",
+                            boringssl_kprobe_names[i]);
+                continue;
+            }
+            link_count++;
+            if (cfg.verbose)
+                fprintf(stderr, "Attached BoringSSL kprobe: %s\n",
+                        boringssl_kprobe_names[i]);
         }
     }
 
