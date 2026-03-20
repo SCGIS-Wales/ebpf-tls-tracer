@@ -202,8 +202,8 @@ static void parse_http_info(const char *data, __u32 len, struct http_info *info)
 static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
 {
     if (len < 14) return 0;
-    __u32 msg_size = ((unsigned char)data[0] << 24) | ((unsigned char)data[1] << 16) |
-                     ((unsigned char)data[2] << 8) | (unsigned char)data[3];
+    __u32 msg_size = ((unsigned int)(unsigned char)data[0] << 24) | ((unsigned int)(unsigned char)data[1] << 16) |
+                     ((unsigned int)(unsigned char)data[2] << 8) | (unsigned char)data[3];
     if (msg_size <= 4 || msg_size > 104857600) return 0;
     int ak = (int)(short)(((unsigned char)data[4] << 8) | (unsigned char)data[5]);
     if (ak < 0 || ak > 74) return 0;
@@ -211,8 +211,8 @@ static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
     if (av < 0 || av > 20) return 0;
     /* H-3 fix: corr_id must be > 0 (not just >= 0) to match tls_tracer.c.
      * Issue 3 fix: correlation_id == 0 causes false positives from HTTP/2 frames. */
-    int corr_id = (int)(((unsigned char)data[8] << 24) | ((unsigned char)data[9] << 16) |
-                        ((unsigned char)data[10] << 8) | (unsigned char)data[11]);
+    int corr_id = (int)(((unsigned int)(unsigned char)data[8] << 24) | ((unsigned int)(unsigned char)data[9] << 16) |
+                        ((unsigned int)(unsigned char)data[10] << 8) | (unsigned char)data[11]);
     if (corr_id <= 0) return 0;
     int cid_len = (int)(short)(((unsigned char)data[12] << 8) | (unsigned char)data[13]);
     if (cid_len < -1 || cid_len > 1024) return 0;
@@ -224,11 +224,11 @@ static int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
 static int detect_kafka_response(const char *data, __u32 len)
 {
     if (len < 12) return 0;
-    __u32 msg_size = ((unsigned char)data[0] << 24) | ((unsigned char)data[1] << 16) |
-                     ((unsigned char)data[2] << 8) | (unsigned char)data[3];
+    __u32 msg_size = ((unsigned int)(unsigned char)data[0] << 24) | ((unsigned int)(unsigned char)data[1] << 16) |
+                     ((unsigned int)(unsigned char)data[2] << 8) | (unsigned char)data[3];
     if (msg_size <= 4 || msg_size > 104857600) return 0;
-    int corr_id = (int)(((unsigned char)data[4] << 24) | ((unsigned char)data[5] << 16) |
-                        ((unsigned char)data[6] << 8) | (unsigned char)data[7]);
+    int corr_id = (int)(((unsigned int)(unsigned char)data[4] << 24) | ((unsigned int)(unsigned char)data[5] << 16) |
+                        ((unsigned int)(unsigned char)data[6] << 8) | (unsigned char)data[7]);
     if (corr_id < 0) return 0;
     int error_code = (int)(short)(((unsigned char)data[8] << 8) | (unsigned char)data[9]);
     if (error_code < -1 || error_code > 120) return 0;
@@ -249,6 +249,13 @@ struct test_config {
 };
 
 static struct test_config test_cfg = { .sanitize_count = 0 };
+
+static void free_test_sanitize_patterns(void)
+{
+    for (int i = 0; i < test_cfg.sanitize_count; i++)
+        regfree(&test_cfg.sanitize[i].regex);
+    test_cfg.sanitize_count = 0;
+}
 
 static int add_test_sanitize_pattern(const char *pattern)
 {
@@ -708,7 +715,7 @@ static void test_kafka_response_huge_msg_size(void)
 static void test_sanitize_apikey(void)
 {
     TEST(sanitize_apikey_pattern);
-    test_cfg.sanitize_count = 0;
+    free_test_sanitize_patterns();
     add_test_sanitize_pattern("apikey=[^&]*");
     char str[256] = "/api/v1?apikey=secret123&foo=bar";
     sanitize_string(str, sizeof(str));
@@ -721,7 +728,7 @@ static void test_sanitize_apikey(void)
 static void test_sanitize_multiple_matches(void)
 {
     TEST(sanitize_multiple_matches);
-    test_cfg.sanitize_count = 0;
+    free_test_sanitize_patterns();
     add_test_sanitize_pattern("token=[^&]*");
     char str[256] = "/a?token=abc&x=1&token=def";
     sanitize_string(str, sizeof(str));
@@ -734,7 +741,7 @@ static void test_sanitize_multiple_matches(void)
 static void test_sanitize_no_match(void)
 {
     TEST(sanitize_no_match);
-    test_cfg.sanitize_count = 0;
+    free_test_sanitize_patterns();
     add_test_sanitize_pattern("secret=[^&]*");
     char str[256] = "/api/v1?name=test&id=123";
     char original[256];
@@ -747,7 +754,7 @@ static void test_sanitize_no_match(void)
 static void test_sanitize_empty_string(void)
 {
     TEST(sanitize_empty_string);
-    test_cfg.sanitize_count = 0;
+    free_test_sanitize_patterns();
     add_test_sanitize_pattern("secret=[^&]*");
     char str[4] = "";
     sanitize_string(str, sizeof(str));
@@ -758,7 +765,7 @@ static void test_sanitize_empty_string(void)
 static void test_sanitize_case_insensitive(void)
 {
     TEST(sanitize_case_insensitive);
-    test_cfg.sanitize_count = 0;
+    free_test_sanitize_patterns();
     add_test_sanitize_pattern("APIKEY=[^&]*");
     char str[256] = "/a?apikey=secret";
     sanitize_string(str, sizeof(str));
@@ -969,6 +976,9 @@ int main(void)
     test_edge_conn_key_size();
     test_edge_http_response_101();
     test_edge_http_version_2();
+
+    /* Free any remaining compiled regex patterns to avoid LeakSanitizer reports */
+    free_test_sanitize_patterns();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
