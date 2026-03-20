@@ -63,6 +63,23 @@ filterUid: 0
 # Custom path to libssl.so on the host (empty = auto-detect)
 sslLibPath: ""
 
+# Traffic filters (each entry is "include:<value>" or "exclude:<value>")
+# All entries within a category must use the same mode (include or exclude).
+filters:
+  # Network/CIDR filters: CIDR ranges or keywords (private, public, loopback)
+  net: []
+    # - "include:private"
+    # - "exclude:10.0.0.0/8"
+  # Protocol filters: tcp, udp, http, https, non-https
+  proto: []
+    # - "include:https"
+  # HTTP method filters: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT
+  method: []
+    # - "exclude:DELETE"
+  # Direction filters: inbound, outbound
+  dir: []
+    # - "include:outbound"
+
 # URL sanitization patterns (case-insensitive regex)
 # Matches in HTTP paths and Host headers are replaced with [REDACTED]
 # Each entry is a POSIX extended regex (ERE)

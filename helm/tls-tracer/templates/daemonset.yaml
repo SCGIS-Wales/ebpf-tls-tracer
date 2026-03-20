@@ -50,6 +50,10 @@ spec:
               {{- if .Values.filterUid }} -u {{ .Values.filterUid }}{{- end }}
               {{- if .Values.sslLibPath }} -l {{ .Values.sslLibPath }}{{- end }}
               {{- range .Values.sanitizePatterns }} -s '{{ . }}'{{- end }}
+              {{- range .Values.filters.net }} --net '{{ . }}'{{- end }}
+              {{- range .Values.filters.proto }} --proto '{{ . }}'{{- end }}
+              {{- range .Values.filters.method }} --method '{{ . }}'{{- end }}
+              {{- range .Values.filters.dir }} --dir '{{ . }}'{{- end }}
               | tee -a /var/log/tls-tracer/events.json
           {{- else }}
           args:
@@ -72,6 +76,22 @@ spec:
             {{- end }}
             {{- range .Values.sanitizePatterns }}
             - "-s"
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.filters.net }}
+            - "--net"
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.filters.proto }}
+            - "--proto"
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.filters.method }}
+            - "--method"
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.filters.dir }}
+            - "--dir"
             - {{ . | quote }}
             {{- end }}
           {{- end }}
