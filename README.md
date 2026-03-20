@@ -14,7 +14,7 @@
 
 ---
 
-eBPF TLS Tracer attaches to OpenSSL at the kernel level to capture **decrypted** TLS traffic in real time — without sidecars, proxies, certificate injection, or any application changes. Deploy it as a **CLI binary**, a **container image**, or a **Helm-managed DaemonSet** and gain immediate visibility into every outbound HTTPS, gRPC, Kafka, and WebSocket flow leaving your nodes.
+eBPF TLS Tracer attaches to TLS libraries at the kernel level to capture **decrypted** TLS traffic in real time — without sidecars, proxies, certificate injection, or any application changes. It supports **OpenSSL**, **GnuTLS**, **wolfSSL**, and **BoringSSL** (statically linked in Envoy/Istio/Apigee Hybrid). Deploy it as a **CLI binary**, a **container image**, or a **Helm-managed DaemonSet** and gain immediate visibility into every outbound HTTPS, gRPC, Kafka, and WebSocket flow leaving your nodes.
 
 ---
 
@@ -115,9 +115,9 @@ sudo ./bin/tls_tracer -f json -v
 
 ## How It Works
 
-1. **Kernel-level hooks** — eBPF uprobes attach to OpenSSL's `SSL_read` and `SSL_write` in `libssl.so`. When any process on the node performs a TLS read or write, the probes fire and capture the plaintext buffer contents.
+1. **Kernel-level hooks** — eBPF uprobes attach to `SSL_read` and `SSL_write` in OpenSSL (`libssl.so`), GnuTLS, wolfSSL, and BoringSSL (statically linked in binaries like Envoy). When any process on the node performs a TLS read or write, the probes fire and capture the plaintext buffer contents.
 
-2. **Connection correlation** — Separate kprobes on `connect()` and `tcp_set_state` capture source/destination IP:port pairs. A BPF hash map correlates each SSL operation back to its TCP connection using the socket file descriptor extracted from OpenSSL internals.
+2. **Connection correlation** — Separate kprobes on `connect()` and `tcp_set_state` capture source/destination IP:port pairs. A BPF hash map correlates each SSL operation back to its TCP connection using the socket file descriptor. For BoringSSL/Envoy (which uses custom BIO), syscall-based fd correlation via `writev`/`sendmsg` kprobes is used instead.
 
 3. **TLS posture capture** — Additional uprobes on `SSL_version`, `SSL_get_current_cipher`, and `SSL_get_certificate` extract the negotiated TLS version, cipher suite, and whether a client certificate is present (mTLS detection).
 
@@ -157,6 +157,7 @@ sudo ./bin/tls_tracer [OPTIONS]
 | `-p` | `--pid PID` | Filter by process ID |
 | `-u` | `--uid UID` | Filter by user ID |
 | `-l` | `--lib PATH` | Path to `libssl.so` (auto-detected by default) |
+| `-B` | `--boringssl-bin PATH` | Path to binary with statically-linked BoringSSL (e.g., `/usr/local/bin/envoy`). Auto-detects common Envoy paths if not specified. |
 | `-f` | `--format FMT` | Output format: `text` (default) or `json` |
 | `-x` | `--hex` | Show hex dump of captured data |
 | `-d` | `--data-only` | Print only captured data (no metadata headers) |
@@ -181,6 +182,7 @@ sudo ./bin/tls_tracer -p 1234                   # Filter to a single process
 sudo ./bin/tls_tracer -u 1000                   # Filter by user ID
 sudo ./bin/tls_tracer --quic                    # Enable QUIC/UDP detection
 sudo ./bin/tls_tracer -l /path/to/libssl.so     # Custom OpenSSL path
+sudo ./bin/tls_tracer -B /usr/local/bin/envoy   # Trace Envoy with BoringSSL
 sudo ./bin/tls_tracer -s 'secret=[^&]*'         # Add extra sanitisation pattern
 ```
 
@@ -558,6 +560,67 @@ When running on ECS, the tracer detects the `ECS_CONTAINER_METADATA_URI_V4` envi
 
 ---
 
+## BoringSSL / Apigee Hybrid Support
+
+TLS Tracer supports **BoringSSL**, Google's fork of OpenSSL that is statically linked into Envoy-based proxies used by **Apigee Hybrid**, **Istio**, and **Anthos Service Mesh (ASM)**.
+
+### How It Differs from OpenSSL Tracing
+
+| Aspect | OpenSSL | BoringSSL (Envoy) |
+|--------|---------|-------------------|
+| **Linking** | Shared library (`libssl.so`) | Statically compiled into binary |
+| **Binary** | N/A (attaches to .so) | `/usr/local/bin/envoy` |
+| **fd extraction** | `SSL->rbio->num` struct offset | Syscall-based correlation (`writev`/`sendmsg` kprobes) |
+| **Custom BIO** | Standard socket BIO | Envoy `io_handle_bio.cc` (custom) |
+| **Symbol requirement** | Always present in .so | Binary must not be stripped |
+
+### Why Syscall-Based fd Correlation?
+
+Envoy does **not** use standard socket-based BIO — it implements a custom BIO (`io_handle_bio.cc`) where the socket fd is buried deep in `Envoy::Network::IoHandle` objects, not in the standard `BIO->num` field. The tracer solves this with a three-tier approach:
+
+1. **Tier 1**: `SSL_read`/`SSL_write` uprobes capture plaintext data (always works if symbols present)
+2. **Tier 2**: `SSL_get_fd` uprobe captures fd directly (bonus, if called by Envoy)
+3. **Tier 3**: When a thread is inside `SSL_write`, kprobes on `writev()`/`sendmsg()` capture the fd from the actual kernel syscall — completely bypassing Envoy's custom BIO
+
+### Usage
+
+```bash
+# Explicit path to Envoy binary
+sudo ./bin/tls_tracer --boringssl-bin /usr/local/bin/envoy -f json -v
+
+# K8s DaemonSet with host filesystem mounted at /host
+sudo ./bin/tls_tracer --boringssl-bin /host/usr/local/bin/envoy -f json
+
+# Auto-detect (searches common Envoy paths automatically)
+sudo ./bin/tls_tracer -f json -v
+```
+
+### Apigee Hybrid 1.16 Details
+
+| Detail | Value |
+|--------|-------|
+| **Ingress image** | `gcr.io/apigee-release/hybrid/apigee-asm-ingress` |
+| **Base** | Istio proxyv2 / Anthos Service Mesh (ASM) |
+| **Envoy binary** | `/usr/local/bin/envoy` |
+| **Helm chart** | `apigee-ingress-manager` |
+| **Pod label** | `app: apigee-ingressgateway` |
+
+### JSON Output
+
+BoringSSL events include `"tls_library":"boringssl"` in JSON output:
+
+```json
+{"timestamp":"2026-03-20T10:30:00.000000Z","pid":1234,"comm":"envoy","tls_version":"1.3","tls_library":"boringssl","direction":"request","protocol":"https"}
+```
+
+### Limitations
+
+- **Stripped binaries**: The Envoy binary must retain `SSL_read`/`SSL_write` symbols. Distroless production images may be stripped. Check with: `readelf -s /usr/local/bin/envoy | grep SSL_read`
+- **TLS version/cipher**: Requires optional symbols (`SSL_version`, `SSL_get_current_cipher`). If absent, these fields will be empty.
+- **fd correlation latency**: Syscall-based correlation captures the fd from the first `writev()` call after `SSL_write` entry. If Envoy's BIO path doesn't call `writev()` synchronously, the fd may be missing for the first event on a connection.
+
+---
+
 ## Data Sanitisation & Redaction
 
 Sensitive HTTP headers are **automatically redacted** (replaced with `[REDACTED]`) before events reach stdout:
@@ -762,7 +825,7 @@ ebpf-tls-tracer/
 | **Operating system** | Linux x86_64 or aarch64 (ARM64) |
 | **Kernel** | 5.5+ minimum; **6.12.8+ recommended** (see CVE-2025-40319) |
 | **Privileges** | Root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
-| **OpenSSL** | `libssl.so` installed (auto-detected) |
+| **TLS library** | OpenSSL (`libssl.so`), GnuTLS, wolfSSL (auto-detected), or BoringSSL (statically linked in Envoy/Istio) |
 | **Runtime libraries** | `libbpf`, `libelf`, `zlib` |
 | **Kernel config** | `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`, `CONFIG_KPROBE_EVENTS`, `CONFIG_UPROBE_EVENTS`, `CONFIG_DEBUG_INFO_BTF` |
 

@@ -240,6 +240,45 @@ static void test_comm_max_length(void)
     PASS();
 }
 
+/* --- Test: TLS library constants --- */
+
+static void test_tls_lib_constants(void)
+{
+    TEST(tls_lib_constants);
+    ASSERT_EQ(TLS_LIB_OPENSSL, 0, "TLS_LIB_OPENSSL should be 0");
+    ASSERT_EQ(TLS_LIB_GNUTLS, 1, "TLS_LIB_GNUTLS should be 1");
+    ASSERT_EQ(TLS_LIB_WOLFSSL, 2, "TLS_LIB_WOLFSSL should be 2");
+    ASSERT_EQ(TLS_LIB_BORINGSSL, 3, "TLS_LIB_BORINGSSL should be 3");
+    PASS();
+}
+
+static void test_tls_lib_constants_unique(void)
+{
+    TEST(tls_lib_constants_no_collision);
+    ASSERT_EQ(TLS_LIB_OPENSSL != TLS_LIB_GNUTLS, 1, "openssl != gnutls");
+    ASSERT_EQ(TLS_LIB_OPENSSL != TLS_LIB_WOLFSSL, 1, "openssl != wolfssl");
+    ASSERT_EQ(TLS_LIB_OPENSSL != TLS_LIB_BORINGSSL, 1, "openssl != boringssl");
+    ASSERT_EQ(TLS_LIB_GNUTLS != TLS_LIB_BORINGSSL, 1, "gnutls != boringssl");
+    ASSERT_EQ(TLS_LIB_WOLFSSL != TLS_LIB_BORINGSSL, 1, "wolfssl != boringssl");
+    PASS();
+}
+
+static void test_boringssl_event_tls_library_field(void)
+{
+    TEST(boringssl_event_tls_library_field);
+    struct tls_event_t event = {};
+    event.tls_library = TLS_LIB_BORINGSSL;
+    ASSERT_EQ(event.tls_library, 3, "tls_library should be 3 for BoringSSL");
+
+    /* Verify the field stores correctly alongside other fields */
+    event.pid = 12345;
+    event.direction = DIRECTION_WRITE;
+    event.event_type = EVENT_TLS_DATA;
+    ASSERT_EQ(event.tls_library, TLS_LIB_BORINGSSL, "tls_library persists");
+    ASSERT_EQ(event.pid, 12345U, "pid unaffected");
+    PASS();
+}
+
 /* --- Test: data_len power of 2 (required for BPF masking) --- */
 
 static void test_max_data_len_power_of_2(void)
@@ -294,6 +333,9 @@ int main(void)
     test_conn_key_struct();
     test_max_data_fill();
     test_comm_max_length();
+    test_tls_lib_constants();
+    test_tls_lib_constants_unique();
+    test_boringssl_event_tls_library_field();
     test_max_data_len_power_of_2();
     test_addr_union_overlap();
     test_conn_info_union_overlap();
