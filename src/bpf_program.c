@@ -157,7 +157,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4 * 1024 * 1024);  /* 4 MB ring buffer (H-1 fix) */
+    __uint(max_entries, 16 * 1024 * 1024);  /* 16 MB ring buffer (sized for high-throughput) */
 } tls_events SEC(".maps");
 
 /* H-1 fix: per-CPU counter for dropped events (ring buffer full).
@@ -634,8 +634,10 @@ static __always_inline void enrich_event_with_cipher(struct tls_event_t *event, 
 {
     __u64 key = (__u64)(unsigned long)ssl;
     struct cipher_name_t *cn = bpf_map_lookup_elem(&cipher_name_map, &key);
-    if (cn)
+    if (cn) {
         __builtin_memcpy(event->cipher, cn->name, 64);
+        event->cipher[MAX_CIPHER_LEN - 1] = '\0';  /* ensure NUL-termination */
+    }
 }
 
 /* --- SSL_get_current_cipher probes: capture negotiated cipher suite ---

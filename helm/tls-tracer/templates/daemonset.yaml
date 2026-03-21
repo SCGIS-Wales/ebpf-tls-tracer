@@ -30,12 +30,12 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       # K-3 fix: give sidecars time to flush buffers on pod termination.
       # Default 30s may be insufficient for S3/Kinesis batch uploads.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 120
       containers:
         - name: tls-tracer
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
+          {{- if or .Values.s3.enabled .Values.kinesis.enabled .Values.splunk.enabled }}
           command: ["sh", "-c"]
           args:
             # R3/R7 fix: use tee -a (append) and trap SIGPIPE to prevent
@@ -131,7 +131,7 @@ spec:
                 - -c
                 - >-
                   test -f /var/run/tls-tracer/healthy &&
-                  [ "$(( $(date +%s) - $(stat -c %Y /var/run/tls-tracer/healthy) ))" -lt 30 ]
+                  [ "$(( $(date +%s) - $(stat -c %Y /var/run/tls-tracer/healthy) ))" -lt 60 ]
             initialDelaySeconds: 15
             periodSeconds: 15
             timeoutSeconds: 5
@@ -158,7 +158,7 @@ spec:
             - name: host-ssl-arm64
               mountPath: /host/usr/lib/aarch64-linux-gnu
               readOnly: true
-            {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
+            {{- if or .Values.s3.enabled .Values.kinesis.enabled .Values.splunk.enabled }}
             - name: log-pipe
               mountPath: /var/log/tls-tracer
             {{- end }}
@@ -259,6 +259,51 @@ spec:
             - name: log-pipe
               mountPath: /var/log/tls-tracer
         {{- end }}
+        {{- if .Values.splunk.enabled }}
+        - name: splunk-hec-shipper
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python3", "/opt/tls_tracer/scripts/splunk_hec_shipper.py"]
+          env:
+            - name: SPLUNK_HEC_URL
+              value: {{ .Values.splunk.hecUrl | quote }}
+            - name: SPLUNK_HEC_TOKEN
+              {{- if and .Values.splunk.hecTokenSecret .Values.splunk.hecTokenSecret.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.splunk.hecTokenSecret.name | quote }}
+                  key: {{ .Values.splunk.hecTokenSecret.key | default "token" | quote }}
+              {{- else }}
+              value: {{ .Values.splunk.hecToken | quote }}
+              {{- end }}
+            - name: SPLUNK_INDEX
+              value: {{ .Values.splunk.index | quote }}
+            - name: SPLUNK_SOURCETYPE
+              value: {{ .Values.splunk.sourcetype | quote }}
+            - name: SPLUNK_SOURCE
+              value: {{ .Values.splunk.source | quote }}
+            - name: SPLUNK_VERIFY_SSL
+              value: {{ .Values.splunk.verifySsl | quote }}
+            - name: SPLUNK_BATCH_SIZE
+              value: {{ .Values.splunk.batchSize | quote }}
+            - name: SPLUNK_FLUSH_INTERVAL
+              value: {{ .Values.splunk.flushIntervalSeconds | quote }}
+          securityContext:
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            {{- toYaml .Values.splunk.resources | nindent 12 }}
+          volumeMounts:
+            - name: log-pipe
+              mountPath: /var/log/tls-tracer
+        {{- end }}
       volumes:
         - name: run-dir
           emptyDir:
@@ -291,12 +336,12 @@ spec:
           hostPath:
             path: /usr/lib/aarch64-linux-gnu
             type: DirectoryOrCreate
-        {{- if or .Values.s3.enabled .Values.kinesis.enabled }}
+        {{- if or .Values.s3.enabled .Values.kinesis.enabled .Values.splunk.enabled }}
         # R9 fix: reduced sizeLimit and log rotation handled by shippers.
         # The shipper tracks offsets and truncates after successful upload.
         - name: log-pipe
           emptyDir:
-            sizeLimit: 256Mi
+            sizeLimit: 512Mi
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

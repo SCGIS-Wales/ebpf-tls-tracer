@@ -27,6 +27,7 @@
 #include <gelf.h>      /* ELF symbol parsing for BoringSSL binary verification */
 #include <libelf.h>
 #include <ifaddrs.h>   /* getifaddrs() for host IP auto-detection */
+#include <sys/random.h> /* getrandom() for hash seed */
 #include <net/if.h>    /* IFF_LOOPBACK */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -54,6 +55,12 @@ static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+s
 __u64 stat_events_captured = 0;
 __u64 stat_events_filtered = 0;
 
+/* Health file path for event-driven updates (NULL = disabled) */
+const char *g_health_file = NULL;
+
+/* Random hash seed initialised at startup to prevent hash collision attacks */
+__u64 g_hash_seed = 0;
+
 /* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
  * R-1 fix: Uses open-addressing hash table for O(1) lookup instead of O(n)
  * linear scan. Key is hash(pid, fd). Slot states: EMPTY/OCCUPIED/DELETED.
@@ -76,10 +83,7 @@ static struct dns_cache_entry dns_cache[DNS_CACHE_SIZE];
 
 static inline __u32 dns_hash(__u32 pid, __u32 fd)
 {
-    __u64 key = ((__u64)pid << 32) | fd;
-    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
-    return ((__u32)(key >> 32)) & (DNS_CACHE_SIZE - 1);
+    return mix_hash_pid_fd(pid, fd, DNS_CACHE_SIZE - 1);
 }
 
 const char *dns_cache_lookup(__u32 pid, __u32 fd)
@@ -161,7 +165,7 @@ static struct config cfg = {
     .verbose         = 0,
     .enable_quic     = 0,
     .sanitize_count  = 0,
-    .ring_buffer_mb  = 4,
+    .ring_buffer_mb  = 16,
     .aggregate_timeout = 30,
     .pcap_snaplen    = 4096,
     .metrics_path    = "/metrics",
@@ -181,8 +185,14 @@ static int add_sanitize_pattern(const char *pattern)
                 MAX_SANITIZE_PATTERNS);
         return -1;
     }
+    /* Reject excessively long patterns to limit regex compilation cost */
+    if (strlen(pattern) > 255) {
+        fprintf(stderr, "Error: Sanitize pattern too long (max 255 chars): %.32s...\n",
+                pattern);
+        return -1;
+    }
     struct sanitize_pattern *sp = &cfg.sanitize[cfg.sanitize_count];
-    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE);
+    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB);
     if (ret != 0) {
         char errbuf[128];
         regerror(ret, &sp->regex, errbuf, sizeof(errbuf));
@@ -229,6 +239,21 @@ void sanitize_string(char *str, size_t len, const struct config *c)
     }
 }
 
+/* Generic library/binary search: try each candidate path with open() to avoid
+ * TOCTOU race (CWE-367). Returns 0 if found, -1 otherwise. */
+static int find_library(const char *candidates[], char *path, size_t path_len)
+{
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int find_ssl_library(char *path, size_t path_len)
 {
     const char *candidates[] = {
@@ -256,19 +281,7 @@ static int find_ssl_library(char *path, size_t path_len)
         "/lib64/libssl.so.3",
         NULL,
     };
-
-    for (int i = 0; candidates[i]; i++) {
-        /* Use open() instead of access() to avoid TOCTOU race (CWE-367).
-         * access() checks permissions, then the file is opened later —
-         * an attacker could swap the file between check and use. */
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 static int find_gnutls_library(char *path, size_t path_len)
@@ -283,15 +296,7 @@ static int find_gnutls_library(char *path, size_t path_len)
         "/usr/lib/libgnutls.so.30",
         NULL,
     };
-    for (int i = 0; candidates[i]; i++) {
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 static int find_wolfssl_library(char *path, size_t path_len)
@@ -306,15 +311,7 @@ static int find_wolfssl_library(char *path, size_t path_len)
         "/usr/lib/libwolfssl.so",
         NULL,
     };
-    for (int i = 0; candidates[i]; i++) {
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 /* Find binary with statically-linked BoringSSL (e.g., Envoy for Apigee Hybrid).
@@ -334,15 +331,7 @@ static int find_boringssl_binary(char *path, size_t path_len)
         "/opt/apigee/bin/envoy",
         NULL,
     };
-    for (int i = 0; candidates[i]; i++) {
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 /* Verify a binary contains required SSL symbols using ELF parsing.
@@ -643,15 +632,27 @@ static void detect_host_ip(char *buf, size_t buflen)
     /* 1. Check HOST_IP environment variable (K8s downward API) */
     const char *env_ip = getenv("HOST_IP");
     if (env_ip && env_ip[0]) {
-        snprintf(buf, buflen, "%s", env_ip);
-        return;
+        struct in_addr v4;
+        struct in6_addr v6;
+        if (inet_pton(AF_INET, env_ip, &v4) == 1 ||
+            inet_pton(AF_INET6, env_ip, &v6) == 1) {
+            snprintf(buf, buflen, "%s", env_ip);
+            return;
+        }
+        fprintf(stderr, "Warning: HOST_IP '%s' is not a valid IP address, ignoring\n", env_ip);
     }
 
     /* Also check NODE_IP (alternative naming convention) */
     env_ip = getenv("NODE_IP");
     if (env_ip && env_ip[0]) {
-        snprintf(buf, buflen, "%s", env_ip);
-        return;
+        struct in_addr v4;
+        struct in6_addr v6;
+        if (inet_pton(AF_INET, env_ip, &v4) == 1 ||
+            inet_pton(AF_INET6, env_ip, &v6) == 1) {
+            snprintf(buf, buflen, "%s", env_ip);
+            return;
+        }
+        fprintf(stderr, "Warning: NODE_IP '%s' is not a valid IP address, ignoring\n", env_ip);
     }
 
     /* 2. Auto-detect: first non-loopback IPv4 address */
@@ -688,6 +689,10 @@ int main(int argc, char **argv)
     int err = 0;
     int link_count = 0;
 
+    /* Initialise random hash seed for collision resistance */
+    if (getrandom(&g_hash_seed, sizeof(g_hash_seed), 0) != sizeof(g_hash_seed))
+        g_hash_seed = (__u64)time(NULL) ^ (__u64)getpid();
+
     static const struct option long_opts[] = {
         {"pid",          required_argument, NULL, 'p'},
         {"uid",          required_argument, NULL, 'u'},
@@ -712,6 +717,8 @@ int main(int argc, char **argv)
         {"pcap-snaplen", required_argument, NULL, 1004},
         {"metrics-port", required_argument, NULL, 1005},
         {"metrics-path", required_argument, NULL, 1006},
+        {"metrics-bind", required_argument, NULL, 1007},
+        {"splunk-sourcetype", required_argument, NULL, 1008},
         {"boringssl-bin", required_argument, NULL, 'B'},
         {"verbose",      no_argument,       NULL, 'v'},
         {"version",      no_argument,       NULL, 'V'},
@@ -888,8 +895,8 @@ int main(int argc, char **argv)
             char *endp;
             errno = 0;
             unsigned long val = strtoul(optarg, &endp, 10);
-            if (*endp != '\0' || val == 0 || val > 64 || errno == ERANGE) {
-                fprintf(stderr, "Error: Invalid ring-buffer-size '%s' (1-64 MB)\n", optarg);
+            if (*endp != '\0' || val == 0 || val > 256 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid ring-buffer-size '%s' (1-256 MB)\n", optarg);
                 return 1;
             }
             /* Must be power of 2 */
@@ -945,6 +952,12 @@ int main(int argc, char **argv)
         }
         case 1006:  /* --metrics-path */
             snprintf(cfg.metrics_path, sizeof(cfg.metrics_path), "%s", optarg);
+            break;
+        case 1007:  /* --metrics-bind */
+            snprintf(cfg.metrics_bind, sizeof(cfg.metrics_bind), "%s", optarg);
+            break;
+        case 1008:  /* --splunk-sourcetype */
+            snprintf(cfg.splunk_sourcetype, sizeof(cfg.splunk_sourcetype), "%s", optarg);
             break;
         case 'v':
             cfg.verbose = 1;
@@ -1252,13 +1265,24 @@ int main(int argc, char **argv)
             "SSL_get_certificate",
         };
 
+        /* Probes 0-3 (SSL_read/SSL_write entry+return) are mandatory for
+         * data capture. Probes 4-9 (SSL_version, cipher, certificate) are
+         * optional — failure degrades metadata but doesn't stop tracing. */
+        int mandatory_ok = 1;
         for (int i = 0; i < 10; i++) {
+            int is_mandatory = (i < 4);  /* SSL_read + SSL_write pairs */
+
             prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
             if (!prog) {
-                fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
-                        uprobe_names[i]);
-                err = 1;
-                goto cleanup;
+                if (is_mandatory) {
+                    fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
+                            uprobe_names[i]);
+                    mandatory_ok = 0;
+                } else if (cfg.verbose) {
+                    fprintf(stderr, "Note: Optional BPF program '%s' not found.\n",
+                            uprobe_names[i]);
+                }
+                continue;
             }
 
             LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
@@ -1271,17 +1295,24 @@ int main(int argc, char **argv)
 
             if (!links[link_count] || libbpf_get_error(links[link_count])) {
                 links[link_count] = NULL;
-                fprintf(stderr, "Warning: Could not attach uprobe for %s (%s). "
-                        "Ensure libssl has debug symbols or is not stripped.\n",
-                        func_names[i], is_retprobe[i] ? "return" : "entry");
+                if (is_mandatory) {
+                    fprintf(stderr, "Error: Could not attach mandatory uprobe for %s (%s). "
+                            "Ensure libssl has debug symbols or is not stripped.\n",
+                            func_names[i], is_retprobe[i] ? "return" : "entry");
+                    mandatory_ok = 0;
+                } else {
+                    fprintf(stderr, "Warning: Could not attach optional uprobe for %s (%s). "
+                            "TLS version/cipher/mTLS metadata may be unavailable.\n",
+                            func_names[i], is_retprobe[i] ? "return" : "entry");
+                }
                 continue;
             }
             link_count++;
             uprobe_count++;
         }
 
-        if (uprobe_count == 0) {
-            fprintf(stderr, "Error: Could not attach any OpenSSL probes. "
+        if (!mandatory_ok || uprobe_count == 0) {
+            fprintf(stderr, "Error: Could not attach required OpenSSL probes (SSL_read/SSL_write). "
                     "Check that the SSL library path is correct and has symbols.\n");
             err = 1;
             goto cleanup;
@@ -1446,16 +1477,22 @@ int main(int argc, char **argv)
     /* Start Prometheus metrics server if requested */
     if (cfg.metrics_port > 0) {
         metrics_set_ring_buffer_size((__u64)cfg.ring_buffer_mb * 1024 * 1024);
-        if (metrics_start(cfg.metrics_port, cfg.metrics_path) != 0) {
+        if (metrics_start(cfg.metrics_port, cfg.metrics_path, cfg.metrics_bind) != 0) {
             fprintf(stderr, "Error: Failed to start metrics server on port %d\n",
                     cfg.metrics_port);
             err = 1;
             goto cleanup;
         }
         if (cfg.verbose)
-            fprintf(stderr, "Metrics: http://0.0.0.0:%d%s\n",
+            fprintf(stderr, "Metrics: http://%s:%d%s\n",
+                    cfg.metrics_bind[0] ? cfg.metrics_bind : "127.0.0.1",
                     cfg.metrics_port, cfg.metrics_path);
     }
+
+    /* Use large fully-buffered stdout to reduce write syscalls.
+     * At 5k events/sec with ~20 printf calls per event, this collapses
+     * individual writes into ~64 KB chunks (single syscall per ~8 events). */
+    setvbuf(stdout, NULL, _IOFBF, 65536);
 
     /* Print startup banner */
     if (!cfg.data_only && cfg.format == FMT_TEXT) {
@@ -1470,16 +1507,22 @@ int main(int argc, char **argv)
     /* Touch health file to signal readiness (S4 fix: no /tmp fallback).
      * /var/run/tls-tracer is provided via emptyDir in K8s or must be
      * pre-created for local dev. Falling back to /tmp would allow a local
-     * attacker to create a symlink and trick root into overwriting files. */
-    const char *health_file = "/var/run/tls-tracer/healthy";
+     * attacker to create a symlink and trick root into overwriting files.
+     * Override with TLS_TRACER_HEALTH_DIR for read-only container runtimes. */
+    const char *health_dir = getenv("TLS_TRACER_HEALTH_DIR");
+    if (!health_dir || !health_dir[0])
+        health_dir = "/var/run/tls-tracer";
+    char health_file_buf[256];
+    snprintf(health_file_buf, sizeof(health_file_buf), "%s/healthy", health_dir);
+    const char *health_file = health_file_buf;
     /* Use open(O_DIRECTORY) instead of access(F_OK) to avoid TOCTOU race (CWE-367) */
     {
-        int dfd = open("/var/run/tls-tracer", O_RDONLY | O_DIRECTORY);
+        int dfd = open(health_dir, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) {
             close(dfd);
-        } else if (mkdir("/var/run/tls-tracer", 0755) != 0) {
-            fprintf(stderr, "Warning: Cannot create /var/run/tls-tracer: %s "
-                    "(health file disabled)\n", strerror(errno));
+        } else if (mkdir(health_dir, 0755) != 0) {
+            fprintf(stderr, "Warning: Cannot create %s: %s "
+                    "(health file disabled)\n", health_dir, strerror(errno));
             health_file = NULL;
         }
     }
@@ -1488,18 +1531,28 @@ int main(int argc, char **argv)
         fprintf(hf, "ready\n");
         fclose(hf);
     }
+    /* Expose health file path to event callback for event-driven updates */
+    g_health_file = health_file;
 
     /* Main event loop (#1 fix: don't mask poll errors) */
     int poll_count = 0;
+    int consecutive_poll_errors = 0;
     time_t start_time = time(NULL);
     while (!exiting) {
         int poll_err = ring_buffer__poll(rb, RING_POLL_TIMEOUT);
         if (poll_err < 0 && poll_err != -EINTR) {
-            fprintf(stderr, "Error: Polling ring buffer failed: %s\n",
-                    strerror(-poll_err));
-            err = poll_err;
-            break;
+            consecutive_poll_errors++;
+            fprintf(stderr, "Warning: Polling ring buffer failed (%d/%d): %s\n",
+                    consecutive_poll_errors, 5, strerror(-poll_err));
+            if (consecutive_poll_errors >= 5) {
+                fprintf(stderr, "Error: %d consecutive poll failures, exiting\n",
+                        consecutive_poll_errors);
+                err = poll_err;
+                break;
+            }
+            continue;
         }
+        consecutive_poll_errors = 0;
 
         /* Check max-events limit */
         if (cfg.max_events > 0 && stat_events_captured >= cfg.max_events) {
@@ -1525,13 +1578,66 @@ int main(int argc, char **argv)
                           session_emit_json, &cfg);
         }
 
-        /* Update health file every ~10 seconds (100ms poll * 100) */
-        if (health_file && poll_count >= 100) {
+        /* Periodic monitoring every ~10 seconds (100ms poll * 100) */
+        if (poll_count >= 100) {
             poll_count = 0;
-            hf = fopen(health_file, "w");
-            if (hf) {
-                fprintf(hf, "%ld\n", (long)time(NULL));
-                fclose(hf);
+
+            /* Update health file */
+            if (health_file) {
+                hf = fopen(health_file, "w");
+                if (hf) {
+                    fprintf(hf, "%ld\n", (long)time(NULL));
+                    if (fclose(hf) != 0)
+                        fprintf(stderr, "Warning: fclose(%s) failed: %s\n",
+                                health_file, strerror(errno));
+                }
+            }
+
+            /* Check for dropped events and warn in real-time */
+            {
+                static __u64 prev_dropped = 0;
+                __u64 total_dropped = 0;
+                int drop_fd_check = bpf_object__find_map_fd_by_name(obj, "dropped_events");
+                if (drop_fd_check >= 0) {
+                    int nr = libbpf_num_possible_cpus();
+                    if (nr > 0 && nr <= 1024) {
+                        __u64 *pc = calloc((size_t)nr, sizeof(__u64));
+                        if (pc) {
+                            __u32 dk = 0;
+                            if (bpf_map_lookup_elem(drop_fd_check, &dk, pc) == 0) {
+                                for (int i = 0; i < nr; i++)
+                                    total_dropped += pc[i];
+                            }
+                            free(pc);
+                        }
+                    }
+                }
+                if (total_dropped > prev_dropped) {
+                    fprintf(stderr, "Warning: %llu events dropped by ring buffer "
+                            "(%llu new since last check)\n",
+                            (unsigned long long)total_dropped,
+                            (unsigned long long)(total_dropped - prev_dropped));
+                    prev_dropped = total_dropped;
+                }
+                if (cfg.metrics_port > 0)
+                    metrics_set_dropped_events(total_dropped);
+            }
+
+            /* BPF map utilisation: iterate maps to count entries */
+            if (cfg.metrics_port > 0) {
+                const char *map_names[] = { "conn_info_map", "ssl_args_map" };
+                const char *metric_names[] = { "conn_info", "ssl_args" };
+                for (int m = 0; m < 2; m++) {
+                    int map_fd = bpf_object__find_map_fd_by_name(obj, map_names[m]);
+                    if (map_fd < 0) continue;
+                    __u64 count = 0;
+                    __u32 key = 0, next_key = 0;
+                    while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
+                        count++;
+                        key = next_key;
+                    }
+                    metrics_set_bpf_map_entries(metric_names[m], count);
+                }
             }
         }
     }
