@@ -21,6 +21,7 @@
 /* Event statistics (defined in tls_tracer.c, accessed here) */
 extern __u64 stat_events_captured;
 extern __u64 stat_events_filtered;
+extern const char *g_health_file;
 
 /* Print Splunk metadata fields if --splunk-sourcetype is configured.
  * Must be called inside a JSON object (emits leading comma). */
@@ -163,6 +164,16 @@ int handle_event(void *ctx, void *data, size_t size)
     }
 
     stat_events_captured++;
+
+    /* Event-driven health update: keeps health file fresh even when
+     * the periodic task in the main loop is delayed by CPU throttling. */
+    if (g_health_file && (stat_events_captured % 1000) == 0) {
+        FILE *hf = fopen(g_health_file, "w");
+        if (hf) {
+            fprintf(hf, "%ld\n", (long)time(NULL));
+            fclose(hf);
+        }
+    }
 
     /* Update Prometheus metrics counters */
     if (c->metrics_port > 0)

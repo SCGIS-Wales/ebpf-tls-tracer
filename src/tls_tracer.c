@@ -27,6 +27,7 @@
 #include <gelf.h>      /* ELF symbol parsing for BoringSSL binary verification */
 #include <libelf.h>
 #include <ifaddrs.h>   /* getifaddrs() for host IP auto-detection */
+#include <sys/random.h> /* getrandom() for hash seed */
 #include <net/if.h>    /* IFF_LOOPBACK */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -53,6 +54,12 @@ static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+s
 /* Event statistics counters (printed to stderr on exit, read by metrics thread) */
 __u64 stat_events_captured = 0;
 __u64 stat_events_filtered = 0;
+
+/* Health file path for event-driven updates (NULL = disabled) */
+const char *g_health_file = NULL;
+
+/* Random hash seed initialised at startup to prevent hash collision attacks */
+__u64 g_hash_seed = 0;
 
 /* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
  * R-1 fix: Uses open-addressing hash table for O(1) lookup instead of O(n)
@@ -158,7 +165,7 @@ static struct config cfg = {
     .verbose         = 0,
     .enable_quic     = 0,
     .sanitize_count  = 0,
-    .ring_buffer_mb  = 4,
+    .ring_buffer_mb  = 16,
     .aggregate_timeout = 30,
     .pcap_snaplen    = 4096,
     .metrics_path    = "/metrics",
@@ -185,7 +192,7 @@ static int add_sanitize_pattern(const char *pattern)
         return -1;
     }
     struct sanitize_pattern *sp = &cfg.sanitize[cfg.sanitize_count];
-    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE);
+    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB);
     if (ret != 0) {
         char errbuf[128];
         regerror(ret, &sp->regex, errbuf, sizeof(errbuf));
@@ -625,15 +632,27 @@ static void detect_host_ip(char *buf, size_t buflen)
     /* 1. Check HOST_IP environment variable (K8s downward API) */
     const char *env_ip = getenv("HOST_IP");
     if (env_ip && env_ip[0]) {
-        snprintf(buf, buflen, "%s", env_ip);
-        return;
+        struct in_addr v4;
+        struct in6_addr v6;
+        if (inet_pton(AF_INET, env_ip, &v4) == 1 ||
+            inet_pton(AF_INET6, env_ip, &v6) == 1) {
+            snprintf(buf, buflen, "%s", env_ip);
+            return;
+        }
+        fprintf(stderr, "Warning: HOST_IP '%s' is not a valid IP address, ignoring\n", env_ip);
     }
 
     /* Also check NODE_IP (alternative naming convention) */
     env_ip = getenv("NODE_IP");
     if (env_ip && env_ip[0]) {
-        snprintf(buf, buflen, "%s", env_ip);
-        return;
+        struct in_addr v4;
+        struct in6_addr v6;
+        if (inet_pton(AF_INET, env_ip, &v4) == 1 ||
+            inet_pton(AF_INET6, env_ip, &v6) == 1) {
+            snprintf(buf, buflen, "%s", env_ip);
+            return;
+        }
+        fprintf(stderr, "Warning: NODE_IP '%s' is not a valid IP address, ignoring\n", env_ip);
     }
 
     /* 2. Auto-detect: first non-loopback IPv4 address */
@@ -669,6 +688,10 @@ int main(int argc, char **argv)
     struct pcap_handle *pcap = NULL;
     int err = 0;
     int link_count = 0;
+
+    /* Initialise random hash seed for collision resistance */
+    if (getrandom(&g_hash_seed, sizeof(g_hash_seed), 0) != sizeof(g_hash_seed))
+        g_hash_seed = (__u64)time(NULL) ^ (__u64)getpid();
 
     static const struct option long_opts[] = {
         {"pid",          required_argument, NULL, 'p'},
@@ -872,8 +895,8 @@ int main(int argc, char **argv)
             char *endp;
             errno = 0;
             unsigned long val = strtoul(optarg, &endp, 10);
-            if (*endp != '\0' || val == 0 || val > 64 || errno == ERANGE) {
-                fprintf(stderr, "Error: Invalid ring-buffer-size '%s' (1-64 MB)\n", optarg);
+            if (*endp != '\0' || val == 0 || val > 256 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid ring-buffer-size '%s' (1-256 MB)\n", optarg);
                 return 1;
             }
             /* Must be power of 2 */
@@ -1466,6 +1489,11 @@ int main(int argc, char **argv)
                     cfg.metrics_port, cfg.metrics_path);
     }
 
+    /* Use large fully-buffered stdout to reduce write syscalls.
+     * At 5k events/sec with ~20 printf calls per event, this collapses
+     * individual writes into ~64 KB chunks (single syscall per ~8 events). */
+    setvbuf(stdout, NULL, _IOFBF, 65536);
+
     /* Print startup banner */
     if (!cfg.data_only && cfg.format == FMT_TEXT) {
         fprintf(stderr, "Tracing TLS traffic");
@@ -1503,18 +1531,28 @@ int main(int argc, char **argv)
         fprintf(hf, "ready\n");
         fclose(hf);
     }
+    /* Expose health file path to event callback for event-driven updates */
+    g_health_file = health_file;
 
     /* Main event loop (#1 fix: don't mask poll errors) */
     int poll_count = 0;
+    int consecutive_poll_errors = 0;
     time_t start_time = time(NULL);
     while (!exiting) {
         int poll_err = ring_buffer__poll(rb, RING_POLL_TIMEOUT);
         if (poll_err < 0 && poll_err != -EINTR) {
-            fprintf(stderr, "Error: Polling ring buffer failed: %s\n",
-                    strerror(-poll_err));
-            err = poll_err;
-            break;
+            consecutive_poll_errors++;
+            fprintf(stderr, "Warning: Polling ring buffer failed (%d/%d): %s\n",
+                    consecutive_poll_errors, 5, strerror(-poll_err));
+            if (consecutive_poll_errors >= 5) {
+                fprintf(stderr, "Error: %d consecutive poll failures, exiting\n",
+                        consecutive_poll_errors);
+                err = poll_err;
+                break;
+            }
+            continue;
         }
+        consecutive_poll_errors = 0;
 
         /* Check max-events limit */
         if (cfg.max_events > 0 && stat_events_captured >= cfg.max_events) {
@@ -1549,7 +1587,9 @@ int main(int argc, char **argv)
                 hf = fopen(health_file, "w");
                 if (hf) {
                     fprintf(hf, "%ld\n", (long)time(NULL));
-                    fclose(hf);
+                    if (fclose(hf) != 0)
+                        fprintf(stderr, "Warning: fclose(%s) failed: %s\n",
+                                health_file, strerror(errno));
                 }
             }
 
@@ -1581,6 +1621,23 @@ int main(int argc, char **argv)
                 }
                 if (cfg.metrics_port > 0)
                     metrics_set_dropped_events(total_dropped);
+            }
+
+            /* BPF map utilisation: iterate maps to count entries */
+            if (cfg.metrics_port > 0) {
+                const char *map_names[] = { "conn_info_map", "ssl_args_map" };
+                const char *metric_names[] = { "conn_info", "ssl_args" };
+                for (int m = 0; m < 2; m++) {
+                    int map_fd = bpf_object__find_map_fd_by_name(obj, map_names[m]);
+                    if (map_fd < 0) continue;
+                    __u64 count = 0;
+                    __u32 key = 0, next_key = 0;
+                    while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
+                        count++;
+                        key = next_key;
+                    }
+                    metrics_set_bpf_map_entries(metric_names[m], count);
+                }
             }
         }
     }

@@ -155,8 +155,15 @@ splunk:
   enabled: false
   # Full HEC URL including /services/collector (required if enabled)
   hecUrl: ""
-  # HEC authentication token (required if enabled).
-  # Recommended: use a Kubernetes Secret and reference it via secretKeyRef.
+  # HEC authentication token — choose ONE method:
+  #
+  # Option A (RECOMMENDED): Reference a Kubernetes Secret
+  hecTokenSecret:
+    name: ""   # e.g. "splunk-hec-token"
+    key: ""    # e.g. "token"
+  #
+  # Option B (dev/test only): Inline token. WARNING: visible in Helm history,
+  # pod env, and git. Use secretKeyRef (option A) for production.
   hecToken: ""
   # Target Splunk index (empty = use HEC default)
   index: ""
@@ -200,11 +207,13 @@ serviceAccount:
 # --- 7. Pod Configuration ---
 
 resources:
+  # Sizing for Apigee Hybrid / high-throughput nodes (5k+ events/sec):
+  # measured CPU ~150-300m under load. Adjust limits based on node traffic volume.
   limits:
-    cpu: 200m
+    cpu: 500m
     memory: 256Mi
   requests:
-    cpu: 50m
+    cpu: 150m
     memory: 64Mi
 
 nodeSelector: {}
