@@ -147,7 +147,39 @@ kinesis:
       cpu: 25m
       memory: 64Mi
 
-# --- 6. Service Account & IRSA ---
+# --- 6. Splunk HEC Log Shipping ---
+# Runs a Python sidecar that forwards JSON logs to Splunk HTTP Event Collector.
+# Reads events from the shared log file and POSTs them to the HEC endpoint.
+
+splunk:
+  enabled: false
+  # Full HEC URL including /services/collector (required if enabled)
+  hecUrl: ""
+  # HEC authentication token (required if enabled).
+  # Recommended: use a Kubernetes Secret and reference it via secretKeyRef.
+  hecToken: ""
+  # Target Splunk index (empty = use HEC default)
+  index: ""
+  # Sourcetype for events
+  sourcetype: "tls:tracer"
+  # Source field
+  source: "tls_tracer"
+  # Verify Splunk TLS certificate
+  verifySsl: true
+  # Batch size (events per HTTP POST)
+  batchSize: 50
+  # Flush interval in seconds
+  flushIntervalSeconds: 5
+  # Resources for Splunk sidecar
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 25m
+      memory: 64Mi
+
+# --- 7. Service Account & IRSA ---
 
 serviceAccount:
   create: true

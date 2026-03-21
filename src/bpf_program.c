@@ -634,8 +634,10 @@ static __always_inline void enrich_event_with_cipher(struct tls_event_t *event, 
 {
     __u64 key = (__u64)(unsigned long)ssl;
     struct cipher_name_t *cn = bpf_map_lookup_elem(&cipher_name_map, &key);
-    if (cn)
+    if (cn) {
         __builtin_memcpy(event->cipher, cn->name, 64);
+        event->cipher[MAX_CIPHER_LEN - 1] = '\0';  /* ensure NUL-termination */
+    }
 }
 
 /* --- SSL_get_current_cipher probes: capture negotiated cipher suite ---

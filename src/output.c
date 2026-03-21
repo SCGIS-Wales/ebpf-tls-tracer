@@ -22,6 +22,16 @@
 extern __u64 stat_events_captured;
 extern __u64 stat_events_filtered;
 
+/* Print Splunk metadata fields if --splunk-sourcetype is configured.
+ * Must be called inside a JSON object (emits leading comma). */
+static void print_splunk_meta(const struct config *c)
+{
+    if (c->splunk_sourcetype[0]) {
+        printf(",\"sourcetype\":");
+        print_json_string(c->splunk_sourcetype);
+    }
+}
+
 const char *direction_str(int dir)
 {
     return dir == DIRECTION_READ ? "RESPONSE" : "REQUEST";
@@ -240,6 +250,7 @@ int handle_event(void *ctx, void *data, size_t size)
                 printf(",\"host_ip\":");
                 print_json_string(c->host_ip);
             }
+            print_splunk_meta(c);
             printf(",\"event_type\":\"tcp_error\","
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"error_code\":%d,\"error\":\"%s\"}\n",
@@ -282,6 +293,7 @@ int handle_event(void *ctx, void *data, size_t size)
                 print_json_string(cipher_safe);
             }
             printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
+            print_splunk_meta(c);
             printf("}\n");
             return 0;
         }
@@ -316,6 +328,7 @@ int handle_event(void *ctx, void *data, size_t size)
             if (tls_ver_str)
                 printf(",\"tls_version\":\"%s\"", tls_ver_str);
 
+            print_splunk_meta(c);
             printf("}\n");
             return 0;
         }
@@ -332,6 +345,7 @@ int handle_event(void *ctx, void *data, size_t size)
                 printf(",\"host_ip\":");
                 print_json_string(c->host_ip);
             }
+            print_splunk_meta(c);
             printf(",\"event_type\":\"quic_detected\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -732,6 +746,7 @@ int handle_event(void *ctx, void *data, size_t size)
             }
         }
 
+        print_splunk_meta(c);
         printf("}\n");
     } else {
         if (!c->data_only) {

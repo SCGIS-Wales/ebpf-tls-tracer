@@ -96,4 +96,16 @@ struct tls_event_t {
     char  data[MAX_DATA_LEN];
 };
 
+/* User-space only: shared 64-bit mixing hash for {pid, fd} keying.
+ * Used by DNS cache and session aggregation. Not available in BPF context. */
+#if !defined(__KERNEL__) && !defined(__bpf__)
+static inline __u32 mix_hash_pid_fd(__u32 pid, __u32 fd, __u32 table_mask)
+{
+    __u64 key = ((__u64)pid << 32) | fd;
+    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
+    return ((__u32)(key >> 32)) & table_mask;
+}
+#endif
+
 #endif /* TRACER_H */
