@@ -216,6 +216,23 @@ resources:
     cpu: 150m
     memory: 64Mi
 
+# --- 8. Auto-Scaling ---
+# All values default to 0 = auto-detect from container memory limit (cgroup).
+# The tracer uses 25% of the container memory limit as its buffer budget and
+# selects a sizing tier: small (≤64 MB), medium (≤256 MB), large (>256 MB).
+scaling:
+  memoryBudget: 0       # Total buffer budget in MB (0 = auto from cgroup)
+  ringBufferMb: 0       # Ring buffer size in MB (0 = auto, must be power-of-2)
+  mapSize: 0            # BPF connection-tracking map entries (0 = auto)
+  sessionTableSize: 0   # Session aggregation hash table entries (0 = auto)
+  dnsCacheSize: 0       # DNS hostname cache entries (0 = auto)
+
+# --- 9. Vertical Pod Autoscaler ---
+vpa:
+  enabled: false
+  # updateMode: "Off" = recommendations only, "Auto" = apply automatically
+  updateMode: "Off"
+
 nodeSelector: {}
 
 tolerations:

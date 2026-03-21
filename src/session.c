@@ -4,6 +4,7 @@
 // summary events on connection close or idle timeout.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <arpa/inet.h>
@@ -12,11 +13,28 @@
 #include "output.h"
 #include "protocol.h"
 
-static struct session_entry session_table[SESSION_TABLE_SIZE];
+/* Dynamic session table (initialised by session_init, fallback to static) */
+static struct session_entry static_session_table[SESSION_TABLE_SIZE];
+static struct session_entry *session_table = static_session_table;
+static __u32 session_table_sz = SESSION_TABLE_SIZE;
+
+void session_init(__u32 size)
+{
+    if (size == 0 || size == SESSION_TABLE_SIZE)
+        return;  /* use static default */
+    struct session_entry *tbl = calloc(size, sizeof(struct session_entry));
+    if (!tbl) {
+        fprintf(stderr, "Warning: Failed to allocate session table (%u entries), "
+                "using default %d\n", size, SESSION_TABLE_SIZE);
+        return;
+    }
+    session_table = tbl;
+    session_table_sz = size;
+}
 
 static inline __u32 session_hash(__u32 pid, __u32 fd)
 {
-    return mix_hash_pid_fd(pid, fd, SESSION_TABLE_SIZE - 1);
+    return mix_hash_pid_fd(pid, fd, session_table_sz - 1);
 }
 
 static struct session_entry *session_find_or_create(__u32 pid, __u32 fd)
@@ -24,8 +42,8 @@ static struct session_entry *session_find_or_create(__u32 pid, __u32 fd)
     __u32 idx = session_hash(pid, fd);
     __u32 first_empty = UINT32_MAX;
 
-    for (__u32 i = 0; i < SESSION_TABLE_SIZE; i++) {
-        __u32 slot = (idx + i) & (SESSION_TABLE_SIZE - 1);
+    for (__u32 i = 0; i < session_table_sz; i++) {
+        __u32 slot = (idx + i) & (session_table_sz - 1);
         if (!session_table[slot].occupied) {
             if (first_empty == UINT32_MAX)
                 first_empty = slot;
@@ -205,7 +223,7 @@ void session_sweep(time_t now, int timeout_secs,
     __u64 timeout_ns = (__u64)timeout_secs * 1000000000ULL;
     __u64 now_ns = (__u64)now * 1000000000ULL;
 
-    for (__u32 i = 0; i < SESSION_TABLE_SIZE; i++) {
+    for (__u32 i = 0; i < session_table_sz; i++) {
         if (!session_table[i].occupied)
             continue;
         if (session_table[i].last_seen_ns == 0)
@@ -224,8 +242,8 @@ void session_close(const struct tls_event_t *event, int reason,
 {
     __u32 idx = session_hash(event->pid, event->fd);
 
-    for (__u32 i = 0; i < SESSION_TABLE_SIZE && i < 64; i++) {
-        __u32 slot = (idx + i) & (SESSION_TABLE_SIZE - 1);
+    for (__u32 i = 0; i < session_table_sz && i < 64; i++) {
+        __u32 slot = (idx + i) & (session_table_sz - 1);
         if (!session_table[slot].occupied)
             return;
         if (session_table[slot].key.pid == event->pid &&
