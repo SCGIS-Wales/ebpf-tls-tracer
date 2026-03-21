@@ -16,10 +16,7 @@ static struct session_entry session_table[SESSION_TABLE_SIZE];
 
 static inline __u32 session_hash(__u32 pid, __u32 fd)
 {
-    __u64 key = ((__u64)pid << 32) | fd;
-    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
-    return ((__u32)(key >> 32)) & (SESSION_TABLE_SIZE - 1);
+    return mix_hash_pid_fd(pid, fd, SESSION_TABLE_SIZE - 1);
 }
 
 static struct session_entry *session_find_or_create(__u32 pid, __u32 fd)

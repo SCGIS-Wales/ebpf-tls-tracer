@@ -76,10 +76,7 @@ static struct dns_cache_entry dns_cache[DNS_CACHE_SIZE];
 
 static inline __u32 dns_hash(__u32 pid, __u32 fd)
 {
-    __u64 key = ((__u64)pid << 32) | fd;
-    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
-    return ((__u32)(key >> 32)) & (DNS_CACHE_SIZE - 1);
+    return mix_hash_pid_fd(pid, fd, DNS_CACHE_SIZE - 1);
 }
 
 const char *dns_cache_lookup(__u32 pid, __u32 fd)
@@ -181,6 +178,12 @@ static int add_sanitize_pattern(const char *pattern)
                 MAX_SANITIZE_PATTERNS);
         return -1;
     }
+    /* Reject excessively long patterns to limit regex compilation cost */
+    if (strlen(pattern) > 255) {
+        fprintf(stderr, "Error: Sanitize pattern too long (max 255 chars): %.32s...\n",
+                pattern);
+        return -1;
+    }
     struct sanitize_pattern *sp = &cfg.sanitize[cfg.sanitize_count];
     int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE);
     if (ret != 0) {
@@ -229,6 +232,21 @@ void sanitize_string(char *str, size_t len, const struct config *c)
     }
 }
 
+/* Generic library/binary search: try each candidate path with open() to avoid
+ * TOCTOU race (CWE-367). Returns 0 if found, -1 otherwise. */
+static int find_library(const char *candidates[], char *path, size_t path_len)
+{
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int find_ssl_library(char *path, size_t path_len)
 {
     const char *candidates[] = {
@@ -256,19 +274,7 @@ static int find_ssl_library(char *path, size_t path_len)
         "/lib64/libssl.so.3",
         NULL,
     };
-
-    for (int i = 0; candidates[i]; i++) {
-        /* Use open() instead of access() to avoid TOCTOU race (CWE-367).
-         * access() checks permissions, then the file is opened later —
-         * an attacker could swap the file between check and use. */
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 static int find_gnutls_library(char *path, size_t path_len)
@@ -283,15 +289,7 @@ static int find_gnutls_library(char *path, size_t path_len)
         "/usr/lib/libgnutls.so.30",
         NULL,
     };
-    for (int i = 0; candidates[i]; i++) {
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 static int find_wolfssl_library(char *path, size_t path_len)
@@ -306,15 +304,7 @@ static int find_wolfssl_library(char *path, size_t path_len)
         "/usr/lib/libwolfssl.so",
         NULL,
     };
-    for (int i = 0; candidates[i]; i++) {
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 /* Find binary with statically-linked BoringSSL (e.g., Envoy for Apigee Hybrid).
@@ -334,15 +324,7 @@ static int find_boringssl_binary(char *path, size_t path_len)
         "/opt/apigee/bin/envoy",
         NULL,
     };
-    for (int i = 0; candidates[i]; i++) {
-        int fd = open(candidates[i], O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(path, path_len, "%s", candidates[i]);
-            return 0;
-        }
-    }
-    return -1;
+    return find_library(candidates, path, path_len);
 }
 
 /* Verify a binary contains required SSL symbols using ELF parsing.
@@ -712,6 +694,8 @@ int main(int argc, char **argv)
         {"pcap-snaplen", required_argument, NULL, 1004},
         {"metrics-port", required_argument, NULL, 1005},
         {"metrics-path", required_argument, NULL, 1006},
+        {"metrics-bind", required_argument, NULL, 1007},
+        {"splunk-sourcetype", required_argument, NULL, 1008},
         {"boringssl-bin", required_argument, NULL, 'B'},
         {"verbose",      no_argument,       NULL, 'v'},
         {"version",      no_argument,       NULL, 'V'},
@@ -945,6 +929,12 @@ int main(int argc, char **argv)
         }
         case 1006:  /* --metrics-path */
             snprintf(cfg.metrics_path, sizeof(cfg.metrics_path), "%s", optarg);
+            break;
+        case 1007:  /* --metrics-bind */
+            snprintf(cfg.metrics_bind, sizeof(cfg.metrics_bind), "%s", optarg);
+            break;
+        case 1008:  /* --splunk-sourcetype */
+            snprintf(cfg.splunk_sourcetype, sizeof(cfg.splunk_sourcetype), "%s", optarg);
             break;
         case 'v':
             cfg.verbose = 1;
@@ -1252,13 +1242,24 @@ int main(int argc, char **argv)
             "SSL_get_certificate",
         };
 
+        /* Probes 0-3 (SSL_read/SSL_write entry+return) are mandatory for
+         * data capture. Probes 4-9 (SSL_version, cipher, certificate) are
+         * optional — failure degrades metadata but doesn't stop tracing. */
+        int mandatory_ok = 1;
         for (int i = 0; i < 10; i++) {
+            int is_mandatory = (i < 4);  /* SSL_read + SSL_write pairs */
+
             prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
             if (!prog) {
-                fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
-                        uprobe_names[i]);
-                err = 1;
-                goto cleanup;
+                if (is_mandatory) {
+                    fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
+                            uprobe_names[i]);
+                    mandatory_ok = 0;
+                } else if (cfg.verbose) {
+                    fprintf(stderr, "Note: Optional BPF program '%s' not found.\n",
+                            uprobe_names[i]);
+                }
+                continue;
             }
 
             LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
@@ -1271,17 +1272,24 @@ int main(int argc, char **argv)
 
             if (!links[link_count] || libbpf_get_error(links[link_count])) {
                 links[link_count] = NULL;
-                fprintf(stderr, "Warning: Could not attach uprobe for %s (%s). "
-                        "Ensure libssl has debug symbols or is not stripped.\n",
-                        func_names[i], is_retprobe[i] ? "return" : "entry");
+                if (is_mandatory) {
+                    fprintf(stderr, "Error: Could not attach mandatory uprobe for %s (%s). "
+                            "Ensure libssl has debug symbols or is not stripped.\n",
+                            func_names[i], is_retprobe[i] ? "return" : "entry");
+                    mandatory_ok = 0;
+                } else {
+                    fprintf(stderr, "Warning: Could not attach optional uprobe for %s (%s). "
+                            "TLS version/cipher/mTLS metadata may be unavailable.\n",
+                            func_names[i], is_retprobe[i] ? "return" : "entry");
+                }
                 continue;
             }
             link_count++;
             uprobe_count++;
         }
 
-        if (uprobe_count == 0) {
-            fprintf(stderr, "Error: Could not attach any OpenSSL probes. "
+        if (!mandatory_ok || uprobe_count == 0) {
+            fprintf(stderr, "Error: Could not attach required OpenSSL probes (SSL_read/SSL_write). "
                     "Check that the SSL library path is correct and has symbols.\n");
             err = 1;
             goto cleanup;
@@ -1446,14 +1454,15 @@ int main(int argc, char **argv)
     /* Start Prometheus metrics server if requested */
     if (cfg.metrics_port > 0) {
         metrics_set_ring_buffer_size((__u64)cfg.ring_buffer_mb * 1024 * 1024);
-        if (metrics_start(cfg.metrics_port, cfg.metrics_path) != 0) {
+        if (metrics_start(cfg.metrics_port, cfg.metrics_path, cfg.metrics_bind) != 0) {
             fprintf(stderr, "Error: Failed to start metrics server on port %d\n",
                     cfg.metrics_port);
             err = 1;
             goto cleanup;
         }
         if (cfg.verbose)
-            fprintf(stderr, "Metrics: http://0.0.0.0:%d%s\n",
+            fprintf(stderr, "Metrics: http://%s:%d%s\n",
+                    cfg.metrics_bind[0] ? cfg.metrics_bind : "127.0.0.1",
                     cfg.metrics_port, cfg.metrics_path);
     }
 
@@ -1470,16 +1479,22 @@ int main(int argc, char **argv)
     /* Touch health file to signal readiness (S4 fix: no /tmp fallback).
      * /var/run/tls-tracer is provided via emptyDir in K8s or must be
      * pre-created for local dev. Falling back to /tmp would allow a local
-     * attacker to create a symlink and trick root into overwriting files. */
-    const char *health_file = "/var/run/tls-tracer/healthy";
+     * attacker to create a symlink and trick root into overwriting files.
+     * Override with TLS_TRACER_HEALTH_DIR for read-only container runtimes. */
+    const char *health_dir = getenv("TLS_TRACER_HEALTH_DIR");
+    if (!health_dir || !health_dir[0])
+        health_dir = "/var/run/tls-tracer";
+    char health_file_buf[256];
+    snprintf(health_file_buf, sizeof(health_file_buf), "%s/healthy", health_dir);
+    const char *health_file = health_file_buf;
     /* Use open(O_DIRECTORY) instead of access(F_OK) to avoid TOCTOU race (CWE-367) */
     {
-        int dfd = open("/var/run/tls-tracer", O_RDONLY | O_DIRECTORY);
+        int dfd = open(health_dir, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) {
             close(dfd);
-        } else if (mkdir("/var/run/tls-tracer", 0755) != 0) {
-            fprintf(stderr, "Warning: Cannot create /var/run/tls-tracer: %s "
-                    "(health file disabled)\n", strerror(errno));
+        } else if (mkdir(health_dir, 0755) != 0) {
+            fprintf(stderr, "Warning: Cannot create %s: %s "
+                    "(health file disabled)\n", health_dir, strerror(errno));
             health_file = NULL;
         }
     }
@@ -1525,13 +1540,47 @@ int main(int argc, char **argv)
                           session_emit_json, &cfg);
         }
 
-        /* Update health file every ~10 seconds (100ms poll * 100) */
-        if (health_file && poll_count >= 100) {
+        /* Periodic monitoring every ~10 seconds (100ms poll * 100) */
+        if (poll_count >= 100) {
             poll_count = 0;
-            hf = fopen(health_file, "w");
-            if (hf) {
-                fprintf(hf, "%ld\n", (long)time(NULL));
-                fclose(hf);
+
+            /* Update health file */
+            if (health_file) {
+                hf = fopen(health_file, "w");
+                if (hf) {
+                    fprintf(hf, "%ld\n", (long)time(NULL));
+                    fclose(hf);
+                }
+            }
+
+            /* Check for dropped events and warn in real-time */
+            {
+                static __u64 prev_dropped = 0;
+                __u64 total_dropped = 0;
+                int drop_fd_check = bpf_object__find_map_fd_by_name(obj, "dropped_events");
+                if (drop_fd_check >= 0) {
+                    int nr = libbpf_num_possible_cpus();
+                    if (nr > 0 && nr <= 1024) {
+                        __u64 *pc = calloc((size_t)nr, sizeof(__u64));
+                        if (pc) {
+                            __u32 dk = 0;
+                            if (bpf_map_lookup_elem(drop_fd_check, &dk, pc) == 0) {
+                                for (int i = 0; i < nr; i++)
+                                    total_dropped += pc[i];
+                            }
+                            free(pc);
+                        }
+                    }
+                }
+                if (total_dropped > prev_dropped) {
+                    fprintf(stderr, "Warning: %llu events dropped by ring buffer "
+                            "(%llu new since last check)\n",
+                            (unsigned long long)total_dropped,
+                            (unsigned long long)(total_dropped - prev_dropped));
+                    prev_dropped = total_dropped;
+                }
+                if (cfg.metrics_port > 0)
+                    metrics_set_dropped_events(total_dropped);
             }
         }
     }

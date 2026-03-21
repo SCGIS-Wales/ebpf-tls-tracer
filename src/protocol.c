@@ -25,7 +25,7 @@ int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
                      (unsigned char)data[3];
 
     /* Sanity: 4 < msg_size < 100MB, and msg_size + 4 should be close to data len */
-    if (msg_size <= 4 || msg_size > 104857600)
+    if (msg_size <= 4 || msg_size > MAX_KAFKA_MESSAGE_SIZE)
         return 0;
 
     /* Read api_key (2 bytes, big-endian, signed) */
@@ -79,7 +79,7 @@ int detect_kafka_response(const char *data, __u32 len)
                      ((unsigned int)(unsigned char)data[2] << 8) |
                      (unsigned char)data[3];
 
-    if (msg_size <= 4 || msg_size > 104857600)
+    if (msg_size <= 4 || msg_size > MAX_KAFKA_MESSAGE_SIZE)
         return 0;
 
     int corr_id = (int)(((unsigned int)(unsigned char)data[4] << 24) |
