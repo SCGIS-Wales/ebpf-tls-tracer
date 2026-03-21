@@ -54,6 +54,11 @@ spec:
               {{- range .Values.filters.proto }} --proto '{{ . }}'{{- end }}
               {{- range .Values.filters.method }} --method '{{ . }}'{{- end }}
               {{- range .Values.filters.dir }} --dir '{{ . }}'{{- end }}
+              {{- if gt (int .Values.scaling.memoryBudget) 0 }} --memory-budget {{ .Values.scaling.memoryBudget }}{{- end }}
+              {{- if gt (int .Values.scaling.ringBufferMb) 0 }} --ring-buffer-size {{ .Values.scaling.ringBufferMb }}{{- end }}
+              {{- if gt (int .Values.scaling.mapSize) 0 }} --map-size {{ .Values.scaling.mapSize }}{{- end }}
+              {{- if gt (int .Values.scaling.sessionTableSize) 0 }} --session-table-size {{ .Values.scaling.sessionTableSize }}{{- end }}
+              {{- if gt (int .Values.scaling.dnsCacheSize) 0 }} --dns-cache-size {{ .Values.scaling.dnsCacheSize }}{{- end }}
               | tee -a /var/log/tls-tracer/events.json
           {{- else }}
           args:
@@ -93,6 +98,26 @@ spec:
             {{- range .Values.filters.dir }}
             - "--dir"
             - {{ . | quote }}
+            {{- end }}
+            {{- if gt (int .Values.scaling.memoryBudget) 0 }}
+            - "--memory-budget"
+            - "{{ .Values.scaling.memoryBudget }}"
+            {{- end }}
+            {{- if gt (int .Values.scaling.ringBufferMb) 0 }}
+            - "--ring-buffer-size"
+            - "{{ .Values.scaling.ringBufferMb }}"
+            {{- end }}
+            {{- if gt (int .Values.scaling.mapSize) 0 }}
+            - "--map-size"
+            - "{{ .Values.scaling.mapSize }}"
+            {{- end }}
+            {{- if gt (int .Values.scaling.sessionTableSize) 0 }}
+            - "--session-table-size"
+            - "{{ .Values.scaling.sessionTableSize }}"
+            {{- end }}
+            {{- if gt (int .Values.scaling.dnsCacheSize) 0 }}
+            - "--dns-cache-size"
+            - "{{ .Values.scaling.dnsCacheSize }}"
             {{- end }}
           {{- end }}
           env:
