@@ -21,6 +21,17 @@
 /* Event statistics (defined in tls_tracer.c, accessed here) */
 extern __u64 stat_events_captured;
 extern __u64 stat_events_filtered;
+extern const char *g_health_file;
+
+/* Print Splunk metadata fields if --splunk-sourcetype is configured.
+ * Must be called inside a JSON object (emits leading comma). */
+static void print_splunk_meta(const struct config *c)
+{
+    if (c->splunk_sourcetype[0]) {
+        printf(",\"sourcetype\":");
+        print_json_string(c->splunk_sourcetype);
+    }
+}
 
 const char *direction_str(int dir)
 {
@@ -154,6 +165,16 @@ int handle_event(void *ctx, void *data, size_t size)
 
     stat_events_captured++;
 
+    /* Event-driven health update: keeps health file fresh even when
+     * the periodic task in the main loop is delayed by CPU throttling. */
+    if (g_health_file && (stat_events_captured % 1000) == 0) {
+        FILE *hf = fopen(g_health_file, "w");
+        if (hf) {
+            fprintf(hf, "%ld\n", (long)time(NULL));
+            fclose(hf);
+        }
+    }
+
     /* Update Prometheus metrics counters */
     if (c->metrics_port > 0)
         metrics_update_event(event);
@@ -240,6 +261,7 @@ int handle_event(void *ctx, void *data, size_t size)
                 printf(",\"host_ip\":");
                 print_json_string(c->host_ip);
             }
+            print_splunk_meta(c);
             printf(",\"event_type\":\"tcp_error\","
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
                    "\"error_code\":%d,\"error\":\"%s\"}\n",
@@ -282,6 +304,7 @@ int handle_event(void *ctx, void *data, size_t size)
                 print_json_string(cipher_safe);
             }
             printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
+            print_splunk_meta(c);
             printf("}\n");
             return 0;
         }
@@ -316,6 +339,7 @@ int handle_event(void *ctx, void *data, size_t size)
             if (tls_ver_str)
                 printf(",\"tls_version\":\"%s\"", tls_ver_str);
 
+            print_splunk_meta(c);
             printf("}\n");
             return 0;
         }
@@ -332,6 +356,7 @@ int handle_event(void *ctx, void *data, size_t size)
                 printf(",\"host_ip\":");
                 print_json_string(c->host_ip);
             }
+            print_splunk_meta(c);
             printf(",\"event_type\":\"quic_detected\","
                    "\"src_ip\":\"%s\",\"src_port\":%u,"
                    "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -732,6 +757,7 @@ int handle_event(void *ctx, void *data, size_t size)
             }
         }
 
+        print_splunk_meta(c);
         printf("}\n");
     } else {
         if (!c->data_only) {

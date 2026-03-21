@@ -16,10 +16,7 @@ static struct session_entry session_table[SESSION_TABLE_SIZE];
 
 static inline __u32 session_hash(__u32 pid, __u32 fd)
 {
-    __u64 key = ((__u64)pid << 32) | fd;
-    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
-    return ((__u32)(key >> 32)) & (SESSION_TABLE_SIZE - 1);
+    return mix_hash_pid_fd(pid, fd, SESSION_TABLE_SIZE - 1);
 }
 
 static struct session_entry *session_find_or_create(__u32 pid, __u32 fd)
@@ -43,8 +40,17 @@ static struct session_entry *session_find_or_create(__u32 pid, __u32 fd)
         }
     }
 
-    /* Create new entry */
+    /* Create new entry — if table is full, evict the hashed slot */
     __u32 slot = (first_empty != UINT32_MAX) ? first_empty : idx;
+    if (first_empty == UINT32_MAX && session_table[slot].occupied) {
+        static __u64 eviction_count = 0;
+        eviction_count++;
+        if ((eviction_count & 0xFF) == 1)  /* warn every 256 evictions */
+            fprintf(stderr, "Warning: session table full, evicting entry "
+                    "(pid=%u fd=%u, total evictions: %llu)\n",
+                    session_table[slot].key.pid, session_table[slot].key.fd,
+                    (unsigned long long)eviction_count);
+    }
     memset(&session_table[slot], 0, sizeof(session_table[slot]));
     session_table[slot].key.pid = pid;
     session_table[slot].key.fd = fd;

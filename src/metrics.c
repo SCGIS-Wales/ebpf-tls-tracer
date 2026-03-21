@@ -3,6 +3,7 @@
 // Prometheus metrics endpoint: exposes event counters in OpenMetrics
 // format via a minimal HTTP server on a dedicated thread.
 
+#define _GNU_SOURCE  /* for pthread_timedjoin_np */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,10 @@ static _Atomic uint64_t m_events_error = 0;
 static _Atomic uint64_t m_bytes_request = 0;
 static _Atomic uint64_t m_bytes_response = 0;
 static _Atomic uint64_t m_ring_buffer_size = 0;
+static _Atomic uint64_t m_events_dropped = 0;
+static _Atomic uint64_t m_active_connections = 0;
+static _Atomic uint64_t m_bpf_conn_info_entries = 0;
+static _Atomic uint64_t m_bpf_ssl_args_entries = 0;
 
 /* Server state */
 static int server_fd = -1;
@@ -65,6 +70,24 @@ void metrics_set_ring_buffer_size(__u64 size_bytes)
     atomic_store(&m_ring_buffer_size, size_bytes);
 }
 
+void metrics_set_dropped_events(__u64 total_dropped)
+{
+    atomic_store(&m_events_dropped, total_dropped);
+}
+
+void metrics_set_active_connections(__u64 count)
+{
+    atomic_store(&m_active_connections, count);
+}
+
+void metrics_set_bpf_map_entries(const char *map_name, __u64 count)
+{
+    if (strcmp(map_name, "conn_info") == 0)
+        atomic_store(&m_bpf_conn_info_entries, count);
+    else if (strcmp(map_name, "ssl_args") == 0)
+        atomic_store(&m_bpf_ssl_args_entries, count);
+}
+
 static int metrics_format(char *buf, size_t bufsize)
 {
     time_t uptime = time(NULL) - metrics_start_time;
@@ -93,6 +116,19 @@ static int metrics_format(char *buf, size_t bufsize)
         "# TYPE tls_tracer_uptime_seconds gauge\n"
         "tls_tracer_uptime_seconds %lld\n"
         "\n"
+        "# HELP tls_tracer_events_dropped_total Ring buffer dropped events\n"
+        "# TYPE tls_tracer_events_dropped_total counter\n"
+        "tls_tracer_events_dropped_total %llu\n"
+        "\n"
+        "# HELP tls_tracer_connections_active Currently tracked connections\n"
+        "# TYPE tls_tracer_connections_active gauge\n"
+        "tls_tracer_connections_active %llu\n"
+        "\n"
+        "# HELP tls_tracer_bpf_map_entries BPF map entry count\n"
+        "# TYPE tls_tracer_bpf_map_entries gauge\n"
+        "tls_tracer_bpf_map_entries{map=\"conn_info\"} %llu\n"
+        "tls_tracer_bpf_map_entries{map=\"ssl_args\"} %llu\n"
+        "\n"
         "# HELP tls_tracer_info Build info\n"
         "# TYPE tls_tracer_info gauge\n"
         "tls_tracer_info{version=\"%s\"} 1\n",
@@ -104,6 +140,10 @@ static int metrics_format(char *buf, size_t bufsize)
         (unsigned long long)atomic_load(&m_bytes_response),
         (unsigned long long)atomic_load(&m_ring_buffer_size),
         (long long)uptime,
+        (unsigned long long)atomic_load(&m_events_dropped),
+        (unsigned long long)atomic_load(&m_active_connections),
+        (unsigned long long)atomic_load(&m_bpf_conn_info_entries),
+        (unsigned long long)atomic_load(&m_bpf_ssl_args_entries),
         VERSION);
 }
 
@@ -112,6 +152,9 @@ static void handle_client(int client_fd)
     char req[512];
     struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* P2-11: prevent slow clients from blocking the metrics thread */
+    struct timeval snd_tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
     ssize_t n = recv(client_fd, req, sizeof(req) - 1, 0);
     if (n <= 0) {
@@ -163,7 +206,7 @@ static void *metrics_thread_fn(void *arg)
     return NULL;
 }
 
-int metrics_start(int port, const char *path)
+int metrics_start(int port, const char *path, const char *bind_addr)
 {
     if (path && path[0])
         snprintf(metrics_http_path, sizeof(metrics_http_path), "%s", path);
@@ -175,11 +218,15 @@ int metrics_start(int port, const char *path)
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    /* Default to 127.0.0.1 (localhost-only) to avoid exposing metrics to
+     * untrusted networks. Use --metrics-bind 0.0.0.0 for K8s pod scraping. */
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port = htons((uint16_t)port),
-        .sin_addr.s_addr = INADDR_ANY,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
     };
+    if (bind_addr && bind_addr[0])
+        inet_pton(AF_INET, bind_addr, &addr.sin_addr);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(server_fd);
@@ -217,11 +264,20 @@ void metrics_stop(void)
 
     metrics_running = 0;
 
-    /* Close the server socket to unblock accept() */
+    /* Use shutdown() before close() to reliably unblock accept() across
+     * all Linux kernel versions, then close the fd. */
     if (server_fd >= 0) {
+        shutdown(server_fd, SHUT_RDWR);
         close(server_fd);
         server_fd = -1;
     }
 
-    pthread_join(metrics_thread, NULL);
+    /* Join with a timeout: if thread doesn't exit within 3s, detach it
+     * to avoid blocking the main process shutdown indefinitely. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 3;
+    int join_err = pthread_timedjoin_np(metrics_thread, NULL, &ts);
+    if (join_err != 0)
+        pthread_detach(metrics_thread);
 }

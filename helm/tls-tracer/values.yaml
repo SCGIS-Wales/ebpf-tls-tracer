@@ -147,7 +147,46 @@ kinesis:
       cpu: 25m
       memory: 64Mi
 
-# --- 6. Service Account & IRSA ---
+# --- 6. Splunk HEC Log Shipping ---
+# Runs a Python sidecar that forwards JSON logs to Splunk HTTP Event Collector.
+# Reads events from the shared log file and POSTs them to the HEC endpoint.
+
+splunk:
+  enabled: false
+  # Full HEC URL including /services/collector (required if enabled)
+  hecUrl: ""
+  # HEC authentication token — choose ONE method:
+  #
+  # Option A (RECOMMENDED): Reference a Kubernetes Secret
+  hecTokenSecret:
+    name: ""   # e.g. "splunk-hec-token"
+    key: ""    # e.g. "token"
+  #
+  # Option B (dev/test only): Inline token. WARNING: visible in Helm history,
+  # pod env, and git. Use secretKeyRef (option A) for production.
+  hecToken: ""
+  # Target Splunk index (empty = use HEC default)
+  index: ""
+  # Sourcetype for events
+  sourcetype: "tls:tracer"
+  # Source field
+  source: "tls_tracer"
+  # Verify Splunk TLS certificate
+  verifySsl: true
+  # Batch size (events per HTTP POST)
+  batchSize: 50
+  # Flush interval in seconds
+  flushIntervalSeconds: 5
+  # Resources for Splunk sidecar
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 25m
+      memory: 64Mi
+
+# --- 7. Service Account & IRSA ---
 
 serviceAccount:
   create: true
@@ -168,11 +207,13 @@ serviceAccount:
 # --- 7. Pod Configuration ---
 
 resources:
+  # Sizing for Apigee Hybrid / high-throughput nodes (5k+ events/sec):
+  # measured CPU ~150-300m under load. Adjust limits based on node traffic volume.
   limits:
-    cpu: 200m
+    cpu: 500m
     memory: 256Mi
   requests:
-    cpu: 50m
+    cpu: 150m
     memory: 64Mi
 
 nodeSelector: {}

@@ -48,6 +48,8 @@ struct config {
     int             pcap_snaplen;   /* max bytes per packet in pcap (default: 4096) */
     int             metrics_port;   /* Prometheus metrics port (0 = disabled) */
     char            metrics_path[64]; /* metrics HTTP path (default: /metrics) */
+    char            metrics_bind[64]; /* metrics bind address (default: 127.0.0.1) */
+    char            splunk_sourcetype[64]; /* Splunk sourcetype for JSON events (empty = disabled) */
     struct traffic_filter filter;
 };
 

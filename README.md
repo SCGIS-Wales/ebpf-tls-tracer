@@ -41,7 +41,7 @@ eBPF TLS Tracer attaches to TLS libraries at the kernel level to capture **decry
   - [Docker](#docker)
   - [Amazon Linux 2023 / EKS](#amazon-linux-2023--eks)
 - [Architecture](#architecture)
-- [Project Structure](#project-structure)
+- [Splunk Integration](#splunk-integration)
 - [Requirements](#requirements)
 - [Licence](#licence)
 
@@ -945,55 +945,6 @@ sudo ./bin/tls_tracer -f json -v
 
 ---
 
-## Project Structure
-
-```
-ebpf-tls-tracer/
-├── include/
-│   ├── tracer.h              # Shared structs (kernel + user space)
-│   ├── config.h              # Configuration constants
-│   ├── filter.h              # Traffic filter data structures
-│   ├── k8s.h                 # Kubernetes metadata interface
-│   ├── output.h              # Output formatting interface
-│   ├── protocol.h            # Protocol detection interface
-│   ├── session.h             # Session aggregation interface
-│   ├── pcap.h                # PCAP-ng export interface
-│   └── metrics.h             # Prometheus metrics interface
-├── src/
-│   ├── bpf_program.c         # eBPF kernel probes (OpenSSL, GnuTLS, wolfSSL, BoringSSL)
-│   ├── tls_tracer.c          # User-space CLI entry point
-│   ├── protocol.c            # L7 protocol detection engine
-│   ├── output.c              # JSON / text event formatting
-│   ├── filter.c              # Traffic filtering (CIDR, protocol, method, direction)
-│   ├── k8s.c                 # Kubernetes metadata enrichment
-│   ├── session.c             # Session aggregation and tracking
-│   ├── pcap.c                # PCAP-ng file writer
-│   └── metrics.c             # Prometheus metrics HTTP server
-├── tests/
-│   ├── test_tracer.c         # Struct and constant tests (16 tests)
-│   ├── test_helpers.c        # Helper function tests (46 tests)
-│   ├── test_filter.c         # Traffic filter tests
-│   ├── test_s3_shipper.py    # S3 log shipper tests
-│   └── test_kinesis_shipper.py  # Kinesis shipper tests
-├── scripts/
-│   ├── s3_shipper.py         # S3 log shipping sidecar
-│   └── kinesis_shipper.py    # Kinesis Firehose sidecar
-├── helm/
-│   └── tls-tracer/           # Helm chart (DaemonSet, RBAC, S3, Kinesis)
-├── deploy/
-│   ├── kubernetes/           # Raw K8s manifests (alternative to Helm)
-│   ├── ecs/                  # AWS ECS task definition (EC2 launch type)
-│   └── systemd/              # systemd service + environment file for EC2
-├── .github/
-│   └── workflows/
-│       ├── build.yml         # CI: build, test, ASAN/UBSan, container image
-│       ├── codeql.yml        # CodeQL SAST scanning
-│       └── semgrep.yml       # Semgrep pattern-based SAST
-├── Dockerfile                # Multi-stage build (Debian trixie)
-├── Makefile                  # Build system
-└── LICENSE                   # MIT
-```
-
 ---
 
 ## Requirements
@@ -1025,6 +976,98 @@ sudo apt-get install libbpf1 libelf1 zlib1g libssl3
 
 # AL2023 / RHEL / Fedora
 sudo dnf install libbpf elfutils-libelf zlib openssl-libs
+```
+
+---
+
+## Splunk Integration
+
+The tracer supports Splunk as a log destination via the HTTP Event Collector (HEC). Events are shipped as structured JSON with Splunk metadata for efficient indexing.
+
+### Direct HEC Shipping (Sidecar or Pipe)
+
+Use the bundled `splunk_hec_shipper.py` to forward events from stdin to Splunk HEC:
+
+```bash
+# Pipe tracer output directly to Splunk HEC
+sudo ./bin/tls_tracer -f json \
+  | python3 scripts/splunk_hec_shipper.py
+```
+
+Required environment variables:
+
+| Variable | Description |
+|---|---|
+| `SPLUNK_HEC_URL` | Full HEC URL, e.g. `https://splunk:8088/services/collector` |
+| `SPLUNK_HEC_TOKEN` | HEC authentication token |
+| `SPLUNK_INDEX` | Target index (optional, uses HEC default) |
+| `SPLUNK_SOURCETYPE` | Sourcetype (default: `tls:tracer`) |
+| `SPLUNK_SOURCE` | Source field (default: `tls_tracer`) |
+| `SPLUNK_VERIFY_SSL` | Verify TLS certs (default: `true`) |
+| `SPLUNK_BATCH_SIZE` | Events per HTTP POST (default: `50`) |
+| `SPLUNK_FLUSH_INTERVAL` | Seconds between flushes (default: `5`) |
+
+### Kubernetes (Helm)
+
+Enable the Splunk sidecar in your Helm values:
+
+```yaml
+splunk:
+  enabled: true
+  hecUrl: "https://splunk-hec.internal:8088/services/collector"
+  hecToken: "your-hec-token"
+  index: "tls_traffic"
+  sourcetype: "tls:tracer"
+```
+
+### Systemd (EC2 / On-Premise)
+
+Configure the systemd service to pipe output to Splunk:
+
+```bash
+# /etc/tls-tracer/tls-tracer.env
+TLS_TRACER_OPTS=-f json -v
+SPLUNK_HEC_URL=https://splunk:8088/services/collector
+SPLUNK_HEC_TOKEN=your-hec-token
+SPLUNK_INDEX=tls_traffic
+```
+
+Override the ExecStart in the service file to pipe through the shipper:
+
+```ini
+ExecStart=/bin/sh -c '/usr/local/bin/tls_tracer $TLS_TRACER_OPTS | python3 /opt/tls_tracer/scripts/splunk_hec_shipper.py'
+```
+
+### Inline Sourcetype Tagging
+
+Use `--splunk-sourcetype` to embed Splunk metadata directly in each JSON event:
+
+```bash
+sudo ./bin/tls_tracer -f json --splunk-sourcetype tls:tracer
+```
+
+This adds a `"sourcetype"` field to every JSON event, enabling Splunk to route events to the correct index/sourcetype without relying on HEC configuration alone.
+
+### Recommended Splunk Searches
+
+```spl
+# All TLS events from a specific host
+index=tls_traffic sourcetype="tls:tracer" host_ip="10.0.1.5"
+
+# Failed TLS connections
+index=tls_traffic sourcetype="tls:tracer" event_type="tls_error"
+
+# HTTP traffic by method and status
+index=tls_traffic sourcetype="tls:tracer" http_method=* | stats count by http_method, http_status
+
+# Weak TLS versions (below 1.2)
+index=tls_traffic sourcetype="tls:tracer" tls_version IN ("TLSv1.0", "TLSv1.1")
+
+# Top destinations by bytes transferred
+index=tls_traffic sourcetype="tls:tracer" | stats sum(data_len) as bytes by dst_ip | sort -bytes
+
+# Dropped events (ring buffer pressure)
+index=tls_traffic sourcetype="tls:tracer" event_type="dropped" | timechart count
 ```
 
 ---

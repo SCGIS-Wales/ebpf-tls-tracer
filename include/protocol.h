@@ -3,6 +3,9 @@
 
 #include "tracer.h"
 
+/* Maximum valid Kafka message size (100 MB) */
+#define MAX_KAFKA_MESSAGE_SIZE (100 * 1024 * 1024)
+
 /* HTTP Layer 7 parsed info */
 struct http_info {
     char method[16];

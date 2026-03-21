@@ -59,6 +59,7 @@ DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024  # R-6 fix: 50MB cap on dead-letter fil
 LOG_FILE = "/var/log/tls-tracer/events.json"
 
 running = True
+dead_letter_drops = 0  # Counter for records dropped at dead-letter cap
 
 
 def signal_handler(signum, frame):
@@ -127,9 +128,12 @@ def send_chunk(firehose, records):
                     except OSError:
                         dlq_size = 0
                     if dlq_size >= DEAD_LETTER_MAX_BYTES:
+                        global dead_letter_drops
+                        dead_letter_drops += len(records)
                         log("WARN", f"Dead-letter file at "
                             f"{dlq_size // (1024*1024)}MB cap, "
-                            f"dropping {len(records)} records")
+                            f"dropping {len(records)} records "
+                            f"(total dropped: {dead_letter_drops})")
                         return False
                     fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                     with os.fdopen(fd, "a") as dlq:
