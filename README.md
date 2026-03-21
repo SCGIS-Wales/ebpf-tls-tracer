@@ -34,6 +34,7 @@ eBPF TLS Tracer attaches to TLS libraries at the kernel level to capture **decry
   - [AWS Integration (S3 & Kinesis)](#aws-integration-s3--kinesis)
   - [Kubernetes Metadata Enrichment](#kubernetes-metadata-enrichment)
   - [Raw Manifests](#raw-manifests)
+- [Linux Service (systemd)](#linux-service-systemd)
 - [Data Sanitisation & Redaction](#data-sanitisation--redaction)
 - [Performance](#performance)
 - [Building from Source](#building-from-source)
@@ -168,6 +169,14 @@ sudo ./bin/tls_tracer [OPTIONS]
 | `-m` | `--method MODE:METHOD` | Filter by HTTP method (repeatable). METHOD: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT` |
 | `-D` | `--dir MODE:DIR` | Filter by traffic direction (repeatable). DIR: `inbound`, `outbound` |
 | `-H` | `--headers-only` | Capture HTTP headers only (truncate at body boundary, for PCI-DSS/GDPR) |
+| `-r` | `--ring-buffer-size MB` | Ring buffer size in MB (power-of-2, 1–64, default: 4) |
+| `-A` | `--aggregate` | Enable session aggregation (emit summaries on close/timeout) |
+| | `--aggregate-timeout SECS` | Idle timeout before summary emission (default: 30) |
+| | `--aggregate-only` | Only emit session summaries, suppress per-event output |
+| | `--pcap FILE` | Write captured events to pcap-ng file |
+| | `--pcap-snaplen N` | Max bytes per packet in pcap (default: 4096) |
+| | `--metrics-port PORT` | Enable Prometheus metrics endpoint on PORT |
+| | `--metrics-path PATH` | HTTP path for metrics (default: `/metrics`) |
 | `-c` | `--max-events N` | Exit after capturing N events |
 | `-t` | `--duration SECS` | Exit after SECS seconds |
 | `-v` | `--verbose` | Verbose output (library path, probe status, ring buffer info) |
@@ -184,6 +193,10 @@ sudo ./bin/tls_tracer --quic                    # Enable QUIC/UDP detection
 sudo ./bin/tls_tracer -l /path/to/libssl.so     # Custom OpenSSL path
 sudo ./bin/tls_tracer -B /usr/local/bin/envoy   # Trace Envoy with BoringSSL
 sudo ./bin/tls_tracer -s 'secret=[^&]*'         # Add extra sanitisation pattern
+sudo ./bin/tls_tracer -f json --aggregate       # Session aggregation
+sudo ./bin/tls_tracer --pcap /tmp/capture.pcapng # PCAP-ng export
+sudo ./bin/tls_tracer -f json --metrics-port 9090 # Prometheus metrics
+sudo ./bin/tls_tracer -f json -r 16             # 16 MB ring buffer
 ```
 
 ### Traffic Filtering
@@ -560,6 +573,150 @@ When running on ECS, the tracer detects the `ECS_CONTAINER_METADATA_URI_V4` envi
 
 ---
 
+## Linux Service (systemd)
+
+Run TLS Tracer as a persistent systemd service on bare-metal or EC2 instances. This is the recommended deployment method for **standalone EC2 instances** and **EC2 instances in ECS clusters** where you want host-level TLS visibility outside of containers.
+
+### Installation on EC2 (Amazon Linux 2023)
+
+```bash
+# Install build dependencies
+sudo dnf install -y clang llvm gcc make libbpf-devel elfutils-libelf-devel \
+  zlib-devel kernel-devel-$(uname -r) kernel-headers-$(uname -r) openssl-devel bpftool
+
+# Build and install
+git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
+cd ebpf-tls-tracer
+make && make test
+sudo make install    # Installs to /usr/local/bin + /usr/local/lib/tls_tracer/
+```
+
+### Service Setup
+
+```bash
+# Copy the systemd unit and environment file
+sudo mkdir -p /etc/tls-tracer
+sudo cp deploy/systemd/tls-tracer.service /etc/systemd/system/
+sudo cp deploy/systemd/tls-tracer.env /etc/tls-tracer/
+
+# Edit the environment file to suit your needs
+sudo vi /etc/tls-tracer/tls-tracer.env
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable tls-tracer
+sudo systemctl start tls-tracer
+```
+
+### Configuration
+
+All runtime options are set via the environment file at `/etc/tls-tracer/tls-tracer.env`. Edit the `TLS_TRACER_OPTS` variable:
+
+```bash
+# Default — JSON output with verbose logging
+TLS_TRACER_OPTS=-f json -v
+
+# BoringSSL / Envoy (Apigee Hybrid)
+TLS_TRACER_OPTS=-f json -v -B /usr/local/bin/envoy
+
+# Prometheus metrics + session aggregation
+TLS_TRACER_OPTS=-f json -v --metrics-port 9090 --aggregate --aggregate-timeout 60
+
+# PCAP capture to file
+TLS_TRACER_OPTS=-f json -v --pcap /var/log/tls-tracer/capture.pcapng
+```
+
+After editing, restart the service:
+
+```bash
+sudo systemctl restart tls-tracer
+```
+
+### Checking Status and Logs
+
+```bash
+# Service status
+sudo systemctl status tls-tracer
+
+# Live log stream (JSON events go to journald)
+sudo journalctl -u tls-tracer -f
+
+# Last 100 events
+sudo journalctl -u tls-tracer -n 100 --no-pager
+
+# Export logs for analysis
+sudo journalctl -u tls-tracer --since "1 hour ago" -o cat > /tmp/tls-events.json
+```
+
+### EC2 Instances in ECS Clusters
+
+On EC2 instances running the ECS container agent, the systemd service provides **complementary host-level visibility** alongside containerised workloads:
+
+- The systemd service traces **all TLS traffic on the host** — including traffic from ECS tasks, the ECS agent itself, and any host-level processes.
+- This is separate from the [ECS task-based deployment](#aws-ecs-deployment). You can run both if needed: the task-based deployment runs inside a container, while the systemd service runs directly on the host.
+- On ECS-optimised AMIs (Amazon Linux 2023), the kernel is already configured with BTF, uprobes, and BPF JIT — no kernel changes are required.
+
+```bash
+# On an ECS EC2 instance — install and start
+sudo dnf install -y clang llvm gcc make libbpf-devel elfutils-libelf-devel \
+  zlib-devel kernel-devel-$(uname -r) kernel-headers-$(uname -r)
+cd /opt && sudo git clone https://github.com/SCGIS-Wales/ebpf-tls-tracer.git
+cd ebpf-tls-tracer && sudo make && sudo make install
+
+sudo mkdir -p /etc/tls-tracer
+sudo cp deploy/systemd/tls-tracer.service /etc/systemd/system/
+sudo cp deploy/systemd/tls-tracer.env /etc/tls-tracer/
+sudo systemctl daemon-reload && sudo systemctl enable --now tls-tracer
+```
+
+To ship logs to CloudWatch, configure the CloudWatch agent to collect from the systemd journal:
+
+```json
+{
+  "logs": {
+    "logs_collected": {
+      "journald": {
+        "units": ["tls-tracer"],
+        "collect_list": [
+          {
+            "unit": "tls-tracer",
+            "log_group_name": "/ec2/tls-tracer",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+### Standalone EC2 Instances
+
+For EC2 instances without ECS (general-purpose VMs, bastion hosts, jump boxes):
+
+```bash
+# Same installation steps as above, then optionally:
+
+# Ship JSON logs to CloudWatch via the CloudWatch agent
+sudo dnf install -y amazon-cloudwatch-agent
+# Configure /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+# with the journald collection config shown above, then:
+sudo systemctl restart amazon-cloudwatch-agent
+```
+
+### Uninstall
+
+```bash
+sudo systemctl stop tls-tracer
+sudo systemctl disable tls-tracer
+sudo rm /etc/systemd/system/tls-tracer.service
+sudo rm -rf /etc/tls-tracer
+sudo make uninstall    # Removes binary and BPF object
+sudo systemctl daemon-reload
+```
+
+---
+
 ## BoringSSL / Apigee Hybrid Support
 
 TLS Tracer supports **BoringSSL**, Google's fork of OpenSSL that is statically linked into Envoy-based proxies used by **Apigee Hybrid**, **Istio**, and **Anthos Service Mesh (ASM)**.
@@ -728,17 +885,22 @@ sudo ./bin/tls_tracer -f json -v
 │  tls_tracer (CLI)                                                │
 │    ├── Argument parsing & configuration (getopt_long)            │
 │    ├── OpenSSL version validation (dlopen / dlsym)               │
+│    ├── BoringSSL ELF symbol verification (libelf/gelf)           │
 │    ├── BPF object loading (libbpf)                               │
 │    ├── Kprobe attach: connect(), tcp_set_state, udp_sendmsg      │
 │    ├── Uprobe attach: SSL_read/write, SSL_version,               │
 │    │    SSL_get_current_cipher, SSL_get_certificate              │
+│    ├── BoringSSL uprobe + kprobe attach (writev/sendmsg)         │
 │    ├── Ring buffer polling (variable-length events)              │
 │    ├── L7 protocol detection (HTTP, gRPC, Kafka, WS, …)         │
 │    ├── Kubernetes metadata enrichment (/proc/<pid>/environ)      │
 │    ├── DNS hostname caching (per pid:fd)                         │
+│    ├── Session aggregation (--aggregate)                         │
+│    ├── PCAP-ng export (--pcap)                                   │
+│    ├── Prometheus metrics endpoint (--metrics-port)              │
 │    └── Event formatting (text / JSON) + sanitisation             │
 │                                                                  │
-├──────────────── Ring Buffer (4 MB, shared) ──────────────────────┤
+├──────────────── Ring Buffer (1–64 MB, shared) ──────────────────┤
 │                                                                  │
 │                        Kernel Space                              │
 │                                                                  │
@@ -753,7 +915,10 @@ sudo ./bin/tls_tracer -f json -v
 │    ├── uretprobe/SSL_write         → capture data + enrich       │
 │    ├── uprobe/SSL_version          → capture TLS version         │
 │    ├── uprobe/SSL_get_current_cipher → capture cipher suite      │
-│    └── uprobe/SSL_get_certificate    → detect mTLS              │
+│    ├── uprobe/SSL_get_certificate    → detect mTLS              │
+│    ├── uprobe/boringssl_SSL_read/write → BoringSSL data capture  │
+│    ├── uprobe/boringssl_SSL_get_fd    → BoringSSL fd (Tier 2)   │
+│    └── kprobe/ksys_write/writev/sendmsg → BoringSSL fd (Tier 3) │
 │                                                                  │
 │  BPF Maps                                                        │
 │    ├── ssl_args_map       (HASH)         per-thread SSL args     │
@@ -761,6 +926,9 @@ sudo ./bin/tls_tracer -f json -v
 │    ├── ssl_version_map    (LRU_HASH)     SSL* → TLS version     │
 │    ├── cipher_name_map    (LRU_HASH)     SSL* → cipher name     │
 │    ├── mtls_map           (LRU_HASH)     SSL* → mTLS flag       │
+│    ├── boringssl_args_map (HASH)         BoringSSL thread args   │
+│    ├── boringssl_fd_map   (LRU_HASH)     BoringSSL SSL* → fd    │
+│    ├── boringssl_in_ssl_map (HASH)       thread-in-SSL flag     │
 │    ├── event_buf     (PERCPU_ARRAY)      scratch buffer          │
 │    ├── tls_events    (RINGBUF, 4 MB)     user-space output       │
 │    └── dropped_events (PERCPU_ARRAY)     drop counter            │
@@ -774,6 +942,8 @@ sudo ./bin/tls_tracer -f json -v
 2. **`kprobe/tcp_set_state`** — fires when TCP reaches `ESTABLISHED`, capturing both local and remote addresses from `struct sock` (CO-RE compatible).
 3. **`kretprobe/connect()`** — stores `{pid_tgid} → conn_info_t` in the BPF map.
 4. **SSL uretprobes** — extract the socket fd from `SSL->rbio->num` (OpenSSL internal offset) and look up `conn_info_map` to enrich TLS events with IP:port.
+
+---
 
 ---
 
