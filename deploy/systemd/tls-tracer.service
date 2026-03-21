@@ -1,0 +1,39 @@
+[Unit]
+Description=eBPF TLS Tracer — kernel-level TLS traffic visibility
+Documentation=https://github.com/SCGIS-Wales/ebpf-tls-tracer
+After=network.target
+ConditionPathExists=/sys/kernel/btf/vmlinux
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/tls-tracer/tls-tracer.env
+ExecStart=/usr/local/bin/tls_tracer $TLS_TRACER_OPTS
+
+# Capabilities required for eBPF probe attachment
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE
+
+# BPF map allocation requires unlimited locked memory
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging — stdout/stderr go to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tls-tracer
+
+# Security hardening
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/sys/fs/bpf
+PrivateTmp=true
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target
