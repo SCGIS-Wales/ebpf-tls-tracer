@@ -24,6 +24,8 @@
 #include <sys/utsname.h>  /* for uname() — C-3 kernel version check */
 #include <fcntl.h>     /* for O_RDONLY — H-4 bounded /proc read */
 #include <dlfcn.h>     /* dlopen/dlsym for R1-REL OpenSSL version check */
+#include <gelf.h>      /* ELF symbol parsing for BoringSSL binary verification */
+#include <libelf.h>
 #include <ifaddrs.h>   /* getifaddrs() for host IP auto-detection */
 #include <net/if.h>    /* IFF_LOOPBACK */
 #include <bpf/libbpf.h>
@@ -34,12 +36,23 @@
 #include "output.h"
 #include "k8s.h"
 #include "protocol.h"
+#include "session.h"
+#include "pcap.h"
+#include "metrics.h"
+
+#ifndef VERSION
+#define VERSION "dev"
+#endif
 
 #define RING_POLL_TIMEOUT  100
-#define MAX_PROBES         32
+#define MAX_PROBES         64
 
 static volatile sig_atomic_t exiting = 0;
 static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+signum (#2 fix) */
+
+/* Event statistics counters (printed to stderr on exit, read by metrics thread) */
+__u64 stat_events_captured = 0;
+__u64 stat_events_filtered = 0;
 
 /* --- Userspace DNS cache: remembers hostname per {pid, fd} connection ---
  * R-1 fix: Uses open-addressing hash table for O(1) lookup instead of O(n)
@@ -148,6 +161,10 @@ static struct config cfg = {
     .verbose         = 0,
     .enable_quic     = 0,
     .sanitize_count  = 0,
+    .ring_buffer_mb  = 4,
+    .aggregate_timeout = 30,
+    .pcap_snaplen    = 4096,
+    .metrics_path    = "/metrics",
 };
 
 static void sig_handler(int signo)
@@ -254,6 +271,254 @@ static int find_ssl_library(char *path, size_t path_len)
     return -1;
 }
 
+static int find_gnutls_library(char *path, size_t path_len)
+{
+    const char *candidates[] = {
+        "/host/usr/lib/x86_64-linux-gnu/libgnutls.so.30",
+        "/host/usr/lib/aarch64-linux-gnu/libgnutls.so.30",
+        "/host/usr/lib64/libgnutls.so.30",
+        "/usr/lib/x86_64-linux-gnu/libgnutls.so.30",
+        "/usr/lib/aarch64-linux-gnu/libgnutls.so.30",
+        "/usr/lib64/libgnutls.so.30",
+        "/usr/lib/libgnutls.so.30",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int find_wolfssl_library(char *path, size_t path_len)
+{
+    const char *candidates[] = {
+        "/host/usr/lib/x86_64-linux-gnu/libwolfssl.so",
+        "/host/usr/lib/aarch64-linux-gnu/libwolfssl.so",
+        "/host/usr/lib64/libwolfssl.so",
+        "/usr/lib/x86_64-linux-gnu/libwolfssl.so",
+        "/usr/lib/aarch64-linux-gnu/libwolfssl.so",
+        "/usr/lib64/libwolfssl.so",
+        "/usr/lib/libwolfssl.so",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Find binary with statically-linked BoringSSL (e.g., Envoy for Apigee Hybrid).
+ * Unlike shared libraries, BoringSSL is compiled directly into the binary.
+ * Search common Envoy/Istio/Apigee paths in K8s DaemonSet and host contexts. */
+static int find_boringssl_binary(char *path, size_t path_len)
+{
+    const char *candidates[] = {
+        /* K8s DaemonSet with host filesystem at /host */
+        "/host/usr/local/bin/envoy",
+        "/host/usr/bin/envoy",
+        /* Direct access (container or host) */
+        "/usr/local/bin/envoy",
+        "/usr/bin/envoy",
+        /* Apigee-specific paths */
+        "/host/opt/apigee/bin/envoy",
+        "/opt/apigee/bin/envoy",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(path, path_len, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Verify a binary contains required SSL symbols using ELF parsing.
+ * Returns 0 if all required symbols found, -1 if any missing.
+ * Used to detect stripped binaries before attempting uprobe attachment. */
+static int verify_boringssl_symbols(const char *binary_path, int verbose)
+{
+    const char *required[] = {"SSL_read", "SSL_write"};
+    const char *optional[] = {"SSL_get_fd", "SSL_version",
+                               "SSL_get_current_cipher", "SSL_get_certificate"};
+    int required_count = 2;
+    int optional_count = 4;
+
+    int bin_fd = open(binary_path, O_RDONLY);
+    if (bin_fd < 0)
+        return -1;
+
+    if (elf_version(EV_CURRENT) == EV_NONE) {
+        close(bin_fd);
+        return -1;
+    }
+
+    Elf *elf = elf_begin(bin_fd, ELF_C_READ, NULL);
+    if (!elf) {
+        close(bin_fd);
+        return -1;
+    }
+
+    /* Scan all symbol tables (.symtab and .dynsym) */
+    int found_required[2] = {0, 0};
+    int found_optional[4] = {0, 0, 0, 0};
+
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(elf, scn)) != NULL) {
+        GElf_Shdr shdr;
+        if (gelf_getshdr(scn, &shdr) == NULL)
+            continue;
+        if (shdr.sh_type != SHT_SYMTAB && shdr.sh_type != SHT_DYNSYM)
+            continue;
+
+        Elf_Data *data = elf_getdata(scn, NULL);
+        if (!data)
+            continue;
+
+        int num_syms = (int)(shdr.sh_size / shdr.sh_entsize);
+        for (int i = 0; i < num_syms; i++) {
+            GElf_Sym sym;
+            if (gelf_getsym(data, i, &sym) == NULL)
+                continue;
+
+            const char *name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+            if (!name)
+                continue;
+
+            for (int r = 0; r < required_count; r++) {
+                if (strcmp(name, required[r]) == 0)
+                    found_required[r] = 1;
+            }
+            for (int o = 0; o < optional_count; o++) {
+                if (strcmp(name, optional[o]) == 0)
+                    found_optional[o] = 1;
+            }
+        }
+    }
+
+    elf_end(elf);
+    close(bin_fd);
+
+    int all_required = 1;
+    for (int r = 0; r < required_count; r++) {
+        if (!found_required[r]) {
+            fprintf(stderr, "Error: Required symbol '%s' not found in %s\n",
+                    required[r], binary_path);
+            all_required = 0;
+        }
+    }
+
+    if (verbose) {
+        for (int r = 0; r < required_count; r++)
+            fprintf(stderr, "  %s: %s %s\n", found_required[r] ? "Found" : "MISSING",
+                    required[r], found_required[r] ? "" : "(REQUIRED)");
+        for (int o = 0; o < optional_count; o++)
+            fprintf(stderr, "  %s: %s %s\n", found_optional[o] ? "Found" : "Missing",
+                    optional[o], found_optional[o] ? "" : "(optional)");
+    }
+
+    return all_required ? 0 : -1;
+}
+
+/* Probe specification for library-specific uprobe attachment */
+struct probe_spec {
+    const char *bpf_name;
+    const char *func_name;
+    int is_retprobe;
+};
+
+static const struct probe_spec gnutls_probes[] = {
+    {"probe_gnutls_recv_enter",       "gnutls_record_recv",       0},
+    {"probe_gnutls_recv_return",      "gnutls_record_recv",       1},
+    {"probe_gnutls_send_enter",       "gnutls_record_send",       0},
+    {"probe_gnutls_send_return",      "gnutls_record_send",       1},
+    {"probe_gnutls_transport_enter",  "gnutls_transport_get_int", 0},
+    {"probe_gnutls_transport_return", "gnutls_transport_get_int", 1},
+};
+
+static const struct probe_spec wolfssl_probes[] = {
+    {"probe_wolfssl_read_enter",    "wolfSSL_read",   0},
+    {"probe_wolfssl_read_return",   "wolfSSL_read",   1},
+    {"probe_wolfssl_write_enter",   "wolfSSL_write",  0},
+    {"probe_wolfssl_write_return",  "wolfSSL_write",  1},
+    {"probe_wolfssl_getfd_enter",   "wolfSSL_get_fd", 0},
+    {"probe_wolfssl_getfd_return",  "wolfSSL_get_fd", 1},
+};
+
+/* BoringSSL probes: attach to statically-linked binary (e.g., Envoy).
+ * Same function names as OpenSSL (API-compatible), but mapped to
+ * BoringSSL-specific BPF programs with syscall-based fd correlation. */
+static const struct probe_spec boringssl_probes[] = {
+    {"probe_boringssl_read_enter",    "SSL_read",    0},
+    {"probe_boringssl_read_return",   "SSL_read",    1},
+    {"probe_boringssl_write_enter",   "SSL_write",   0},
+    {"probe_boringssl_write_return",  "SSL_write",   1},
+    {"probe_boringssl_getfd_enter",   "SSL_get_fd",  0},
+    {"probe_boringssl_getfd_return",  "SSL_get_fd",  1},
+};
+
+/* Optional BoringSSL probes — attach if symbols present, no error if missing */
+static const struct probe_spec boringssl_optional_probes[] = {
+    {"probe_boringssl_version_enter",  "SSL_version",             0},
+    {"probe_boringssl_version_return", "SSL_version",             1},
+    {"probe_boringssl_cipher_enter",   "SSL_get_current_cipher",  0},
+    {"probe_boringssl_cipher_return",  "SSL_get_current_cipher",  1},
+    {"probe_boringssl_cert_enter",     "SSL_get_certificate",     0},
+    {"probe_boringssl_cert_return",    "SSL_get_certificate",     1},
+};
+
+/* Attach probes for a specific TLS library.
+ * Returns the number of probes successfully attached. */
+static int attach_library_probes(struct bpf_object *obj,
+                                  const struct probe_spec *probes,
+                                  int probe_count,
+                                  const char *lib_path,
+                                  const char *lib_name,
+                                  struct bpf_link **links,
+                                  int *link_count,
+                                  int verbose)
+{
+    int attached = 0;
+    for (int i = 0; i < probe_count; i++) {
+        struct bpf_program *p = bpf_object__find_program_by_name(obj, probes[i].bpf_name);
+        if (!p) {
+            if (verbose)
+                fprintf(stderr, "Note: BPF program '%s' not found for %s\n",
+                        probes[i].bpf_name, lib_name);
+            continue;
+        }
+        LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
+            .retprobe = probes[i].is_retprobe,
+            .func_name = probes[i].func_name,
+        );
+        links[*link_count] = bpf_program__attach_uprobe_opts(
+            p, -1, lib_path, 0, &uprobe_opts);
+        if (!links[*link_count] || libbpf_get_error(links[*link_count])) {
+            links[*link_count] = NULL;
+            if (verbose)
+                fprintf(stderr, "Warning: Could not attach %s uprobe for %s (%s)\n",
+                        probes[i].func_name, lib_name,
+                        probes[i].is_retprobe ? "return" : "entry");
+            continue;
+        }
+        (*link_count)++;
+        attached++;
+    }
+    return attached;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -267,6 +532,9 @@ static void usage(const char *prog)
         "  -p, --pid PID          Filter by process ID\n"
         "  -u, --uid UID          Filter by user ID\n"
         "  -l, --lib PATH         Path to libssl.so (auto-detected by default)\n"
+        "  -B, --boringssl-bin PATH  Path to binary with statically-linked BoringSSL\n"
+        "                            (e.g., /usr/local/bin/envoy for Apigee Hybrid/Istio).\n"
+        "                            Auto-detects common Envoy paths if not specified.\n"
         "  -f, --format FMT       Output format: text (default) or json\n"
         "  -x, --hex              Show hex dump of captured data\n"
         "  -d, --data-only        Print only captured data (no headers)\n"
@@ -282,7 +550,19 @@ static void usage(const char *prog)
         "                         MTH: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT\n"
         "  -D, --dir MODE:DIR     Filter by traffic direction (repeatable)\n"
         "                         DIR: inbound, outbound\n"
+        "  -H, --headers-only     Capture HTTP headers only (truncate at body boundary)\n"
+        "  -r, --ring-buffer-size MB  Ring buffer size in MB (power-of-2, 1-64, default: 4)\n"
+        "  -A, --aggregate        Enable session aggregation (emit summaries on close/timeout)\n"
+        "      --aggregate-timeout SECS  Idle timeout before summary emission (default: 30)\n"
+        "      --aggregate-only   Only emit session summaries, suppress per-event output\n"
+        "      --pcap FILE        Write captured events to pcap-ng file\n"
+        "      --pcap-snaplen N   Max bytes per packet in pcap (default: 4096)\n"
+        "      --metrics-port PORT  Enable Prometheus metrics endpoint on PORT\n"
+        "      --metrics-path PATH  HTTP path for metrics (default: /metrics)\n"
+        "  -c, --max-events N     Exit after capturing N events\n"
+        "  -t, --duration SECS    Exit after SECS seconds\n"
         "  -v, --verbose          Verbose output\n"
+        "  -V, --version          Show version and exit\n"
         "  -h, --help             Show this help message\n"
         "\n"
         "Examples:\n"
@@ -404,29 +684,43 @@ int main(int argc, char **argv)
     struct bpf_program *prog;
     struct bpf_link *links[MAX_PROBES] = {0};
     struct ring_buffer *rb = NULL;
+    struct pcap_handle *pcap = NULL;
     int err = 0;
     int link_count = 0;
 
     static const struct option long_opts[] = {
-        {"pid",       required_argument, NULL, 'p'},
-        {"uid",       required_argument, NULL, 'u'},
-        {"lib",       required_argument, NULL, 'l'},
-        {"format",    required_argument, NULL, 'f'},
-        {"hex",       no_argument,       NULL, 'x'},
-        {"data-only", no_argument,       NULL, 'd'},
-        {"sanitize",  required_argument, NULL, 's'},
-        {"quic",      no_argument,       NULL, 'q'},
-        {"net",       required_argument, NULL, 'n'},
-        {"proto",     required_argument, NULL, 'P'},
-        {"method",    required_argument, NULL, 'm'},
-        {"dir",       required_argument, NULL, 'D'},
-        {"verbose",   no_argument,       NULL, 'v'},
-        {"help",      no_argument,       NULL, 'h'},
+        {"pid",          required_argument, NULL, 'p'},
+        {"uid",          required_argument, NULL, 'u'},
+        {"lib",          required_argument, NULL, 'l'},
+        {"format",       required_argument, NULL, 'f'},
+        {"hex",          no_argument,       NULL, 'x'},
+        {"data-only",    no_argument,       NULL, 'd'},
+        {"sanitize",     required_argument, NULL, 's'},
+        {"quic",         no_argument,       NULL, 'q'},
+        {"net",          required_argument, NULL, 'n'},
+        {"proto",        required_argument, NULL, 'P'},
+        {"method",       required_argument, NULL, 'm'},
+        {"dir",          required_argument, NULL, 'D'},
+        {"headers-only", no_argument,       NULL, 'H'},
+        {"max-events",   required_argument, NULL, 'c'},
+        {"duration",     required_argument, NULL, 't'},
+        {"ring-buffer-size", required_argument, NULL, 'r'},
+        {"aggregate",    no_argument,       NULL, 'A'},
+        {"aggregate-timeout", required_argument, NULL, 1001},
+        {"aggregate-only", no_argument,     NULL, 1002},
+        {"pcap",         required_argument, NULL, 1003},
+        {"pcap-snaplen", required_argument, NULL, 1004},
+        {"metrics-port", required_argument, NULL, 1005},
+        {"metrics-path", required_argument, NULL, 1006},
+        {"boringssl-bin", required_argument, NULL, 'B'},
+        {"verbose",      no_argument,       NULL, 'v'},
+        {"version",      no_argument,       NULL, 'V'},
+        {"help",         no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:u:l:f:xds:qn:P:m:D:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:u:l:B:f:xds:qn:P:m:D:Hc:t:r:AvVh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': {
             char *endp;
@@ -452,6 +746,9 @@ int main(int argc, char **argv)
         }
         case 'l':
             snprintf(cfg.ssl_lib, sizeof(cfg.ssl_lib), "%s", optarg);
+            break;
+        case 'B':
+            snprintf(cfg.boringssl_bin, sizeof(cfg.boringssl_bin), "%s", optarg);
             break;
         case 'f':
             if (strcmp(optarg, "json") == 0)
@@ -562,9 +859,99 @@ int main(int argc, char **argv)
             }
             break;
         }
+        case 'H':
+            cfg.headers_only = 1;
+            break;
+        case 'c': {
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > UINT_MAX || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid max-events '%s'\n", optarg);
+                return 1;
+            }
+            cfg.max_events = (__u64)val;
+            break;
+        }
+        case 't': {
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 86400 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid duration '%s' (1-86400 seconds)\n", optarg);
+                return 1;
+            }
+            cfg.duration = (int)val;
+            break;
+        }
+        case 'r': {
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 64 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid ring-buffer-size '%s' (1-64 MB)\n", optarg);
+                return 1;
+            }
+            /* Must be power of 2 */
+            if ((val & (val - 1)) != 0) {
+                fprintf(stderr, "Error: ring-buffer-size must be a power of 2 (got %lu)\n", val);
+                return 1;
+            }
+            cfg.ring_buffer_mb = (__u32)val;
+            break;
+        }
+        case 'A':
+            cfg.aggregate = 1;
+            break;
+        case 1001: {  /* --aggregate-timeout */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 3600 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid aggregate-timeout '%s' (1-3600 seconds)\n", optarg);
+                return 1;
+            }
+            cfg.aggregate_timeout = (int)val;
+            break;
+        }
+        case 1002:  /* --aggregate-only */
+            cfg.aggregate = 1;
+            cfg.aggregate_only = 1;
+            break;
+        case 1003:  /* --pcap */
+            snprintf(cfg.pcap_path, sizeof(cfg.pcap_path), "%s", optarg);
+            break;
+        case 1004: {  /* --pcap-snaplen */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 65535 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid pcap-snaplen '%s'\n", optarg);
+                return 1;
+            }
+            cfg.pcap_snaplen = (int)val;
+            break;
+        }
+        case 1005: {  /* --metrics-port */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 65535 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid metrics-port '%s'\n", optarg);
+                return 1;
+            }
+            cfg.metrics_port = (int)val;
+            break;
+        }
+        case 1006:  /* --metrics-path */
+            snprintf(cfg.metrics_path, sizeof(cfg.metrics_path), "%s", optarg);
+            break;
         case 'v':
             cfg.verbose = 1;
             break;
+        case 'V':
+            printf("tls_tracer %s\n", VERSION);
+            return 0;
         case 'h':
             usage(argv[0]);
             return 0;
@@ -597,11 +984,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Find SSL library */
+    /* Find SSL library (OpenSSL).
+     * Not fatal if BoringSSL binary is specified/detected — allows running
+     * on systems where only Envoy with statically-linked BoringSSL exists. */
     if (cfg.ssl_lib[0] == '\0') {
         if (find_ssl_library(cfg.ssl_lib, sizeof(cfg.ssl_lib)) != 0) {
-            fprintf(stderr, "Error: Could not find libssl.so. Specify with --lib PATH.\n");
-            return 1;
+            if (cfg.boringssl_bin[0]) {
+                if (cfg.verbose)
+                    fprintf(stderr, "OpenSSL not found (using BoringSSL binary instead)\n");
+            } else {
+                /* Check if auto-detect finds a BoringSSL binary */
+                char tmp_boring[256] = "";
+                if (find_boringssl_binary(tmp_boring, sizeof(tmp_boring)) == 0) {
+                    if (cfg.verbose)
+                        fprintf(stderr, "OpenSSL not found, but found BoringSSL binary: %s\n", tmp_boring);
+                } else {
+                    fprintf(stderr, "Error: Could not find libssl.so. "
+                            "Specify with --lib PATH or --boringssl-bin PATH.\n");
+                    return 1;
+                }
+            }
         }
     } else {
         /* Use open() instead of access() to avoid TOCTOU race (CWE-367) */
@@ -614,15 +1016,23 @@ int main(int argc, char **argv)
         close(fd);
     }
 
-    if (cfg.verbose)
-        fprintf(stderr, "Using SSL library: %s\n", cfg.ssl_lib);
-
-    validate_openssl_version(cfg.ssl_lib);
+    if (cfg.ssl_lib[0]) {
+        if (cfg.verbose)
+            fprintf(stderr, "Using SSL library: %s\n", cfg.ssl_lib);
+        validate_openssl_version(cfg.ssl_lib);
+    }
 
     /* Detect host/node IP for JSON enrichment (EC2 instance IP) */
     detect_host_ip(cfg.host_ip, sizeof(cfg.host_ip));
     if (cfg.host_ip[0] && cfg.verbose)
         fprintf(stderr, "Host IP: %s\n", cfg.host_ip);
+
+    /* Detect AWS ECS runtime environment */
+    if (getenv("ECS_CONTAINER_METADATA_URI_V4") || getenv("ECS_CONTAINER_METADATA_URI")) {
+        cfg.ecs_detected = 1;
+        if (cfg.verbose)
+            fprintf(stderr, "Runtime: AWS ECS detected\n");
+    }
 
     /* Set up signal handlers (R6 fix: use sigaction for reliable signal handling).
      * signal() has undefined behavior on some systems — the handler may be reset
@@ -758,6 +1168,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Override ring buffer size before loading (must be between open and load) */
+    {
+        struct bpf_map *rb_map = bpf_object__find_map_by_name(obj, "tls_events");
+        if (rb_map) {
+            err = bpf_map__set_max_entries(rb_map, cfg.ring_buffer_mb * 1024 * 1024);
+            if (err) {
+                fprintf(stderr, "Warning: Could not set ring buffer size to %u MB: %s\n",
+                        cfg.ring_buffer_mb, strerror(-err));
+            }
+        }
+    }
+
     err = bpf_object__load(obj);
     if (err) {
         fprintf(stderr, "Error: Failed to load BPF object: %s\n",
@@ -801,71 +1223,193 @@ int main(int argc, char **argv)
             fprintf(stderr, "Attached kprobe: %s\n", kprobe_names[i]);
     }
 
-    /* Attach uprobes to SSL functions */
-    const char *uprobe_names[] = {
-        "probe_ssl_read_enter",
-        "probe_ssl_read_return",
-        "probe_ssl_write_enter",
-        "probe_ssl_write_return",
-        "probe_ssl_version_enter",
-        "probe_ssl_version_return",
-        "probe_ssl_get_cipher_enter",
-        "probe_ssl_get_cipher_return",
-        "probe_ssl_get_cert_enter",
-        "probe_ssl_get_cert_return",
-    };
-    int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
-    const char *func_names[] = {
-        "SSL_read",
-        "SSL_read",
-        "SSL_write",
-        "SSL_write",
-        "SSL_version",
-        "SSL_version",
-        "SSL_get_current_cipher",
-        "SSL_get_current_cipher",
-        "SSL_get_certificate",
-        "SSL_get_certificate",
-    };
-
+    /* Attach uprobes to OpenSSL functions (skip if no OpenSSL library found) */
     int uprobe_count = 0;
-    for (int i = 0; i < 10; i++) {
-        prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
-        if (!prog) {
-            fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
-                    uprobe_names[i]);
+    if (cfg.ssl_lib[0]) {
+        const char *uprobe_names[] = {
+            "probe_ssl_read_enter",
+            "probe_ssl_read_return",
+            "probe_ssl_write_enter",
+            "probe_ssl_write_return",
+            "probe_ssl_version_enter",
+            "probe_ssl_version_return",
+            "probe_ssl_get_cipher_enter",
+            "probe_ssl_get_cipher_return",
+            "probe_ssl_get_cert_enter",
+            "probe_ssl_get_cert_return",
+        };
+        int is_retprobe[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
+        const char *func_names[] = {
+            "SSL_read",
+            "SSL_read",
+            "SSL_write",
+            "SSL_write",
+            "SSL_version",
+            "SSL_version",
+            "SSL_get_current_cipher",
+            "SSL_get_current_cipher",
+            "SSL_get_certificate",
+            "SSL_get_certificate",
+        };
+
+        for (int i = 0; i < 10; i++) {
+            prog = bpf_object__find_program_by_name(obj, uprobe_names[i]);
+            if (!prog) {
+                fprintf(stderr, "Error: BPF program '%s' not found in object.\n",
+                        uprobe_names[i]);
+                err = 1;
+                goto cleanup;
+            }
+
+            LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
+                .retprobe = is_retprobe[i],
+                .func_name = func_names[i],
+            );
+
+            links[link_count] = bpf_program__attach_uprobe_opts(
+                prog, -1, cfg.ssl_lib, 0, &uprobe_opts);
+
+            if (!links[link_count] || libbpf_get_error(links[link_count])) {
+                links[link_count] = NULL;
+                fprintf(stderr, "Warning: Could not attach uprobe for %s (%s). "
+                        "Ensure libssl has debug symbols or is not stripped.\n",
+                        func_names[i], is_retprobe[i] ? "return" : "entry");
+                continue;
+            }
+            link_count++;
+            uprobe_count++;
+        }
+
+        if (uprobe_count == 0) {
+            fprintf(stderr, "Error: Could not attach any OpenSSL probes. "
+                    "Check that the SSL library path is correct and has symbols.\n");
             err = 1;
             goto cleanup;
         }
 
-        LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
-            .retprobe = is_retprobe[i],
-            .func_name = func_names[i],
-        );
+        if (cfg.verbose)
+            fprintf(stderr, "Attached %d/%d OpenSSL probes.\n", uprobe_count, 10);
+    }
 
-        links[link_count] = bpf_program__attach_uprobe_opts(
-            prog, -1, cfg.ssl_lib, 0, &uprobe_opts);
-
-        if (!links[link_count] || libbpf_get_error(links[link_count])) {
-            links[link_count] = NULL;
-            fprintf(stderr, "Warning: Could not attach uprobe for %s (%s). "
-                    "Ensure libssl has debug symbols or is not stripped.\n",
-                    func_names[i], is_retprobe[i] ? "return" : "entry");
-            continue;
+    /* Auto-detect and attach GnuTLS probes */
+    {
+        char gnutls_lib[256] = "";
+        if (find_gnutls_library(gnutls_lib, sizeof(gnutls_lib)) == 0) {
+            int n = attach_library_probes(obj, gnutls_probes,
+                        sizeof(gnutls_probes) / sizeof(gnutls_probes[0]),
+                        gnutls_lib, "GnuTLS", links, &link_count, cfg.verbose);
+            if (n > 0 && cfg.verbose)
+                fprintf(stderr, "Attached %d/%d GnuTLS probes (%s)\n",
+                        n, (int)(sizeof(gnutls_probes) / sizeof(gnutls_probes[0])),
+                        gnutls_lib);
+        } else if (cfg.verbose) {
+            fprintf(stderr, "GnuTLS library not found (optional)\n");
         }
-        link_count++;
-        uprobe_count++;
     }
 
-    if (uprobe_count == 0) {
-        fprintf(stderr, "Error: Could not attach any SSL probes. "
-                "Check that the SSL library path is correct and has symbols.\n");
-        err = 1;
-        goto cleanup;
+    /* Auto-detect and attach wolfSSL probes */
+    {
+        char wolfssl_lib[256] = "";
+        if (find_wolfssl_library(wolfssl_lib, sizeof(wolfssl_lib)) == 0) {
+            int n = attach_library_probes(obj, wolfssl_probes,
+                        sizeof(wolfssl_probes) / sizeof(wolfssl_probes[0]),
+                        wolfssl_lib, "wolfSSL", links, &link_count, cfg.verbose);
+            if (n > 0 && cfg.verbose)
+                fprintf(stderr, "Attached %d/%d wolfSSL probes (%s)\n",
+                        n, (int)(sizeof(wolfssl_probes) / sizeof(wolfssl_probes[0])),
+                        wolfssl_lib);
+        } else if (cfg.verbose) {
+            fprintf(stderr, "wolfSSL library not found (optional)\n");
+        }
     }
 
-    if (cfg.verbose)
-        fprintf(stderr, "Attached %d/%d SSL probes.\n", uprobe_count, 10);
+    /* Auto-detect and attach BoringSSL probes (statically-linked in binary).
+     * BoringSSL is used by Envoy (Apigee Hybrid / Istio ingress gateway).
+     * Unlike shared libraries, uprobes attach to the binary itself. */
+    {
+        char boringssl_bin[256] = "";
+        int boringssl_explicit = (cfg.boringssl_bin[0] != '\0');
+
+        if (boringssl_explicit) {
+            snprintf(boringssl_bin, sizeof(boringssl_bin), "%s", cfg.boringssl_bin);
+            int bfd = open(boringssl_bin, O_RDONLY);
+            if (bfd < 0) {
+                fprintf(stderr, "Error: Cannot access BoringSSL binary '%s': %s\n",
+                        boringssl_bin, strerror(errno));
+                err = 1;
+                goto cleanup;
+            }
+            close(bfd);
+        } else {
+            find_boringssl_binary(boringssl_bin, sizeof(boringssl_bin));
+        }
+
+        if (boringssl_bin[0]) {
+            if (verify_boringssl_symbols(boringssl_bin, cfg.verbose) == 0) {
+                int n = attach_library_probes(obj, boringssl_probes,
+                            (int)(sizeof(boringssl_probes) / sizeof(boringssl_probes[0])),
+                            boringssl_bin, "BoringSSL", links, &link_count, cfg.verbose);
+                /* Also try optional probes (version, cipher, cert) — no error if missing */
+                int n2 = attach_library_probes(obj, boringssl_optional_probes,
+                            (int)(sizeof(boringssl_optional_probes) / sizeof(boringssl_optional_probes[0])),
+                            boringssl_bin, "BoringSSL (optional)", links, &link_count, 0);
+
+                if (n > 0)
+                    fprintf(stderr, "Attached %d+%d BoringSSL probes (%s)\n",
+                            n, n2, boringssl_bin);
+                else if (boringssl_explicit) {
+                    fprintf(stderr, "Error: Could not attach any BoringSSL probes to %s\n",
+                            boringssl_bin);
+                    err = 1;
+                    goto cleanup;
+                }
+            } else if (boringssl_explicit) {
+                fprintf(stderr, "Error: %s is missing required SSL symbols (binary may be stripped).\n"
+                        "Hint: Check with: readelf -s %s | grep SSL_read\n",
+                        boringssl_bin, boringssl_bin);
+                err = 1;
+                goto cleanup;
+            } else if (cfg.verbose) {
+                fprintf(stderr, "Note: Found %s but SSL symbols missing (stripped?), skipping BoringSSL\n",
+                        boringssl_bin);
+            }
+        } else if (cfg.verbose) {
+            fprintf(stderr, "BoringSSL binary not found (optional)\n");
+        }
+    }
+
+    /* Attach BoringSSL syscall-based fd correlation kprobes.
+     * These are lightweight — only a single map lookup per syscall,
+     * and only match for threads currently inside a BoringSSL SSL call. */
+    {
+        const char *boringssl_kprobe_names[] = {
+            "probe_boringssl_sys_write",
+            "probe_boringssl_sys_writev",
+            "probe_boringssl_sys_sendmsg",
+        };
+        for (int i = 0; i < 3; i++) {
+            struct bpf_program *kp = bpf_object__find_program_by_name(obj,
+                                        boringssl_kprobe_names[i]);
+            if (!kp) {
+                if (cfg.verbose)
+                    fprintf(stderr, "Note: BoringSSL kprobe '%s' not found\n",
+                            boringssl_kprobe_names[i]);
+                continue;
+            }
+            links[link_count] = bpf_program__attach(kp);
+            if (!links[link_count] || libbpf_get_error(links[link_count])) {
+                links[link_count] = NULL;
+                if (cfg.verbose)
+                    fprintf(stderr, "Warning: Could not attach BoringSSL kprobe '%s'\n",
+                            boringssl_kprobe_names[i]);
+                continue;
+            }
+            link_count++;
+            if (cfg.verbose)
+                fprintf(stderr, "Attached BoringSSL kprobe: %s\n",
+                        boringssl_kprobe_names[i]);
+        }
+    }
 
     /* Set up ring buffer (H-1: migrated from perf_buffer for reliability) */
     int map_fd = bpf_object__find_map_fd_by_name(obj, "tls_events");
@@ -884,7 +1428,34 @@ int main(int argc, char **argv)
     }
 
     if (cfg.verbose)
-        fprintf(stderr, "Ring buffer: 4 MB\n");
+        fprintf(stderr, "Ring buffer: %u MB\n", cfg.ring_buffer_mb);
+
+    /* Open PCAP file if requested */
+    if (cfg.pcap_path[0]) {
+        pcap = pcap_open(cfg.pcap_path);
+        if (!pcap) {
+            fprintf(stderr, "Error: Failed to open pcap file '%s'\n", cfg.pcap_path);
+            err = 1;
+            goto cleanup;
+        }
+        if (cfg.verbose)
+            fprintf(stderr, "PCAP output: %s (snaplen=%d)\n",
+                    cfg.pcap_path, cfg.pcap_snaplen);
+    }
+
+    /* Start Prometheus metrics server if requested */
+    if (cfg.metrics_port > 0) {
+        metrics_set_ring_buffer_size((__u64)cfg.ring_buffer_mb * 1024 * 1024);
+        if (metrics_start(cfg.metrics_port, cfg.metrics_path) != 0) {
+            fprintf(stderr, "Error: Failed to start metrics server on port %d\n",
+                    cfg.metrics_port);
+            err = 1;
+            goto cleanup;
+        }
+        if (cfg.verbose)
+            fprintf(stderr, "Metrics: http://0.0.0.0:%d%s\n",
+                    cfg.metrics_port, cfg.metrics_path);
+    }
 
     /* Print startup banner */
     if (!cfg.data_only && cfg.format == FMT_TEXT) {
@@ -920,6 +1491,7 @@ int main(int argc, char **argv)
 
     /* Main event loop (#1 fix: don't mask poll errors) */
     int poll_count = 0;
+    time_t start_time = time(NULL);
     while (!exiting) {
         int poll_err = ring_buffer__poll(rb, RING_POLL_TIMEOUT);
         if (poll_err < 0 && poll_err != -EINTR) {
@@ -929,8 +1501,32 @@ int main(int argc, char **argv)
             break;
         }
 
+        /* Check max-events limit */
+        if (cfg.max_events > 0 && stat_events_captured >= cfg.max_events) {
+            if (cfg.verbose)
+                fprintf(stderr, "Reached max-events limit (%llu)\n",
+                        (unsigned long long)cfg.max_events);
+            break;
+        }
+
+        /* Check duration limit */
+        if (cfg.duration > 0 && (time(NULL) - start_time) >= cfg.duration) {
+            if (cfg.verbose)
+                fprintf(stderr, "Reached duration limit (%d seconds)\n", cfg.duration);
+            break;
+        }
+
+        /* Periodic tasks every ~10 poll cycles (~1 second) */
+        poll_count++;
+
+        /* Session sweep: emit summaries for idle connections */
+        if (cfg.aggregate && poll_count % 10 == 0) {
+            session_sweep(time(NULL), cfg.aggregate_timeout,
+                          session_emit_json, &cfg);
+        }
+
         /* Update health file every ~10 seconds (100ms poll * 100) */
-        if (health_file && ++poll_count >= 100) {
+        if (health_file && poll_count >= 100) {
             poll_count = 0;
             hf = fopen(health_file, "w");
             if (hf) {
@@ -944,10 +1540,39 @@ int main(int argc, char **argv)
     if (health_file)
         unlink(health_file);
 
-    if (cfg.verbose)
-        fprintf(stderr, "\nExiting...\n");
+    /* Print event statistics on exit */
+    {
+        time_t elapsed = time(NULL) - start_time;
+        __u64 dropped = 0;
+        /* Read BPF dropped_events per-CPU array to get total drops */
+        int drop_fd = bpf_object__find_map_fd_by_name(obj, "dropped_events");
+        if (drop_fd >= 0) {
+            int nr_cpus = libbpf_num_possible_cpus();
+            if (nr_cpus > 0 && nr_cpus <= 1024) {
+                __u64 *per_cpu = calloc((size_t)nr_cpus, sizeof(__u64));
+                if (per_cpu) {
+                    __u32 key = 0;
+                    if (bpf_map_lookup_elem(drop_fd, &key, per_cpu) == 0) {
+                        for (int i = 0; i < nr_cpus; i++)
+                            dropped += per_cpu[i];
+                    }
+                    free(per_cpu);
+                }
+            }
+        }
+        fprintf(stderr, "\nEvents captured: %llu, filtered: %llu, dropped: %llu, "
+                "runtime: %llds\n",
+                (unsigned long long)stat_events_captured,
+                (unsigned long long)stat_events_filtered,
+                (unsigned long long)dropped,
+                (long long)elapsed);
+    }
 
 cleanup:
+    if (cfg.metrics_port > 0)
+        metrics_stop();
+    if (pcap)
+        pcap_close(pcap);
     if (rb)
         ring_buffer__free(rb);
     for (int i = 0; i < link_count; i++) {

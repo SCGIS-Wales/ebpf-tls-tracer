@@ -26,6 +26,12 @@ typedef int32_t  __s32;
 #define DIRECTION_READ  0
 #define DIRECTION_WRITE 1
 
+/* TLS library types */
+#define TLS_LIB_OPENSSL  0
+#define TLS_LIB_GNUTLS   1
+#define TLS_LIB_WOLFSSL   2
+#define TLS_LIB_BORINGSSL 3
+
 /* Event types */
 #define EVENT_TLS_DATA      1
 #define EVENT_TLS_HANDSHAKE 2
@@ -73,6 +79,7 @@ struct tls_event_t {
     __u8  event_type;
     __u8  addr_family;       /* ADDR_FAMILY_IPV4 or ADDR_FAMILY_IPV6 */
     __u8  is_mtls;           /* 1 = mutual TLS (client cert present), 0 = one-way */
+    __u8  tls_library;       /* TLS_LIB_OPENSSL, TLS_LIB_GNUTLS, TLS_LIB_WOLFSSL, TLS_LIB_BORINGSSL */
     __s16 error_code;        /* errno for connect errors, SSL ret for TLS errors */
     __u16 local_port;
     __u16 remote_port;

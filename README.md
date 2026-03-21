@@ -14,7 +14,7 @@
 
 ---
 
-eBPF TLS Tracer attaches to OpenSSL at the kernel level to capture **decrypted** TLS traffic in real time — without sidecars, proxies, certificate injection, or any application changes. Deploy it as a **CLI binary**, a **container image**, or a **Helm-managed DaemonSet** and gain immediate visibility into every outbound HTTPS, gRPC, Kafka, and WebSocket flow leaving your nodes.
+eBPF TLS Tracer attaches to TLS libraries at the kernel level to capture **decrypted** TLS traffic in real time — without sidecars, proxies, certificate injection, or any application changes. It supports **OpenSSL**, **GnuTLS**, **wolfSSL**, and **BoringSSL** (statically linked in Envoy/Istio/Apigee Hybrid). Deploy it as a **CLI binary**, a **container image**, or a **Helm-managed DaemonSet** and gain immediate visibility into every outbound HTTPS, gRPC, Kafka, and WebSocket flow leaving your nodes.
 
 ---
 
@@ -115,9 +115,9 @@ sudo ./bin/tls_tracer -f json -v
 
 ## How It Works
 
-1. **Kernel-level hooks** — eBPF uprobes attach to OpenSSL's `SSL_read` and `SSL_write` in `libssl.so`. When any process on the node performs a TLS read or write, the probes fire and capture the plaintext buffer contents.
+1. **Kernel-level hooks** — eBPF uprobes attach to `SSL_read` and `SSL_write` in OpenSSL (`libssl.so`), GnuTLS, wolfSSL, and BoringSSL (statically linked in binaries like Envoy). When any process on the node performs a TLS read or write, the probes fire and capture the plaintext buffer contents.
 
-2. **Connection correlation** — Separate kprobes on `connect()` and `tcp_set_state` capture source/destination IP:port pairs. A BPF hash map correlates each SSL operation back to its TCP connection using the socket file descriptor extracted from OpenSSL internals.
+2. **Connection correlation** — Separate kprobes on `connect()` and `tcp_set_state` capture source/destination IP:port pairs. A BPF hash map correlates each SSL operation back to its TCP connection using the socket file descriptor. For BoringSSL/Envoy (which uses custom BIO), syscall-based fd correlation via `writev`/`sendmsg` kprobes is used instead.
 
 3. **TLS posture capture** — Additional uprobes on `SSL_version`, `SSL_get_current_cipher`, and `SSL_get_certificate` extract the negotiated TLS version, cipher suite, and whether a client certificate is present (mTLS detection).
 
@@ -157,6 +157,7 @@ sudo ./bin/tls_tracer [OPTIONS]
 | `-p` | `--pid PID` | Filter by process ID |
 | `-u` | `--uid UID` | Filter by user ID |
 | `-l` | `--lib PATH` | Path to `libssl.so` (auto-detected by default) |
+| `-B` | `--boringssl-bin PATH` | Path to binary with statically-linked BoringSSL (e.g., `/usr/local/bin/envoy`). Auto-detects common Envoy paths if not specified. |
 | `-f` | `--format FMT` | Output format: `text` (default) or `json` |
 | `-x` | `--hex` | Show hex dump of captured data |
 | `-d` | `--data-only` | Print only captured data (no metadata headers) |
@@ -166,7 +167,11 @@ sudo ./bin/tls_tracer [OPTIONS]
 | `-P` | `--proto MODE:PROTO` | Filter by protocol (repeatable). PROTO: `tcp`, `udp`, `http`, `https`, `non-https` |
 | `-m` | `--method MODE:METHOD` | Filter by HTTP method (repeatable). METHOD: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT` |
 | `-D` | `--dir MODE:DIR` | Filter by traffic direction (repeatable). DIR: `inbound`, `outbound` |
+| `-H` | `--headers-only` | Capture HTTP headers only (truncate at body boundary, for PCI-DSS/GDPR) |
+| `-c` | `--max-events N` | Exit after capturing N events |
+| `-t` | `--duration SECS` | Exit after SECS seconds |
 | `-v` | `--verbose` | Verbose output (library path, probe status, ring buffer info) |
+| `-V` | `--version` | Show version and exit |
 | `-h` | `--help` | Show help message |
 
 **Examples:**
@@ -177,6 +182,7 @@ sudo ./bin/tls_tracer -p 1234                   # Filter to a single process
 sudo ./bin/tls_tracer -u 1000                   # Filter by user ID
 sudo ./bin/tls_tracer --quic                    # Enable QUIC/UDP detection
 sudo ./bin/tls_tracer -l /path/to/libssl.so     # Custom OpenSSL path
+sudo ./bin/tls_tracer -B /usr/local/bin/envoy   # Trace Envoy with BoringSSL
 sudo ./bin/tls_tracer -s 'secret=[^&]*'         # Add extra sanitisation pattern
 ```
 
@@ -336,6 +342,7 @@ Each event is a single self-contained NDJSON line. Fields are **only present whe
 | `data_len` | integer | Captured plaintext byte count |
 | `conn_id` | string | Connection identifier (`pid:fd`) for event correlation |
 | `dst_dns` | string | Hostname from HTTP Host header (cached per connection) |
+| `host_ip` | string | Node/host IP address (via `HOST_IP` env var or auto-detected) |
 
 ### TLS Posture Fields
 
@@ -499,6 +506,121 @@ If you prefer not to use Helm, raw Kubernetes manifests are available in [`deplo
 
 ---
 
+## AWS ECS Deployment
+
+TLS Tracer can run on **Amazon ECS (EC2 launch type)** as a privileged daemon task. Fargate is not supported because eBPF requires direct kernel access.
+
+### Prerequisites
+
+| Requirement | Details |
+|---|---|
+| Launch type | **EC2** (not Fargate — eBPF needs kernel access) |
+| Instance AMI | Amazon Linux 2023 (kernel 6.1+, BTF enabled) |
+| Network mode | `host` (required for full network visibility) |
+| PID mode | `host` (required to trace all container processes) |
+| Privileges | `privileged: true` in container definition |
+
+### Task Definition
+
+An example task definition is provided at [`deploy/ecs/task-definition.json`](deploy/ecs/task-definition.json).
+
+```bash
+# Register the task definition
+aws ecs register-task-definition --cli-input-json file://deploy/ecs/task-definition.json
+
+# Create a daemon service (one task per EC2 instance)
+aws ecs create-service \
+  --cluster my-cluster \
+  --service-name tls-tracer \
+  --task-definition tls-tracer \
+  --scheduling-strategy DAEMON \
+  --launch-type EC2
+```
+
+### CloudWatch Logs
+
+The task definition configures `awslogs` log driver by default. Events are streamed as NDJSON to the `/ecs/tls-tracer` log group. Use CloudWatch Logs Insights to query:
+
+```
+fields @timestamp, dst_ip, dst_port, protocol, http_method, http_path
+| filter protocol = "https"
+| sort @timestamp desc
+| limit 50
+```
+
+### ECS Metadata Enrichment
+
+When running on ECS, the tracer detects the `ECS_CONTAINER_METADATA_URI_V4` environment variable and includes `"runtime":"ecs"` in JSON events. The ECS task metadata (task ARN, cluster name) can be enriched downstream via CloudWatch Logs or a log shipper that reads the ECS metadata endpoint.
+
+### Limitations
+
+- **Fargate is not supported** — eBPF requires `CAP_SYS_ADMIN` and kernel access unavailable on Fargate.
+- **K8s metadata fields** (`k8s_pod`, `k8s_namespace`) are not populated on ECS — use ECS task metadata instead.
+- **Network mode must be `host`** — `awsvpc` mode isolates network namespaces, limiting visibility to the task's own traffic.
+
+---
+
+## BoringSSL / Apigee Hybrid Support
+
+TLS Tracer supports **BoringSSL**, Google's fork of OpenSSL that is statically linked into Envoy-based proxies used by **Apigee Hybrid**, **Istio**, and **Anthos Service Mesh (ASM)**.
+
+### How It Differs from OpenSSL Tracing
+
+| Aspect | OpenSSL | BoringSSL (Envoy) |
+|--------|---------|-------------------|
+| **Linking** | Shared library (`libssl.so`) | Statically compiled into binary |
+| **Binary** | N/A (attaches to .so) | `/usr/local/bin/envoy` |
+| **fd extraction** | `SSL->rbio->num` struct offset | Syscall-based correlation (`writev`/`sendmsg` kprobes) |
+| **Custom BIO** | Standard socket BIO | Envoy `io_handle_bio.cc` (custom) |
+| **Symbol requirement** | Always present in .so | Binary must not be stripped |
+
+### Why Syscall-Based fd Correlation?
+
+Envoy does **not** use standard socket-based BIO — it implements a custom BIO (`io_handle_bio.cc`) where the socket fd is buried deep in `Envoy::Network::IoHandle` objects, not in the standard `BIO->num` field. The tracer solves this with a three-tier approach:
+
+1. **Tier 1**: `SSL_read`/`SSL_write` uprobes capture plaintext data (always works if symbols present)
+2. **Tier 2**: `SSL_get_fd` uprobe captures fd directly (bonus, if called by Envoy)
+3. **Tier 3**: When a thread is inside `SSL_write`, kprobes on `writev()`/`sendmsg()` capture the fd from the actual kernel syscall — completely bypassing Envoy's custom BIO
+
+### Usage
+
+```bash
+# Explicit path to Envoy binary
+sudo ./bin/tls_tracer --boringssl-bin /usr/local/bin/envoy -f json -v
+
+# K8s DaemonSet with host filesystem mounted at /host
+sudo ./bin/tls_tracer --boringssl-bin /host/usr/local/bin/envoy -f json
+
+# Auto-detect (searches common Envoy paths automatically)
+sudo ./bin/tls_tracer -f json -v
+```
+
+### Apigee Hybrid 1.16 Details
+
+| Detail | Value |
+|--------|-------|
+| **Ingress image** | `gcr.io/apigee-release/hybrid/apigee-asm-ingress` |
+| **Base** | Istio proxyv2 / Anthos Service Mesh (ASM) |
+| **Envoy binary** | `/usr/local/bin/envoy` |
+| **Helm chart** | `apigee-ingress-manager` |
+| **Pod label** | `app: apigee-ingressgateway` |
+
+### JSON Output
+
+BoringSSL events include `"tls_library":"boringssl"` in JSON output:
+
+```json
+{"timestamp":"2026-03-20T10:30:00.000000Z","pid":1234,"comm":"envoy","tls_version":"1.3","tls_library":"boringssl","direction":"request","protocol":"https"}
+```
+
+### Limitations
+
+- **Stripped binaries**: The Envoy binary must retain `SSL_read`/`SSL_write` symbols. Distroless production images may be stripped. Check with: `readelf -s /usr/local/bin/envoy | grep SSL_read`
+- **TLS version/cipher**: Requires optional symbols (`SSL_version`, `SSL_get_current_cipher`). If absent, these fields will be empty.
+- **fd correlation latency**: Syscall-based correlation captures the fd from the first `writev()` call after `SSL_write` entry. If Envoy's BIO path doesn't call `writev()` synchronously, the fd may be missing for the first event on a connection.
+
+---
+
 ## Data Sanitisation & Redaction
 
 Sensitive HTTP headers are **automatically redacted** (replaced with `[REDACTED]`) before events reach stdout:
@@ -534,7 +656,7 @@ eBPF uprobes add approximately **1–2 µs per `SSL_read`/`SSL_write` call**. At
 - **Rate-limited `/proc` reads** — capped at 50/s to prevent I/O storms under PID churn.
 - **Variable-length events** — only copies actual data bytes, not fixed 16 KB buffers.
 
-> **Kernel note:** Linux 6.1+ is recommended. Kernels prior to 6.12.8 contain a ring buffer race condition (CVE-2025-40319); the tracer emits a warning at startup on affected versions.
+> **Kernel note:** Linux **6.12.8+** is recommended. Kernels prior to 6.12.8 contain a ring buffer race condition ([CVE-2025-40319](https://nvd.nist.gov/vuln/detail/CVE-2025-40319)); the tracer emits a warning at startup on affected versions. Minimum supported kernel is 5.5+.
 
 ---
 
@@ -635,7 +757,7 @@ sudo ./bin/tls_tracer -f json -v
 │                                                                  │
 │  BPF Maps                                                        │
 │    ├── ssl_args_map       (HASH)         per-thread SSL args     │
-│    ├── conn_info_map      (LRU_HASH)     pid_tgid → addresses   │
+│    ├── conn_info_map      (LRU_HASH)     {pid,fd} → addresses   │
 │    ├── ssl_version_map    (LRU_HASH)     SSL* → TLS version     │
 │    ├── cipher_name_map    (LRU_HASH)     SSL* → cipher name     │
 │    ├── mtls_map           (LRU_HASH)     SSL* → mTLS flag       │
@@ -662,6 +784,7 @@ ebpf-tls-tracer/
 ├── include/
 │   ├── tracer.h              # Shared structs (kernel + user space)
 │   ├── config.h              # Configuration constants
+│   ├── filter.h              # Traffic filter data structures
 │   ├── k8s.h                 # Kubernetes metadata interface
 │   ├── output.h              # Output formatting interface
 │   └── protocol.h            # Protocol detection interface
@@ -670,10 +793,12 @@ ebpf-tls-tracer/
 │   ├── tls_tracer.c          # User-space CLI entry point
 │   ├── protocol.c            # L7 protocol detection engine
 │   ├── output.c              # JSON / text event formatting
+│   ├── filter.c              # Traffic filtering (CIDR, protocol, method, direction)
 │   └── k8s.c                 # Kubernetes metadata enrichment
 ├── tests/
 │   ├── test_tracer.c         # Struct and constant tests (16 tests)
 │   ├── test_helpers.c        # Helper function tests (46 tests)
+│   ├── test_filter.c         # Traffic filter tests
 │   ├── test_s3_shipper.py    # S3 log shipper tests
 │   └── test_kinesis_shipper.py  # Kinesis shipper tests
 ├── scripts/
@@ -698,9 +823,9 @@ ebpf-tls-tracer/
 | Requirement | Details |
 |---|---|
 | **Operating system** | Linux x86_64 or aarch64 (ARM64) |
-| **Kernel** | 5.5+ minimum; **6.1+ recommended** |
+| **Kernel** | 5.5+ minimum; **6.12.8+ recommended** (see CVE-2025-40319) |
 | **Privileges** | Root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
-| **OpenSSL** | `libssl.so` installed (auto-detected) |
+| **TLS library** | OpenSSL (`libssl.so`), GnuTLS, wolfSSL (auto-detected), or BoringSSL (statically linked in Envoy/Istio) |
 | **Runtime libraries** | `libbpf`, `libelf`, `zlib` |
 | **Kernel config** | `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`, `CONFIG_KPROBE_EVENTS`, `CONFIG_UPROBE_EVENTS`, `CONFIG_DEBUG_INFO_BTF` |
 
@@ -723,6 +848,49 @@ sudo apt-get install libbpf1 libelf1 zlib1g libssl3
 # AL2023 / RHEL / Fedora
 sudo dnf install libbpf elfutils-libelf zlib openssl-libs
 ```
+
+---
+
+## Security Scanning
+
+The CI pipeline integrates multiple security scanning tools suitable for enterprise security evaluation:
+
+| Tool | Purpose | CI Workflow |
+|---|---|---|
+| **CodeQL** | Static Application Security Testing (SAST) for C/C++ and Python | `codeql.yml` |
+| **Semgrep** | Pattern-based SAST with community rules | `semgrep.yml` |
+| **Trivy** | Container image vulnerability scanning | `build.yml` |
+| **AddressSanitizer** | Runtime memory error detection (buffer overflow, use-after-free) | `build.yml` |
+| **UndefinedBehaviorSanitizer** | Runtime UB detection (integer overflow, null deref) | `build.yml` |
+| **SonarQube** | Code quality and security analysis (optional, requires external server) | `build.yml` |
+| **libbpf CVE check** | Detects vulnerable libbpf 1.5.0 (CVE-2025-29481) | `build.yml` |
+| **OpenSSL CVE check** | Warns about CVE-2025-15467 affected versions | `build.yml` |
+
+### Running Locally
+
+```bash
+# AddressSanitizer + UBSan build
+make clean
+make CFLAGS="-O1 -g -Wall -Wextra -Werror -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer" \
+     LDFLAGS="-lbpf -lelf -lz -ldl -fsanitize=address,undefined" test
+
+# Container image scan with Trivy
+docker build -t tls_tracer:scan .
+trivy image --severity CRITICAL,HIGH tls_tracer:scan
+
+# Semgrep scan
+semgrep scan --config auto src/ include/
+```
+
+### Build Hardening
+
+The binary is compiled with full hardening flags:
+
+- `-fstack-protector-strong` — Stack canaries for buffer overflow detection
+- `-D_FORTIFY_SOURCE=2` — Runtime buffer overflow checks in libc functions
+- `-fPIE` / `-pie` — Position-independent executable (ASLR support)
+- `-Wl,-z,relro,-z,now` — Full RELRO (GOT hardening against overwrite attacks)
+- `-Wformat=2 -Wformat-security` — Format string vulnerability detection
 
 ---
 

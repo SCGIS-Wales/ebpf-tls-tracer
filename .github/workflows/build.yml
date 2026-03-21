@@ -247,6 +247,38 @@ jobs:
       - name: Smoke test container
         run: docker run --rm tls_tracer:test --help
 
+      - name: Scan container image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: tls_tracer:test
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+  # ---------- Sanitizer build ----------
+
+  sanitizer-build:
+    name: Build (ASan + UBSan)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev \
+            linux-libc-dev libc6-dev
+
+      - name: Build with AddressSanitizer and UndefinedBehaviorSanitizer
+        run: |
+          make clean
+          make GCC=clang \
+            CFLAGS="-O1 -g -Wall -Wextra -Werror -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer -DVERSION='\"ci-asan\"'" \
+            LDFLAGS="-lbpf -lelf -lz -ldl -fsanitize=address,undefined" test
+
   # ---------- Integration test: K8s with kind ----------
 
   integration-k8s:
