@@ -157,7 +157,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4 * 1024 * 1024);  /* 4 MB ring buffer (H-1 fix) */
+    __uint(max_entries, 16 * 1024 * 1024);  /* 16 MB ring buffer (sized for high-throughput) */
 } tls_events SEC(".maps");
 
 /* H-1 fix: per-CPU counter for dropped events (ring buffer full).

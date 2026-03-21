@@ -30,6 +30,8 @@ static _Atomic uint64_t m_bytes_response = 0;
 static _Atomic uint64_t m_ring_buffer_size = 0;
 static _Atomic uint64_t m_events_dropped = 0;
 static _Atomic uint64_t m_active_connections = 0;
+static _Atomic uint64_t m_bpf_conn_info_entries = 0;
+static _Atomic uint64_t m_bpf_ssl_args_entries = 0;
 
 /* Server state */
 static int server_fd = -1;
@@ -78,6 +80,14 @@ void metrics_set_active_connections(__u64 count)
     atomic_store(&m_active_connections, count);
 }
 
+void metrics_set_bpf_map_entries(const char *map_name, __u64 count)
+{
+    if (strcmp(map_name, "conn_info") == 0)
+        atomic_store(&m_bpf_conn_info_entries, count);
+    else if (strcmp(map_name, "ssl_args") == 0)
+        atomic_store(&m_bpf_ssl_args_entries, count);
+}
+
 static int metrics_format(char *buf, size_t bufsize)
 {
     time_t uptime = time(NULL) - metrics_start_time;
@@ -114,6 +124,11 @@ static int metrics_format(char *buf, size_t bufsize)
         "# TYPE tls_tracer_connections_active gauge\n"
         "tls_tracer_connections_active %llu\n"
         "\n"
+        "# HELP tls_tracer_bpf_map_entries BPF map entry count\n"
+        "# TYPE tls_tracer_bpf_map_entries gauge\n"
+        "tls_tracer_bpf_map_entries{map=\"conn_info\"} %llu\n"
+        "tls_tracer_bpf_map_entries{map=\"ssl_args\"} %llu\n"
+        "\n"
         "# HELP tls_tracer_info Build info\n"
         "# TYPE tls_tracer_info gauge\n"
         "tls_tracer_info{version=\"%s\"} 1\n",
@@ -127,6 +142,8 @@ static int metrics_format(char *buf, size_t bufsize)
         (long long)uptime,
         (unsigned long long)atomic_load(&m_events_dropped),
         (unsigned long long)atomic_load(&m_active_connections),
+        (unsigned long long)atomic_load(&m_bpf_conn_info_entries),
+        (unsigned long long)atomic_load(&m_bpf_ssl_args_entries),
         VERSION);
 }
 
@@ -135,6 +152,9 @@ static void handle_client(int client_fd)
     char req[512];
     struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* P2-11: prevent slow clients from blocking the metrics thread */
+    struct timeval snd_tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
     ssize_t n = recv(client_fd, req, sizeof(req) - 1, 0);
     if (n <= 0) {

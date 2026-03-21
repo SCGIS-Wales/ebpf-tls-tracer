@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Splunk HTTP Event Collector (HEC) shipper for TLS Tracer.
 
-Reads NDJSON from stdin (piped from tls_tracer) and forwards events to a
-Splunk HEC endpoint using batched HTTP POSTs. Designed for use as a sidecar
-container or systemd pipe target.
+Reads NDJSON from a log file (offset-based tailing) or stdin and forwards
+events to a Splunk HEC endpoint using batched HTTP POSTs. Designed for use
+as a sidecar container or systemd pipe target.
 
 Resilience:
   - Batches events (configurable size and flush interval)
@@ -28,7 +28,6 @@ import sys
 import json
 import time
 import signal
-import select
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 import ssl as _ssl
@@ -69,8 +68,10 @@ FLUSH_INTERVAL = _parse_int_env("SPLUNK_FLUSH_INTERVAL", 5, min_val=1, max_val=3
 MAX_RETRIES = 5
 MAX_LINE_LEN = 65536
 DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024  # 50 MB cap
+LOG_FILE = os.environ.get("LOG_FILE", "/var/log/tls-tracer/events.json")
 
 running = True
+dead_letter_drops = 0  # Counter for events dropped at dead-letter cap
 
 
 def signal_handler(signum, frame):
@@ -199,8 +200,10 @@ def _write_dead_letter(events):
         except OSError:
             dlq_size = 0
         if dlq_size >= DEAD_LETTER_MAX_BYTES:
+            global dead_letter_drops
+            dead_letter_drops += len(events)
             log("WARN", f"Dead-letter file at {dlq_size // (1024 * 1024)}MB cap, "
-                f"dropping {len(events)} events")
+                f"dropping {len(events)} events (total dropped: {dead_letter_drops})")
             return
         fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as dlq:
@@ -209,6 +212,45 @@ def _write_dead_letter(events):
         log("INFO", f"Wrote {len(events)} events to {dlq_path}")
     except Exception as e:
         log("ERROR", f"Dead-letter write failed: {e}")
+
+
+def tail_file(path, offset, last_inode):
+    """Read new lines from file starting at offset. Returns (lines, new_offset, inode).
+
+    Handles log rotation: if inode changes or file shrinks, resets offset."""
+    lines = []
+    try:
+        stat = os.stat(path)
+        current_inode = stat.st_ino
+        size = stat.st_size
+
+        if last_inode is not None and current_inode != last_inode:
+            log("INFO", "Log file inode changed, resetting offset")
+            offset = 0
+
+        if size < offset:
+            log("INFO", "Log file truncated, resetting offset")
+            offset = 0
+
+        if size == offset:
+            return lines, offset, current_inode
+
+        with open(path, "r") as f:
+            f.seek(offset)
+            for line in f:
+                stripped = line.strip()
+                if stripped:
+                    if len(stripped) > MAX_LINE_LEN:
+                        log("WARN", f"Skipping oversized line ({len(stripped)} bytes)")
+                        continue
+                    lines.append(stripped)
+            new_offset = f.tell()
+            return lines, new_offset, current_inode
+    except FileNotFoundError:
+        return lines, 0, None
+    except Exception as e:
+        log("WARN", f"Read error: {e}")
+        return lines, offset, last_inode
 
 
 def check_hec_health(ssl_ctx):
@@ -255,22 +297,15 @@ def main():
     batch = []
     last_flush = time.time()
     events_sent = 0
+    offset = 0
+    last_inode = None
+
+    log("INFO", f"Tailing {LOG_FILE}")
 
     while running:
-        # Use select() for non-blocking stdin read with 1s timeout
-        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
-        if ready:
-            line = sys.stdin.readline()
-            if not line:
-                # EOF — stdin closed
-                break
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if len(stripped) > MAX_LINE_LEN:
-                log("WARN", f"Skipping oversized line ({len(stripped)} bytes)")
-                continue
-            batch.append(wrap_event(stripped))
+        new_lines, offset, last_inode = tail_file(LOG_FILE, offset, last_inode)
+        for line in new_lines:
+            batch.append(wrap_event(line))
 
         now = time.time()
         if len(batch) >= BATCH_SIZE or (now - last_flush >= FLUSH_INTERVAL and batch):
@@ -279,6 +314,9 @@ def main():
             if send_batch(wrapped, ssl_ctx):
                 events_sent += len(wrapped)
             last_flush = now
+
+        if not new_lines:
+            time.sleep(1)  # Avoid busy-loop when no new data
 
     # Graceful shutdown: flush remaining
     if batch:

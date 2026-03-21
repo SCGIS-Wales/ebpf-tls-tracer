@@ -30,7 +30,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       # K-3 fix: give sidecars time to flush buffers on pod termination.
       # Default 30s may be insufficient for S3/Kinesis batch uploads.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 120
       containers:
         - name: tls-tracer
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -131,7 +131,7 @@ spec:
                 - -c
                 - >-
                   test -f /var/run/tls-tracer/healthy &&
-                  [ "$(( $(date +%s) - $(stat -c %Y /var/run/tls-tracer/healthy) ))" -lt 30 ]
+                  [ "$(( $(date +%s) - $(stat -c %Y /var/run/tls-tracer/healthy) ))" -lt 60 ]
             initialDelaySeconds: 15
             periodSeconds: 15
             timeoutSeconds: 5
@@ -263,14 +263,19 @@ spec:
         - name: splunk-hec-shipper
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["sh", "-c"]
-          args:
-            - "tail -F /var/log/tls-tracer/events.json | python3 /opt/tls_tracer/scripts/splunk_hec_shipper.py"
+          command: ["python3", "/opt/tls_tracer/scripts/splunk_hec_shipper.py"]
           env:
             - name: SPLUNK_HEC_URL
               value: {{ .Values.splunk.hecUrl | quote }}
             - name: SPLUNK_HEC_TOKEN
+              {{- if and .Values.splunk.hecTokenSecret .Values.splunk.hecTokenSecret.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.splunk.hecTokenSecret.name | quote }}
+                  key: {{ .Values.splunk.hecTokenSecret.key | default "token" | quote }}
+              {{- else }}
               value: {{ .Values.splunk.hecToken | quote }}
+              {{- end }}
             - name: SPLUNK_INDEX
               value: {{ .Values.splunk.index | quote }}
             - name: SPLUNK_SOURCETYPE
@@ -336,7 +341,7 @@ spec:
         # The shipper tracks offsets and truncates after successful upload.
         - name: log-pipe
           emptyDir:
-            sizeLimit: 256Mi
+            sizeLimit: 512Mi
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

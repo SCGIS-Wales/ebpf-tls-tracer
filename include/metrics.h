@@ -23,4 +23,7 @@ void metrics_set_dropped_events(__u64 total_dropped);
 /* Update active connections gauge */
 void metrics_set_active_connections(__u64 count);
 
+/* Update BPF map entry counts (called periodically from main loop) */
+void metrics_set_bpf_map_entries(const char *map_name, __u64 count);
+
 #endif /* METRICS_H */

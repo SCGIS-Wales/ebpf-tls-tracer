@@ -40,8 +40,17 @@ static struct session_entry *session_find_or_create(__u32 pid, __u32 fd)
         }
     }
 
-    /* Create new entry */
+    /* Create new entry — if table is full, evict the hashed slot */
     __u32 slot = (first_empty != UINT32_MAX) ? first_empty : idx;
+    if (first_empty == UINT32_MAX && session_table[slot].occupied) {
+        static __u64 eviction_count = 0;
+        eviction_count++;
+        if ((eviction_count & 0xFF) == 1)  /* warn every 256 evictions */
+            fprintf(stderr, "Warning: session table full, evicting entry "
+                    "(pid=%u fd=%u, total evictions: %llu)\n",
+                    session_table[slot].key.pid, session_table[slot].key.fd,
+                    (unsigned long long)eviction_count);
+    }
     memset(&session_table[slot], 0, sizeof(session_table[slot]));
     session_table[slot].key.pid = pid;
     session_table[slot].key.fd = fd;
