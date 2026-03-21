@@ -72,15 +72,18 @@ static int read_container_id(pid_t pid, char *buf, size_t buflen)
         if (!p)
             p = strstr(line, "docker-");
         if (p) {
-            /* Skip prefix to get to the ID */
-            char *id_start = strchr(p, '-');
-            if (id_start) {
-                id_start++;  /* skip second '-' for cri-containerd- */
-                if (strncmp(p, "cri-containerd-", 15) == 0) {
-                    id_start = p + 15;
-                } else {
-                    id_start = strchr(p, '-') + 1;
-                }
+            /* Skip prefix to get to the container ID */
+            char *id_start;
+            if (strncmp(p, "cri-containerd-", 15) == 0) {
+                id_start = p + 15;
+            } else {
+                /* docker-<id> pattern */
+                id_start = strchr(p, '-');
+                if (!id_start)
+                    continue;
+                id_start++;
+            }
+            {
                 /* Copy up to .scope or end of line */
                 char *end = strstr(id_start, ".scope");
                 if (!end)

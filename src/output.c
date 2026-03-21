@@ -14,10 +14,29 @@
 #include "filter.h"
 #include "protocol.h"
 #include "k8s.h"
+#include "session.h"
+#include "pcap.h"
+#include "metrics.h"
+
+/* Event statistics (defined in tls_tracer.c, accessed here) */
+extern __u64 stat_events_captured;
+extern __u64 stat_events_filtered;
 
 const char *direction_str(int dir)
 {
     return dir == DIRECTION_READ ? "RESPONSE" : "REQUEST";
+}
+
+/* DRY helper: TLS version code to string */
+static const char *tls_version_str(__u16 ver)
+{
+    switch (ver) {
+    case 0x0301: return "1.0";
+    case 0x0302: return "1.1";
+    case 0x0303: return "1.2";
+    case 0x0304: return "1.3";
+    default:     return NULL;
+    }
 }
 
 void format_addr(const struct tls_event_t *event, char *buf, size_t buflen)
@@ -101,10 +120,14 @@ int handle_event(void *ctx, void *data, size_t size)
         return 0;
 
     /* Apply filters */
-    if (c->filter_pid && event->pid != c->filter_pid)
+    if (c->filter_pid && event->pid != c->filter_pid) {
+        stat_events_filtered++;
         return 0;
-    if (c->filter_uid && event->uid != c->filter_uid)
+    }
+    if (c->filter_uid && event->uid != c->filter_uid) {
+        stat_events_filtered++;
         return 0;
+    }
 
     __u32 data_len = event->data_len;
     if (data_len > MAX_DATA_LEN)
@@ -117,8 +140,42 @@ int handle_event(void *ctx, void *data, size_t size)
         parse_http_info(event->data, data_len, &http_early);
 
     /* Apply traffic filters (CIDR, protocol, method, direction) */
-    if (filter_event(&c->filter, event, &http_early) == 0)
+    if (filter_event(&c->filter, event, &http_early) == 0) {
+        stat_events_filtered++;
         return 0;
+    }
+
+    /* Headers-only mode: truncate data at HTTP body boundary (\r\n\r\n) */
+    if (c->headers_only && data_len > 0) {
+        const void *body_sep = memmem(event->data, data_len, "\r\n\r\n", 4);
+        if (body_sep)
+            data_len = (__u32)((const char *)body_sep - event->data) + 4;
+    }
+
+    stat_events_captured++;
+
+    /* Update Prometheus metrics counters */
+    if (c->metrics_port > 0)
+        metrics_update_event(event);
+
+    /* Write to PCAP file (data events only) */
+    if (c->pcap_path[0] && event->event_type == EVENT_TLS_DATA)
+        pcap_write_event_from_tls(c->pcap_path, event);
+
+    /* Session aggregation: update session tracking */
+    if (c->aggregate) {
+        session_update(event, &http_early, c);
+
+        /* Emit summary immediately on close/error */
+        if (event->event_type == EVENT_TLS_CLOSE)
+            session_close(event, SESSION_CLOSE_NORMAL, session_emit_json, c);
+        else if (event->event_type == EVENT_TLS_ERROR)
+            session_close(event, SESSION_CLOSE_ERROR, session_emit_json, c);
+
+        /* Suppress per-event output if aggregate-only mode */
+        if (c->aggregate_only)
+            return 0;
+    }
 
     char addr_buf[128];
     format_addr(event, addr_buf, sizeof(addr_buf));
@@ -193,14 +250,7 @@ int handle_event(void *ctx, void *data, size_t size)
 
         /* Handle TLS close events (#3 fix) */
         if (event->event_type == EVENT_TLS_CLOSE) {
-            const char *tls_ver_str = NULL;
-            switch (event->tls_version) {
-            case 0x0301: tls_ver_str = "1.0"; break;
-            case 0x0302: tls_ver_str = "1.1"; break;
-            case 0x0303: tls_ver_str = "1.2"; break;
-            case 0x0304: tls_ver_str = "1.3"; break;
-            default: break;
-            }
+            const char *tls_ver_str = tls_version_str(event->tls_version);
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
                    "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
@@ -238,14 +288,7 @@ int handle_event(void *ctx, void *data, size_t size)
 
         /* Handle TLS error events */
         if (event->event_type == EVENT_TLS_ERROR) {
-            const char *tls_ver_str = NULL;
-            switch (event->tls_version) {
-            case 0x0301: tls_ver_str = "1.0"; break;
-            case 0x0302: tls_ver_str = "1.1"; break;
-            case 0x0303: tls_ver_str = "1.2"; break;
-            case 0x0304: tls_ver_str = "1.3"; break;
-            default: break;
-            }
+            const char *tls_ver_str = tls_version_str(event->tls_version);
 
             printf("{\"timestamp\":\"%s.%06ldZ\",\"timestamp_ns\":%llu,"
                    "\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
@@ -326,6 +369,8 @@ int handle_event(void *ctx, void *data, size_t size)
             printf(",\"host_ip\":");
             print_json_string(c->host_ip);
         }
+        if (c->ecs_detected)
+            printf(",\"runtime\":\"ecs\"");
         printf(",\"direction\":\"%s\","
                "\"src_ip\":\"%s\",\"src_port\":%u,"
                "\"dst_ip\":\"%s\",\"dst_port\":%u,"
@@ -529,14 +574,7 @@ int handle_event(void *ctx, void *data, size_t size)
             }
         }
         /* TLS version: 0x0303=TLS1.2, 0x0304=TLS1.3 */
-        const char *tls_ver_str = NULL;
-        switch (event->tls_version) {
-        case 0x0301: tls_ver_str = "1.0"; break;
-        case 0x0302: tls_ver_str = "1.1"; break;
-        case 0x0303: tls_ver_str = "1.2"; break;
-        case 0x0304: tls_ver_str = "1.3"; break;
-        default: break;
-        }
+        const char *tls_ver_str = tls_version_str(event->tls_version);
         if (tls_ver_str)
             printf(",\"tls_version\":\"%s\"", tls_ver_str);
 
@@ -552,6 +590,14 @@ int handle_event(void *ctx, void *data, size_t size)
 
         /* TLS authentication mode: one-way or mutual (mTLS) */
         printf(",\"tls_auth\":\"%s\"", event->is_mtls ? "mtls" : "one-way");
+
+        /* TLS library (omit for OpenSSL for backward compat) */
+        if (event->tls_library == TLS_LIB_GNUTLS)
+            printf(",\"tls_library\":\"gnutls\"");
+        else if (event->tls_library == TLS_LIB_WOLFSSL)
+            printf(",\"tls_library\":\"wolfssl\"");
+        else if (event->tls_library == TLS_LIB_BORINGSSL)
+            printf(",\"tls_library\":\"boringssl\"");
 
         printf(",\"transport\":\"tls\",\"protocol\":\"%s\"", l7_proto);
 

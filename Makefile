@@ -23,10 +23,18 @@ BPF_CFLAGS := -O2 -g -target bpf \
               $(if $(SYS_INC),-isystem $(SYS_INC)) \
               -Wall -Werror
 
-# User-space compilation flags
+# Version (from git tag or 'dev')
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+
+# User-space compilation flags (hardened for enterprise use)
 CFLAGS     := -O2 -g -Wall -Wextra -Werror \
-              -I$(INCLUDE_DIR)
-LDFLAGS    := -lbpf -lelf -lz -ldl
+              -I$(INCLUDE_DIR) \
+              -fstack-protector-strong \
+              -D_FORTIFY_SOURCE=2 \
+              -Wformat=2 -Wformat-security \
+              -fPIE \
+              -DVERSION=\"$(VERSION)\"
+LDFLAGS    := -lbpf -lelf -lz -ldl -lpthread -pie -Wl,-z,relro,-z,now
 
 # Source files
 BPF_SRC    := $(SRC_DIR)/bpf_program.c
@@ -35,6 +43,9 @@ PROTO_SRC  := $(SRC_DIR)/protocol.c
 OUTPUT_SRC := $(SRC_DIR)/output.c
 FILTER_SRC := $(SRC_DIR)/filter.c
 K8S_SRC    := $(SRC_DIR)/k8s.c
+SESSION_SRC := $(SRC_DIR)/session.c
+PCAP_SRC   := $(SRC_DIR)/pcap.c
+METRICS_SRC := $(SRC_DIR)/metrics.c
 
 # Output files
 BPF_OBJ    := $(BIN_DIR)/bpf_program.o
@@ -69,7 +80,9 @@ $(BPF_OBJ): $(BPF_SRC) $(INCLUDE_DIR)/tracer.h | $(BIN_DIR)
 # Compile user-space tracer (multi-object)
 TRACER_HDRS := $(INCLUDE_DIR)/tracer.h $(INCLUDE_DIR)/config.h \
                $(INCLUDE_DIR)/output.h $(INCLUDE_DIR)/protocol.h \
-               $(INCLUDE_DIR)/filter.h $(INCLUDE_DIR)/k8s.h
+               $(INCLUDE_DIR)/filter.h $(INCLUDE_DIR)/k8s.h \
+               $(INCLUDE_DIR)/session.h $(INCLUDE_DIR)/pcap.h \
+               $(INCLUDE_DIR)/metrics.h
 
 $(BUILD_DIR)/tls_tracer.o: $(TRACER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 	@echo "  CC      $@"
@@ -91,8 +104,21 @@ $(BUILD_DIR)/k8s.o: $(K8S_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 	@echo "  CC      $@"
 	@$(GCC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/session.o: $(SESSION_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pcap.o: $(PCAP_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/metrics.o: $(METRICS_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
+	@echo "  CC      $@"
+	@$(GCC) $(CFLAGS) -c $< -o $@
+
 TRACER_OBJS := $(BUILD_DIR)/tls_tracer.o $(BUILD_DIR)/protocol.o \
-               $(BUILD_DIR)/output.o $(BUILD_DIR)/filter.o $(BUILD_DIR)/k8s.o
+               $(BUILD_DIR)/output.o $(BUILD_DIR)/filter.o $(BUILD_DIR)/k8s.o \
+               $(BUILD_DIR)/session.o $(BUILD_DIR)/pcap.o $(BUILD_DIR)/metrics.o
 
 $(TRACER_BIN): $(TRACER_OBJS) | $(BIN_DIR)
 	@echo "  LD      $@"
@@ -105,7 +131,7 @@ $(BUILD_DIR)/test_tracer.o: $(TEST_DIR)/test_tracer.c $(INCLUDE_DIR)/tracer.h | 
 
 $(TEST_BIN): $(BUILD_DIR)/test_tracer.o | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(GCC) -o $@ $^
+	@$(GCC) -o $@ $^ $(LDFLAGS)
 
 # Helper function tests (JSON, HTTP, Kafka, sanitize, addr formatting)
 $(BUILD_DIR)/test_helpers.o: $(TEST_HELPERS_SRC) $(INCLUDE_DIR)/tracer.h | $(BUILD_DIR)
@@ -114,7 +140,7 @@ $(BUILD_DIR)/test_helpers.o: $(TEST_HELPERS_SRC) $(INCLUDE_DIR)/tracer.h | $(BUI
 
 $(TEST_HELPERS_BIN): $(BUILD_DIR)/test_helpers.o | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(GCC) -o $@ $^
+	@$(GCC) -o $@ $^ $(LDFLAGS)
 
 # Filter unit tests (needs filter.o and protocol.o for function definitions)
 $(BUILD_DIR)/test_filter.o: $(TEST_FILTER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
@@ -123,7 +149,7 @@ $(BUILD_DIR)/test_filter.o: $(TEST_FILTER_SRC) $(TRACER_HDRS) | $(BUILD_DIR)
 
 $(TEST_FILTER_BIN): $(BUILD_DIR)/test_filter.o $(BUILD_DIR)/filter.o $(BUILD_DIR)/protocol.o | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(GCC) -o $@ $^
+	@$(GCC) -o $@ $^ $(LDFLAGS)
 
 test: $(TEST_BIN) $(TEST_HELPERS_BIN) $(TEST_FILTER_BIN)
 	@echo "  TEST    Running struct/constant tests..."

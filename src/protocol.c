@@ -19,9 +19,9 @@ int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
         return 0;
 
     /* Read message_size (4 bytes, big-endian) */
-    __u32 msg_size = ((unsigned char)data[0] << 24) |
-                     ((unsigned char)data[1] << 16) |
-                     ((unsigned char)data[2] << 8) |
+    __u32 msg_size = ((unsigned int)(unsigned char)data[0] << 24) |
+                     ((unsigned int)(unsigned char)data[1] << 16) |
+                     ((unsigned int)(unsigned char)data[2] << 8) |
                      (unsigned char)data[3];
 
     /* Sanity: 4 < msg_size < 100MB, and msg_size + 4 should be close to data len */
@@ -45,9 +45,9 @@ int detect_kafka_protocol(const char *data, __u32 len, int *api_key)
      * false positives from HTTP/2 binary frames where the bytes at this
      * offset are often 0. Real Kafka clients use correlation_id starting
      * from 1, incrementing per request. */
-    int corr_id = (int)(((unsigned char)data[8] << 24) |
-                        ((unsigned char)data[9] << 16) |
-                        ((unsigned char)data[10] << 8) |
+    int corr_id = (int)(((unsigned int)(unsigned char)data[8] << 24) |
+                        ((unsigned int)(unsigned char)data[9] << 16) |
+                        ((unsigned int)(unsigned char)data[10] << 8) |
                         (unsigned char)data[11]);
     if (corr_id <= 0)
         return 0;
@@ -74,17 +74,17 @@ int detect_kafka_response(const char *data, __u32 len)
     if (len < 12)
         return 0;
 
-    __u32 msg_size = ((unsigned char)data[0] << 24) |
-                     ((unsigned char)data[1] << 16) |
-                     ((unsigned char)data[2] << 8) |
+    __u32 msg_size = ((unsigned int)(unsigned char)data[0] << 24) |
+                     ((unsigned int)(unsigned char)data[1] << 16) |
+                     ((unsigned int)(unsigned char)data[2] << 8) |
                      (unsigned char)data[3];
 
     if (msg_size <= 4 || msg_size > 104857600)
         return 0;
 
-    int corr_id = (int)(((unsigned char)data[4] << 24) |
-                        ((unsigned char)data[5] << 16) |
-                        ((unsigned char)data[6] << 8) |
+    int corr_id = (int)(((unsigned int)(unsigned char)data[4] << 24) |
+                        ((unsigned int)(unsigned char)data[5] << 16) |
+                        ((unsigned int)(unsigned char)data[6] << 8) |
                         (unsigned char)data[7]);
     if (corr_id < 0)
         return 0;
@@ -185,18 +185,18 @@ int parse_h2_error_code(const char *data, __u32 len, int *frame_type_out)
 
     if (frame_type == 0x03 && frame_len == 4 && len >= 13) {
         /* RST_STREAM: error code at offset 9 */
-        __u32 error_code = ((unsigned char)data[9] << 24) |
-                           ((unsigned char)data[10] << 16) |
-                           ((unsigned char)data[11] << 8) |
+        __u32 error_code = ((unsigned int)(unsigned char)data[9] << 24) |
+                           ((unsigned int)(unsigned char)data[10] << 16) |
+                           ((unsigned int)(unsigned char)data[11] << 8) |
                            (unsigned char)data[12];
         return (int)error_code;
     }
 
     if (frame_type == 0x07 && frame_len >= 8 && len >= 17) {
         /* GOAWAY: last_stream_id at 9-12, error code at 13-16 */
-        __u32 error_code = ((unsigned char)data[13] << 24) |
-                           ((unsigned char)data[14] << 16) |
-                           ((unsigned char)data[15] << 8) |
+        __u32 error_code = ((unsigned int)(unsigned char)data[13] << 24) |
+                           ((unsigned int)(unsigned char)data[14] << 16) |
+                           ((unsigned int)(unsigned char)data[15] << 8) |
                            (unsigned char)data[16];
         return (int)error_code;
     }

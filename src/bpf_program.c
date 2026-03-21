@@ -199,6 +199,7 @@ static __always_inline struct tls_event_t *get_event_buf(void)
     event->direction = 0;
     event->event_type = 0;
     event->is_mtls = 0;
+    event->tls_library = TLS_LIB_OPENSSL;
     event->error_code = 0;
     event->addr_family = 0;
     event->local_port = 0;
@@ -970,6 +971,803 @@ int probe_ssl_write_return(struct pt_regs *ctx)
 
 cleanup:
     bpf_map_delete_elem(&ssl_args_map, &id);
+    return 0;
+}
+
+/* ========================================================================
+ * GnuTLS probes: trace gnutls_record_recv/send and gnutls_transport_get_int
+ * for FD extraction. All probes emit to the same tls_events ring buffer.
+ * ======================================================================== */
+
+/* GnuTLS args map: stash {session, buf, size} per thread */
+struct gnutls_args_t {
+    void *session;  /* gnutls_session_t */
+    void *buf;
+    int   size;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct gnutls_args_t);
+} gnutls_args_map SEC(".maps");
+
+/* GnuTLS FD map: session pointer → fd (populated by gnutls_transport_get_int) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);  /* gnutls_session_t cast to u64 */
+    __type(value, int);
+} gnutls_fd_map SEC(".maps");
+
+/* gnutls_transport_get_int: captures the FD associated with a session */
+struct gnutls_transport_args_t {
+    void *session;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct gnutls_transport_args_t);
+} gnutls_transport_args_map SEC(".maps");
+
+SEC("uprobe/gnutls_transport_get_int")
+int probe_gnutls_transport_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_transport_args_t args = {};
+    args.session = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&gnutls_transport_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/gnutls_transport_get_int")
+int probe_gnutls_transport_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_transport_args_t *args;
+    args = bpf_map_lookup_elem(&gnutls_transport_args_map, &id);
+    if (!args)
+        return 0;
+
+    int fd = (int)PT_REGS_RC(ctx);
+    if (fd >= 0) {
+        __u64 key = (__u64)(unsigned long)args->session;
+        bpf_map_update_elem(&gnutls_fd_map, &key, &fd, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&gnutls_transport_args_map, &id);
+    return 0;
+}
+
+static __always_inline int get_gnutls_fd(void *session)
+{
+    __u64 key = (__u64)(unsigned long)session;
+    int *fd = bpf_map_lookup_elem(&gnutls_fd_map, &key);
+    if (fd && *fd >= 0)
+        return *fd;
+    return -1;
+}
+
+/* gnutls_record_recv: ssize_t gnutls_record_recv(gnutls_session_t, void *buf, size_t len) */
+SEC("uprobe/gnutls_record_recv")
+int probe_gnutls_recv_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t args = {};
+    args.session = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&gnutls_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/gnutls_record_recv")
+int probe_gnutls_recv_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t *args = bpf_map_lookup_elem(&gnutls_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_gnutls_recv;
+
+    int fd = get_gnutls_fd(args->session);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_gnutls_recv;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_READ;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_GNUTLS;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 read_len = ret;
+    if (read_len > MAX_DATA_LEN)
+        read_len = MAX_DATA_LEN;
+    event->data_len = read_len;
+
+    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_gnutls_recv:
+    bpf_map_delete_elem(&gnutls_args_map, &id);
+    return 0;
+}
+
+/* gnutls_record_send: ssize_t gnutls_record_send(gnutls_session_t, const void *buf, size_t len) */
+SEC("uprobe/gnutls_record_send")
+int probe_gnutls_send_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t args = {};
+    args.session = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&gnutls_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/gnutls_record_send")
+int probe_gnutls_send_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct gnutls_args_t *args = bpf_map_lookup_elem(&gnutls_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_gnutls_send;
+
+    int fd = get_gnutls_fd(args->session);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_gnutls_send;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_WRITE;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_GNUTLS;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 write_len = ret;
+    if (write_len > MAX_DATA_LEN)
+        write_len = MAX_DATA_LEN;
+    event->data_len = write_len;
+
+    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_gnutls_send:
+    bpf_map_delete_elem(&gnutls_args_map, &id);
+    return 0;
+}
+
+/* ========================================================================
+ * wolfSSL probes: trace wolfSSL_read/wolfSSL_write and wolfSSL_get_fd
+ * ======================================================================== */
+
+struct wolfssl_args_t {
+    void *ssl;   /* WOLFSSL * */
+    void *buf;
+    int   size;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct wolfssl_args_t);
+} wolfssl_args_map SEC(".maps");
+
+/* wolfSSL FD map: ssl pointer → fd (populated by wolfSSL_get_fd) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, int);
+} wolfssl_fd_map SEC(".maps");
+
+struct wolfssl_getfd_args_t {
+    void *ssl;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct wolfssl_getfd_args_t);
+} wolfssl_getfd_args_map SEC(".maps");
+
+/* wolfSSL_get_fd: int wolfSSL_get_fd(const WOLFSSL *ssl) */
+SEC("uprobe/wolfSSL_get_fd")
+int probe_wolfssl_getfd_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_getfd_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&wolfssl_getfd_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/wolfSSL_get_fd")
+int probe_wolfssl_getfd_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_getfd_args_t *args;
+    args = bpf_map_lookup_elem(&wolfssl_getfd_args_map, &id);
+    if (!args)
+        return 0;
+
+    int fd = (int)PT_REGS_RC(ctx);
+    if (fd >= 0) {
+        __u64 key = (__u64)(unsigned long)args->ssl;
+        bpf_map_update_elem(&wolfssl_fd_map, &key, &fd, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&wolfssl_getfd_args_map, &id);
+    return 0;
+}
+
+static __always_inline int get_wolfssl_fd(void *ssl)
+{
+    __u64 key = (__u64)(unsigned long)ssl;
+    int *fd = bpf_map_lookup_elem(&wolfssl_fd_map, &key);
+    if (fd && *fd >= 0)
+        return *fd;
+    return -1;
+}
+
+/* wolfSSL_read: int wolfSSL_read(WOLFSSL *ssl, void *data, int sz) */
+SEC("uprobe/wolfSSL_read")
+int probe_wolfssl_read_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&wolfssl_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/wolfSSL_read")
+int probe_wolfssl_read_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t *args = bpf_map_lookup_elem(&wolfssl_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_wolfssl_read;
+
+    int fd = get_wolfssl_fd(args->ssl);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_wolfssl_read;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_READ;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_WOLFSSL;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 read_len = ret;
+    if (read_len > MAX_DATA_LEN)
+        read_len = MAX_DATA_LEN;
+    event->data_len = read_len;
+
+    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_wolfssl_read:
+    bpf_map_delete_elem(&wolfssl_args_map, &id);
+    return 0;
+}
+
+/* wolfSSL_write: int wolfSSL_write(WOLFSSL *ssl, const void *data, int sz) */
+SEC("uprobe/wolfSSL_write")
+int probe_wolfssl_write_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.size = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&wolfssl_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/wolfSSL_write")
+int probe_wolfssl_write_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct wolfssl_args_t *args = bpf_map_lookup_elem(&wolfssl_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_wolfssl_write;
+
+    int fd = get_wolfssl_fd(args->ssl);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_wolfssl_write;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_WRITE;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_WOLFSSL;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+
+    __u32 write_len = ret;
+    if (write_len > MAX_DATA_LEN)
+        write_len = MAX_DATA_LEN;
+    event->data_len = write_len;
+
+    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_wolfssl_write:
+    bpf_map_delete_elem(&wolfssl_args_map, &id);
+    return 0;
+}
+
+/* ========================================================================
+ * BoringSSL probes: trace SSL_read/SSL_write in statically-linked binaries
+ * (e.g., Envoy/Apigee Hybrid ingress gateway).
+ *
+ * BoringSSL uses the same API as OpenSSL (SSL_read, SSL_write, SSL_get_fd)
+ * but is statically linked into the binary. The critical difference is that
+ * Envoy uses custom BIO (io_handle_bio.cc), so SSL->rbio->num does NOT
+ * contain the socket fd. Instead, we use syscall-based fd correlation:
+ *
+ * Tier 1: SSL_read/SSL_write uprobes capture plaintext data
+ * Tier 2: SSL_get_fd uprobe captures fd (if available/called)
+ * Tier 3: kprobe on writev/write captures fd from the syscall that
+ *         Envoy's custom BIO issues while inside SSL_read/SSL_write
+ *
+ * The Tier 3 approach: when a thread enters SSL_write, we flag it in
+ * boringssl_in_ssl_map. When the same thread calls writev() (Envoy's
+ * scatter-gather I/O), we capture the fd argument. On SSL_write return,
+ * we use that fd for connection correlation.
+ * ======================================================================== */
+
+/* BoringSSL args map: stash {ssl, buf, size} per thread */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct ssl_args_t);  /* same struct as OpenSSL — identical API */
+} boringssl_args_map SEC(".maps");
+
+/* BoringSSL fd map: ssl pointer → fd (populated by SSL_get_fd or syscall correlation) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);  /* SSL pointer cast to u64 */
+    __type(value, int);
+} boringssl_fd_map SEC(".maps");
+
+/* Track which threads are currently inside a BoringSSL SSL_read/SSL_write.
+ * Used by writev/write kprobes for Tier 3 syscall-based fd correlation. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);   /* pid_tgid */
+    __type(value, __u64); /* SSL pointer — so we can store fd per SSL object */
+} boringssl_in_ssl_map SEC(".maps");
+
+/* Temp map for SSL_get_fd args (BoringSSL variant) */
+struct boringssl_getfd_args_t {
+    void *ssl;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct boringssl_getfd_args_t);
+} boringssl_getfd_args_map SEC(".maps");
+
+/* --- Tier 2: SSL_get_fd uprobe (bonus fd source, works if not inlined) --- */
+
+SEC("uprobe/boringssl_SSL_get_fd")
+int probe_boringssl_getfd_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct boringssl_getfd_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&boringssl_getfd_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/boringssl_SSL_get_fd")
+int probe_boringssl_getfd_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct boringssl_getfd_args_t *args;
+    args = bpf_map_lookup_elem(&boringssl_getfd_args_map, &id);
+    if (!args)
+        return 0;
+
+    int fd = (int)PT_REGS_RC(ctx);
+    if (fd >= 0) {
+        __u64 key = (__u64)(unsigned long)args->ssl;
+        bpf_map_update_elem(&boringssl_fd_map, &key, &fd, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&boringssl_getfd_args_map, &id);
+    return 0;
+}
+
+/* --- Tier 3: kprobes on writev/write for syscall-based fd correlation ---
+ *
+ * When a thread is inside SSL_write/SSL_read (flagged in boringssl_in_ssl_map),
+ * Envoy's custom BIO eventually calls writev()/write() on the real socket.
+ * We capture the fd from the first syscall argument and store it in
+ * boringssl_fd_map keyed by the SSL pointer.
+ *
+ * Overhead: single hash lookup per write/writev syscall. Map miss (~20ns)
+ * for non-BoringSSL threads. Only a handful of threads are typically inside
+ * SSL calls at any given time. */
+
+SEC("kprobe/ksys_write")
+int probe_boringssl_sys_write(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    __u64 *ssl_ptr = bpf_map_lookup_elem(&boringssl_in_ssl_map, &id);
+    if (!ssl_ptr)
+        return 0;
+
+    int fd = (int)PT_REGS_PARM1(ctx);
+    if (fd >= 0 && fd < 1048576) {
+        __u64 key = *ssl_ptr;
+        bpf_map_update_elem(&boringssl_fd_map, &key, &fd, BPF_ANY);
+    }
+    return 0;
+}
+
+SEC("kprobe/ksys_writev")
+int probe_boringssl_sys_writev(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    __u64 *ssl_ptr = bpf_map_lookup_elem(&boringssl_in_ssl_map, &id);
+    if (!ssl_ptr)
+        return 0;
+
+    int fd = (int)PT_REGS_PARM1(ctx);
+    if (fd >= 0 && fd < 1048576) {
+        __u64 key = *ssl_ptr;
+        bpf_map_update_elem(&boringssl_fd_map, &key, &fd, BPF_ANY);
+    }
+    return 0;
+}
+
+SEC("kprobe/__sys_sendmsg")
+int probe_boringssl_sys_sendmsg(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    __u64 *ssl_ptr = bpf_map_lookup_elem(&boringssl_in_ssl_map, &id);
+    if (!ssl_ptr)
+        return 0;
+
+    int fd = (int)PT_REGS_PARM1(ctx);
+    if (fd >= 0 && fd < 1048576) {
+        __u64 key = *ssl_ptr;
+        bpf_map_update_elem(&boringssl_fd_map, &key, &fd, BPF_ANY);
+    }
+    return 0;
+}
+
+/* --- Helper: get fd for BoringSSL from fd map --- */
+
+static __always_inline int get_boringssl_fd(void *ssl)
+{
+    __u64 key = (__u64)(unsigned long)ssl;
+    int *fd = bpf_map_lookup_elem(&boringssl_fd_map, &key);
+    if (fd && *fd >= 0)
+        return *fd;
+    return -1;
+}
+
+/* --- SSL_read probes (BoringSSL) ---
+ * int SSL_read(SSL *ssl, void *buf, int num) — identical signature to OpenSSL */
+
+SEC("uprobe/boringssl_SSL_read")
+int probe_boringssl_read_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.num = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&boringssl_args_map, &id, &args, BPF_ANY);
+
+    /* Flag thread as inside SSL_read for Tier 3 syscall fd correlation */
+    __u64 ssl_key = (__u64)(unsigned long)args.ssl;
+    bpf_map_update_elem(&boringssl_in_ssl_map, &id, &ssl_key, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/boringssl_SSL_read")
+int probe_boringssl_read_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+
+    /* Clear the in-SSL flag (Tier 3) */
+    bpf_map_delete_elem(&boringssl_in_ssl_map, &id);
+
+    struct ssl_args_t *args = bpf_map_lookup_elem(&boringssl_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_boringssl_read;
+
+    int fd = get_boringssl_fd(args->ssl);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_boringssl_read;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_READ;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_BORINGSSL;
+    event->tls_version = get_tls_version(args->ssl);
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+    enrich_event_with_cipher(event, args->ssl);
+    event->is_mtls = get_mtls_status(args->ssl);
+
+    __u32 read_len = ret;
+    if (read_len > MAX_DATA_LEN)
+        read_len = MAX_DATA_LEN;
+    event->data_len = read_len;
+
+    if (bpf_probe_read_user(event->data, read_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + read_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_boringssl_read:
+    bpf_map_delete_elem(&boringssl_args_map, &id);
+    return 0;
+}
+
+/* --- SSL_write probes (BoringSSL) ---
+ * int SSL_write(SSL *ssl, const void *buf, int num) — identical signature to OpenSSL */
+
+SEC("uprobe/boringssl_SSL_write")
+int probe_boringssl_write_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    args.buf = (void *)PT_REGS_PARM2(ctx);
+    args.num = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&boringssl_args_map, &id, &args, BPF_ANY);
+
+    /* Flag thread as inside SSL_write for Tier 3 syscall fd correlation */
+    __u64 ssl_key = (__u64)(unsigned long)args.ssl;
+    bpf_map_update_elem(&boringssl_in_ssl_map, &id, &ssl_key, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/boringssl_SSL_write")
+int probe_boringssl_write_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+
+    /* Clear the in-SSL flag (Tier 3) */
+    bpf_map_delete_elem(&boringssl_in_ssl_map, &id);
+
+    struct ssl_args_t *args = bpf_map_lookup_elem(&boringssl_args_map, &id);
+    if (!args)
+        return 0;
+
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0)
+        goto cleanup_boringssl_write;
+
+    int fd = get_boringssl_fd(args->ssl);
+
+    struct tls_event_t *event = get_event_buf();
+    if (!event)
+        goto cleanup_boringssl_write;
+
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = id >> 32;
+    event->tid = (__u32)id;
+    event->uid = bpf_get_current_uid_gid();
+    event->fd = fd >= 0 ? (__u32)fd : 0;
+    event->direction = DIRECTION_WRITE;
+    event->event_type = EVENT_TLS_DATA;
+    event->tls_library = TLS_LIB_BORINGSSL;
+    event->tls_version = get_tls_version(args->ssl);
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    if (fd >= 0)
+        enrich_event_with_conn_info(event, id >> 32, (__u32)fd);
+    enrich_event_with_cipher(event, args->ssl);
+    event->is_mtls = get_mtls_status(args->ssl);
+
+    __u32 write_len = ret;
+    if (write_len > MAX_DATA_LEN)
+        write_len = MAX_DATA_LEN;
+    event->data_len = write_len;
+
+    if (bpf_probe_read_user(event->data, write_len & (MAX_DATA_LEN - 1), args->buf) == 0) {
+        __u64 out_size = offsetof(struct tls_event_t, data) + write_len;
+        emit_event(event, out_size);
+    }
+
+cleanup_boringssl_write:
+    bpf_map_delete_elem(&boringssl_args_map, &id);
+    return 0;
+}
+
+/* --- BoringSSL SSL_version probes (optional — only if symbol present) --- */
+
+SEC("uprobe/boringssl_SSL_version")
+int probe_boringssl_version_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_version_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&ssl_version_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/boringssl_SSL_version")
+int probe_boringssl_version_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_version_args_t *args;
+    args = bpf_map_lookup_elem(&ssl_version_args_map, &id);
+    if (!args)
+        return 0;
+
+    int version = (int)PT_REGS_RC(ctx);
+    if (version > 0) {
+        __u64 key = (__u64)(unsigned long)args->ssl;
+        __u16 ver = (__u16)version;
+        bpf_map_update_elem(&ssl_version_map, &key, &ver, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&ssl_version_args_map, &id);
+    return 0;
+}
+
+/* --- BoringSSL SSL_get_current_cipher probes (optional) --- */
+
+SEC("uprobe/boringssl_SSL_get_current_cipher")
+int probe_boringssl_cipher_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cipher_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&ssl_cipher_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/boringssl_SSL_get_current_cipher")
+int probe_boringssl_cipher_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cipher_args_t *args;
+    args = bpf_map_lookup_elem(&ssl_cipher_args_map, &id);
+    if (!args)
+        return 0;
+
+    void *ssl_cipher = (void *)PT_REGS_RC(ctx);
+    if (!ssl_cipher)
+        goto cleanup_boring_cipher;
+
+    /* BoringSSL SSL_CIPHER struct: name pointer at offset 8 (same as OpenSSL).
+     * BoringSSL's ssl_cipher_st has: uint32_t id, then const char *name.
+     * On 64-bit: id(4) + padding(4) + name(8) → name at offset 8. */
+    const char *name_ptr = NULL;
+    if (bpf_probe_read_user(&name_ptr, sizeof(name_ptr),
+                            (void *)ssl_cipher + 8) != 0 || !name_ptr)
+        goto cleanup_boring_cipher;
+
+    struct cipher_name_t cn = {};
+    if (bpf_probe_read_user(cn.name, sizeof(cn.name) - 1, name_ptr) == 0) {
+        cn.name[63] = '\0';
+        __u64 ssl_key = (__u64)(unsigned long)args->ssl;
+        bpf_map_update_elem(&cipher_name_map, &ssl_key, &cn, BPF_ANY);
+    }
+
+cleanup_boring_cipher:
+    bpf_map_delete_elem(&ssl_cipher_args_map, &id);
+    return 0;
+}
+
+/* --- BoringSSL SSL_get_certificate probes (optional — mTLS detection) --- */
+
+SEC("uprobe/boringssl_SSL_get_certificate")
+int probe_boringssl_cert_enter(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cert_args_t args = {};
+    args.ssl = (void *)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&ssl_cert_args_map, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/boringssl_SSL_get_certificate")
+int probe_boringssl_cert_return(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_cert_args_t *args;
+    args = bpf_map_lookup_elem(&ssl_cert_args_map, &id);
+    if (!args)
+        return 0;
+
+    void *cert = (void *)PT_REGS_RC(ctx);
+    __u64 ssl_key = (__u64)(unsigned long)args->ssl;
+    __u8 is_mtls = cert ? 1 : 0;
+    bpf_map_update_elem(&mtls_map, &ssl_key, &is_mtls, BPF_ANY);
+
+    bpf_map_delete_elem(&ssl_cert_args_map, &id);
     return 0;
 }
 

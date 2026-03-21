@@ -1,0 +1,75 @@
+{
+  "family": "tls-tracer",
+  "networkMode": "host",
+  "pidMode": "host",
+  "requiresCompatibilities": ["EC2"],
+  "containerDefinitions": [
+    {
+      "name": "tls-tracer",
+      "image": "ghcr.io/scgis-wales/ebpf-tls-tracer:latest",
+      "privileged": true,
+      "essential": true,
+      "command": ["-f", "json", "-v"],
+      "mountPoints": [
+        {
+          "sourceVolume": "sys-kernel-debug",
+          "containerPath": "/sys/kernel/debug",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "sys-kernel-tracing",
+          "containerPath": "/sys/kernel/tracing",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "sys-fs-bpf",
+          "containerPath": "/sys/fs/bpf",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "proc",
+          "containerPath": "/proc",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "host-ssl-lib",
+          "containerPath": "/host/usr/lib",
+          "readOnly": true
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/tls-tracer",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "tls-tracer",
+          "awslogs-create-group": "true"
+        }
+      },
+      "memory": 256,
+      "cpu": 128
+    }
+  ],
+  "volumes": [
+    {
+      "name": "sys-kernel-debug",
+      "host": { "sourcePath": "/sys/kernel/debug" }
+    },
+    {
+      "name": "sys-kernel-tracing",
+      "host": { "sourcePath": "/sys/kernel/tracing" }
+    },
+    {
+      "name": "sys-fs-bpf",
+      "host": { "sourcePath": "/sys/fs/bpf" }
+    },
+    {
+      "name": "proc",
+      "host": { "sourcePath": "/proc" }
+    },
+    {
+      "name": "host-ssl-lib",
+      "host": { "sourcePath": "/usr/lib" }
+    }
+  ]
+}
