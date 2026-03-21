@@ -48,6 +48,10 @@ struct session_entry {
 typedef void (*session_emit_fn)(const struct session_entry *entry,
                                 const struct config *cfg);
 
+/* Initialise session table with dynamic size (0 = use compile-time default).
+ * Must be called before session_update(). Size must be power-of-2. */
+void session_init(__u32 size);
+
 /* Update or create a session from an event */
 void session_update(const struct tls_event_t *event,
                     const struct http_info *http,

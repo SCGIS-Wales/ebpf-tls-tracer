@@ -1,0 +1,26 @@
+{{- if .Values.vpa.enabled }}
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: {{ include "tls-tracer.fullname" . }}
+  namespace: {{ .Values.namespace | default "tls-tracer" }}
+  labels:
+    app.kubernetes.io/name: {{ include "tls-tracer.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: DaemonSet
+    name: {{ include "tls-tracer.fullname" . }}
+  updatePolicy:
+    updateMode: {{ .Values.vpa.updateMode | default "Off" | quote }}
+  resourcePolicy:
+    containerPolicies:
+      - containerName: tls-tracer
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: "2"
+          memory: 2Gi
+{{- end }}

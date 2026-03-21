@@ -51,6 +51,12 @@ struct config {
     char            metrics_bind[64]; /* metrics bind address (default: 127.0.0.1) */
     char            splunk_sourcetype[64]; /* Splunk sourcetype for JSON events (empty = disabled) */
     struct traffic_filter filter;
+
+    /* Auto-scaling (0 = auto-detect from cgroup/sysconf) */
+    __u32           memory_budget_mb;   /* total buffer budget in MB (0 = auto) */
+    __u32           conn_map_entries;   /* BPF connection-tracking map entries (0 = auto) */
+    __u32           session_table_size; /* session aggregation hash table size (0 = auto) */
+    __u32           dns_cache_size;     /* DNS hostname cache size (0 = auto) */
 };
 
 /* DNS cache: hostname lookup/store per {pid, fd} connection */

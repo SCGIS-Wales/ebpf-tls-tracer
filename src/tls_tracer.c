@@ -48,6 +48,107 @@
 #define RING_POLL_TIMEOUT  100
 #define MAX_PROBES         64
 
+/* Round up to next power of 2 (for buffer/table sizing) */
+static inline __u32 next_power_of_2(__u32 v)
+{
+    if (v == 0) return 1;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
+/* Auto-detect available memory and size buffers accordingly.
+ * Fields set to non-zero (via CLI flags) are not overridden. */
+static void auto_size_buffers(struct config *cfg)
+{
+    uint64_t mem_bytes = 0;
+    const char *mem_source = "default";
+
+    /* Try cgroup v2 (K8s standard since 1.25) */
+    FILE *f = fopen("/sys/fs/cgroup/memory.max", "r");
+    if (f) {
+        char buf[32];
+        if (fgets(buf, sizeof(buf), f) && strncmp(buf, "max", 3) != 0) {
+            mem_bytes = strtoull(buf, NULL, 10);
+            mem_source = "cgroup-v2";
+        }
+        fclose(f);
+    }
+    /* Fallback: cgroup v1 */
+    if (!mem_bytes) {
+        f = fopen("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r");
+        if (f) {
+            char buf[32];
+            if (fgets(buf, sizeof(buf), f)) {
+                uint64_t val = strtoull(buf, NULL, 10);
+                /* cgroup v1 returns PAGE_COUNTER_MAX (~2^63) when unlimited */
+                if (val < (uint64_t)8 * 1024 * 1024 * 1024 * 1024) {
+                    mem_bytes = val;
+                    mem_source = "cgroup-v1";
+                }
+            }
+            fclose(f);
+        }
+    }
+    /* Fallback: system total */
+    if (!mem_bytes) {
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page_size > 0) {
+            mem_bytes = (uint64_t)pages * (uint64_t)page_size;
+            mem_source = "sysconf";
+        }
+    }
+
+    /* Compute memory budget: explicit flag > 25% of detected limit > 64 MB fallback */
+    uint64_t budget_mb = cfg->memory_budget_mb;
+    if (budget_mb == 0 && mem_bytes > 0)
+        budget_mb = (mem_bytes / (1024 * 1024)) / 4;
+    if (budget_mb == 0)
+        budget_mb = 64;
+
+    /* Apply sizing tier:
+     *   ≤64 MB  → small  (dev/test, ~20 MB buffer footprint)
+     *   ≤256 MB → medium (staging, ~80 MB footprint)
+     *   >256 MB → large  (production Apigee Hybrid, ~200 MB footprint) */
+    if (budget_mb <= 64) {
+        if (!cfg->ring_buffer_mb)      cfg->ring_buffer_mb = 8;
+        if (!cfg->conn_map_entries)    cfg->conn_map_entries = 32768;
+        if (!cfg->session_table_size)  cfg->session_table_size = 4096;
+        if (!cfg->dns_cache_size)      cfg->dns_cache_size = 4096;
+    } else if (budget_mb <= 256) {
+        if (!cfg->ring_buffer_mb)      cfg->ring_buffer_mb = 32;
+        if (!cfg->conn_map_entries)    cfg->conn_map_entries = 65536;
+        if (!cfg->session_table_size)  cfg->session_table_size = 8192;
+        if (!cfg->dns_cache_size)      cfg->dns_cache_size = 8192;
+    } else {
+        if (!cfg->ring_buffer_mb)      cfg->ring_buffer_mb = 128;
+        if (!cfg->conn_map_entries)    cfg->conn_map_entries = 262144;
+        if (!cfg->session_table_size)  cfg->session_table_size = 16384;
+        if (!cfg->dns_cache_size)      cfg->dns_cache_size = 16384;
+    }
+
+    /* Ensure power-of-2 for hash table masking and ring buffer */
+    cfg->ring_buffer_mb = next_power_of_2(cfg->ring_buffer_mb);
+    cfg->conn_map_entries = next_power_of_2(cfg->conn_map_entries);
+    cfg->session_table_size = next_power_of_2(cfg->session_table_size);
+    cfg->dns_cache_size = next_power_of_2(cfg->dns_cache_size);
+
+    /* Cap ring buffer at 256 MB */
+    if (cfg->ring_buffer_mb > 256) cfg->ring_buffer_mb = 256;
+
+    const char *tier = budget_mb <= 64 ? "small" : budget_mb <= 256 ? "medium" : "large";
+    fprintf(stderr, "Sizing [%s]: ring=%uMB maps=%u sessions=%u dns=%u "
+            "(budget=%luMB, source=%s)\n",
+            tier, cfg->ring_buffer_mb, cfg->conn_map_entries,
+            cfg->session_table_size, cfg->dns_cache_size,
+            (unsigned long)budget_mb, mem_source);
+}
+
 static volatile sig_atomic_t exiting = 0;
 static volatile sig_atomic_t exit_signal = 0;  /* stores signal number for 128+signum (#2 fix) */
 
@@ -79,19 +180,36 @@ struct dns_cache_entry {
     __u8   state;
 };
 
-static struct dns_cache_entry dns_cache[DNS_CACHE_SIZE];
+/* Dynamic DNS cache (initialised by dns_cache_init, fallback to static) */
+static struct dns_cache_entry static_dns_cache[DNS_CACHE_SIZE];
+static struct dns_cache_entry *dns_cache = static_dns_cache;
+static __u32 dns_cache_sz = DNS_CACHE_SIZE;
+
+static void dns_cache_init(__u32 size)
+{
+    if (size == 0 || size == DNS_CACHE_SIZE)
+        return;
+    struct dns_cache_entry *tbl = calloc(size, sizeof(struct dns_cache_entry));
+    if (!tbl) {
+        fprintf(stderr, "Warning: Failed to allocate DNS cache (%u entries), "
+                "using default %d\n", size, DNS_CACHE_SIZE);
+        return;
+    }
+    dns_cache = tbl;
+    dns_cache_sz = size;
+}
 
 static inline __u32 dns_hash(__u32 pid, __u32 fd)
 {
-    return mix_hash_pid_fd(pid, fd, DNS_CACHE_SIZE - 1);
+    return mix_hash_pid_fd(pid, fd, dns_cache_sz - 1);
 }
 
 const char *dns_cache_lookup(__u32 pid, __u32 fd)
 {
     time_t now = time(NULL);
     __u32 idx = dns_hash(pid, fd);
-    for (__u32 i = 0; i < DNS_CACHE_SIZE; i++) {
-        __u32 slot = (idx + i) & (DNS_CACHE_SIZE - 1);
+    for (__u32 i = 0; i < dns_cache_sz; i++) {
+        __u32 slot = (idx + i) & (dns_cache_sz - 1);
         if (dns_cache[slot].state == DNS_SLOT_EMPTY)
             return NULL;
         if (dns_cache[slot].state == DNS_SLOT_OCCUPIED &&
@@ -116,8 +234,8 @@ void dns_cache_store(__u32 pid, __u32 fd, const char *hostname)
     __u32 idx = dns_hash(pid, fd);
     __u32 first_avail = UINT32_MAX;
 
-    for (__u32 i = 0; i < DNS_CACHE_SIZE; i++) {
-        __u32 slot = (idx + i) & (DNS_CACHE_SIZE - 1);
+    for (__u32 i = 0; i < dns_cache_sz; i++) {
+        __u32 slot = (idx + i) & (dns_cache_sz - 1);
         if (dns_cache[slot].state == DNS_SLOT_EMPTY) {
             __u32 target = (first_avail != UINT32_MAX) ? first_avail : slot;
             dns_cache[target].pid = pid;
@@ -165,7 +283,7 @@ static struct config cfg = {
     .verbose         = 0,
     .enable_quic     = 0,
     .sanitize_count  = 0,
-    .ring_buffer_mb  = 16,
+    .ring_buffer_mb  = 0,  /* 0 = auto-detect from cgroup/sysconf */
     .aggregate_timeout = 30,
     .pcap_snaplen    = 4096,
     .metrics_path    = "/metrics",
@@ -719,6 +837,10 @@ int main(int argc, char **argv)
         {"metrics-path", required_argument, NULL, 1006},
         {"metrics-bind", required_argument, NULL, 1007},
         {"splunk-sourcetype", required_argument, NULL, 1008},
+        {"memory-budget", required_argument, NULL, 1009},
+        {"map-size",     required_argument, NULL, 1010},
+        {"session-table-size", required_argument, NULL, 1011},
+        {"dns-cache-size", required_argument, NULL, 1012},
         {"boringssl-bin", required_argument, NULL, 'B'},
         {"verbose",      no_argument,       NULL, 'v'},
         {"version",      no_argument,       NULL, 'V'},
@@ -959,6 +1081,50 @@ int main(int argc, char **argv)
         case 1008:  /* --splunk-sourcetype */
             snprintf(cfg.splunk_sourcetype, sizeof(cfg.splunk_sourcetype), "%s", optarg);
             break;
+        case 1009: {  /* --memory-budget */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val == 0 || val > 8192 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid memory-budget '%s' (1-8192 MB)\n", optarg);
+                return 1;
+            }
+            cfg.memory_budget_mb = (__u32)val;
+            break;
+        }
+        case 1010: {  /* --map-size */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val < 1024 || val > 1048576 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid map-size '%s' (1024-1048576)\n", optarg);
+                return 1;
+            }
+            cfg.conn_map_entries = (__u32)val;
+            break;
+        }
+        case 1011: {  /* --session-table-size */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val < 256 || val > 262144 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid session-table-size '%s' (256-262144)\n", optarg);
+                return 1;
+            }
+            cfg.session_table_size = (__u32)val;
+            break;
+        }
+        case 1012: {  /* --dns-cache-size */
+            char *endp;
+            errno = 0;
+            unsigned long val = strtoul(optarg, &endp, 10);
+            if (*endp != '\0' || val < 256 || val > 262144 || errno == ERANGE) {
+                fprintf(stderr, "Error: Invalid dns-cache-size '%s' (256-262144)\n", optarg);
+                return 1;
+            }
+            cfg.dns_cache_size = (__u32)val;
+            break;
+        }
         case 'v':
             cfg.verbose = 1;
             break;
@@ -989,6 +1155,14 @@ int main(int argc, char **argv)
             add_sanitize_pattern(default_sanitize_patterns[i]);
         }
     }
+
+    /* Auto-size buffers based on available memory (cgroup/sysconf).
+     * CLI flags set non-zero values that won't be overridden. */
+    auto_size_buffers(&cfg);
+
+    /* Initialise dynamic tables with auto-sized dimensions */
+    dns_cache_init(cfg.dns_cache_size);
+    session_init(cfg.session_table_size);
 
     /* Check for root */
     if (geteuid() != 0) {
@@ -1181,16 +1355,59 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Override ring buffer size before loading (must be between open and load) */
+    /* Override BPF map sizes before loading (must be between open and load).
+     * Ring buffer and connection-tracking maps are auto-sized or CLI-overridden.
+     * Args/scratch maps scale with CPU count (per-thread, not per-connection). */
     {
+        /* Ring buffer */
         struct bpf_map *rb_map = bpf_object__find_map_by_name(obj, "tls_events");
         if (rb_map) {
             err = bpf_map__set_max_entries(rb_map, cfg.ring_buffer_mb * 1024 * 1024);
-            if (err) {
-                fprintf(stderr, "Warning: Could not set ring buffer size to %u MB: %s\n",
+            if (err)
+                fprintf(stderr, "Warning: Could not set ring buffer to %u MB: %s\n",
                         cfg.ring_buffer_mb, strerror(-err));
+        }
+
+        /* Connection-tracking maps: scale with expected concurrent connections */
+        const char *conn_maps[] = {
+            "conn_info_map", "ssl_version_map", "cipher_name_map", "mtls_map", NULL
+        };
+        for (int i = 0; conn_maps[i]; i++) {
+            struct bpf_map *m = bpf_object__find_map_by_name(obj, conn_maps[i]);
+            if (m) {
+                int ret = bpf_map__set_max_entries(m, cfg.conn_map_entries);
+                if (ret && cfg.verbose)
+                    fprintf(stderr, "Warning: Could not resize %s to %u: %s\n",
+                            conn_maps[i], cfg.conn_map_entries, strerror(-ret));
             }
         }
+
+        /* Per-thread scratch maps: scale with CPU count */
+        int ncpus = libbpf_num_possible_cpus();
+        if (ncpus <= 0) ncpus = 4;
+        __u32 args_entries = (__u32)ncpus * 1024;
+        if (args_entries < 10240) args_entries = 10240;
+
+        const char *args_maps[] = {
+            "ssl_args_map", "ssl_version_args_map", "ssl_cert_args_map",
+            "ssl_cipher_args_map", "connect_args_map",
+            "gnutls_args_map", "gnutls_fd_map", "gnutls_transport_args_map",
+            "gnutls_version_args_map",
+            "wolfssl_args_map", "wolfssl_fd_map", "wolfssl_getfd_args_map",
+            "wolfssl_version_args_map",
+            "boringssl_args_map", "boringssl_fd_map", "boringssl_in_ssl_map",
+            "boringssl_getfd_args_map", "boringssl_args_v2_map",
+            NULL
+        };
+        for (int i = 0; args_maps[i]; i++) {
+            struct bpf_map *m = bpf_object__find_map_by_name(obj, args_maps[i]);
+            if (m)
+                bpf_map__set_max_entries(m, args_entries);
+        }
+
+        if (cfg.verbose)
+            fprintf(stderr, "BPF maps: conn=%u entries, args=%u entries (%d CPUs)\n",
+                    cfg.conn_map_entries, args_entries, ncpus);
     }
 
     err = bpf_object__load(obj);
