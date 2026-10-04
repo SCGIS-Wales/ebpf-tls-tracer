@@ -1,0 +1,252 @@
+[
+  {
+    "tag_name": "v1.0.0",
+    "name": "v1.0.0",
+    "body": "## What's Changed\n* feat: mature eBPF TLS interception codebase by @api-py in https://github.com/SCGIS-Wales/ebpf_tls_cli/pull/1\n* feat: IP capture, Kubernetes, AL2023, GHCR publishing by @api-py in https://github.com/SCGIS-Wales/ebpf_tls_cli/pull/2\n* fix: resolve BPF compilation failure in CI by @api-py in https://github.com/SCGIS-Wales/ebpf_tls_cli/pull/3\n* feat: auto-tag releases, GHCR packages, Debian trixie by @api-py in https://github.com/SCGIS-Wales/ebpf_tls_cli/pull/4\n\n## New Contributors\n* @api-py made their first contribution in https://github.com/SCGIS-Wales/ebpf_tls_cli/pull/1\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf_tls_cli/commits/v1.0.0",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.1",
+    "name": "v1.0.1",
+    "body": "## What's Changed\n* feat: enriched JSON logs, Helm chart, K8s metadata, HTTP L7 by @api-py in https://github.com/SCGIS-Wales/ebpf_tls_cli/pull/5\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf_tls_cli/compare/v1.0.0...v1.0.1",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.2",
+    "name": "v1.0.2",
+    "body": "## What's Changed\n* feat: URL sanitization, S3/Kinesis sidecars, Helm enhancements, AL2023 docs by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/6\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.1...v1.0.2",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.3",
+    "name": "v1.0.3",
+    "body": "## What's Changed\n* fix: error handling audit \u2014 10 issues + security hardening by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/7\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.2...v1.0.3",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.4",
+    "name": "v1.0.4",
+    "body": "## What's Changed\n* fix: security, reliability, and code quality audit (28 issues) by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/8\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.3...v1.0.4",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.5",
+    "name": "v1.0.5",
+    "body": "## What's Changed\n* fix: reliability, JSON correctness, Helm, and test coverage by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/9\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.4...v1.0.5",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.6",
+    "name": "v1.0.6",
+    "body": "## What's Changed\n* fix: conn_info_map key, SSL retry noise, false Kafka detection by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/10\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.5...v1.0.6",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.7",
+    "name": "v1.0.7",
+    "body": "## What's Changed\n* perf: variable-length output, 256-page buffer, optional QUIC, security defaults by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/11\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.6...v1.0.7",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.8",
+    "name": "v1.0.8",
+    "body": "## What's Changed\n* fix: K8s metadata enrichment test + OpenSSL 3.5.x by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/12\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.7...v1.0.8",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.9",
+    "name": "v1.0.9",
+    "body": "## What's Changed\n* fix: address critical and high audit findings (C-1, C-3, H-1, H-4, H-5, H-6) by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/13\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.8...v1.0.9",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.10",
+    "name": "v1.0.10",
+    "body": "## What's Changed\n* fix: audit round 3 \u2014 security, reliability, code quality by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/14\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.9...v1.0.10",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.11",
+    "name": "v1.0.11",
+    "body": "## What's Changed\n* fix: revert kind to v1.35.0, fail CI on tracer crash by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/15\n* Fix GLIBC_2.38 crash: mount host SSL libs to /host/ prefix by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/16\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.10...v1.0.11",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.12",
+    "name": "v1.0.12",
+    "body": "## What's Changed\n* Fix static analysis findings (flawfinder, cppcheck, semgrep) by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/17\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.11...v1.0.12",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.13",
+    "name": "v1.0.13",
+    "body": "## What's Changed\n* Replace em-dashes with hyphens in README by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/18\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.12...v1.0.13",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.14",
+    "name": "v1.0.14",
+    "body": "## What's Changed\n* Add multi-arch support (amd64 + arm64) by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/19\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.13...v1.0.14",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.15",
+    "name": "v1.0.15",
+    "body": "**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.14...v1.0.15",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.16",
+    "name": "v1.0.16",
+    "body": "## What's Changed\n* Fix JSON injection, ring buffer diagnostic, and resource cleanup by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/20\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.15...v1.0.16",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.17",
+    "name": "v1.0.17",
+    "body": "## What's Changed\n* Refactor: split tls_tracer.c into logical modules by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/21\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.16...v1.0.17",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.18",
+    "name": "v1.0.18",
+    "body": "**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.17...v1.0.18",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.19",
+    "name": "v1.0.19",
+    "body": "## What's Changed\n* Add traffic filtering by CIDR, protocol, HTTP method, and direction by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/22\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.18...v1.0.19",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.20",
+    "name": "v1.0.20",
+    "body": "## What's Changed\n* Add ring buffer config, multi-TLS, session aggregation, PCAP export, Prometheus metrics and BoringSSL support by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/25\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.19...v1.0.20",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.21",
+    "name": "v1.0.21",
+    "body": "## What's Changed\n* Update README with missing CLI options, systemd service and EC2 deployment by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/26\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.20...v1.0.21",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.22",
+    "name": "v1.0.22",
+    "body": "## What's Changed\n* Security remediation, resilience improvements, code cleanup, and Splu\u2026 by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/27\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.21...v1.0.22",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  },
+  {
+    "tag_name": "v1.0.23",
+    "name": "v1.0.23",
+    "body": "## What's Changed\n* Add auto-configurable buffer and map sizing for elastic scaling by @api-py in https://github.com/SCGIS-Wales/ebpf-tls-tracer/pull/28\n\n\n**Full Changelog**: https://github.com/SCGIS-Wales/ebpf-tls-tracer/compare/v1.0.22...v1.0.23",
+    "prerelease": false,
+    "assets": [
+      "checksums.txt",
+      "tls_tracer-linux-aarch64.tar.gz",
+      "tls_tracer-linux-x86_64.tar.gz"
+    ]
+  }
+]

@@ -1,0 +1,125 @@
+name: Maintenance - attribution
+
+# One off maintenance after the history rewrite that attributed every commit
+# to api-py. Run manually from the Actions tab.
+#   retag:    re-point every release tag to its rewritten commit
+#             (.github/maintenance/tag-map.txt).
+#   releases: delete and recreate every release under api-py's account
+#             (.github/maintenance/releases.json), preserving names, notes,
+#             pre-release flags and assets. Requires the RELEASE_TOKEN
+#             secret (fine grained token of api-py with contents: write);
+#             skipped with a notice when the secret is absent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      retag:
+        description: Re-point release tags to the rewritten commits
+        type: boolean
+        default: true
+      releases:
+        description: Recreate releases under api-py (needs RELEASE_TOKEN)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintenance-attribution
+  cancel-in-progress: false
+
+jobs:
+  retag:
+    name: Re-point release tags
+    if: inputs.retag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Force update tags from the map
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          while read -r TAG SHA; do
+            if [ -z "${TAG}" ] || [ "${TAG#\#}" != "${TAG}" ]; then continue; fi
+            # The rewritten commit must exist in the repository
+            gh api "repos/${REPO}/git/commits/${SHA}" --jq .sha >/dev/null
+            CURRENT=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null || echo "")
+            if [ "${CURRENT}" = "${SHA}" ]; then
+              echo "${TAG}: already at ${SHA}"
+              continue
+            fi
+            if [ -n "${CURRENT}" ]; then
+              gh api -X PATCH "repos/${REPO}/git/refs/tags/${TAG}" -f sha="${SHA}" -F force=true --jq .object.sha
+            else
+              gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" --jq .object.sha
+            fi
+            echo "${TAG}: ${CURRENT:-none} -> ${SHA}"
+          done < .github/maintenance/tag-map.txt
+
+  releases:
+    name: Recreate releases under api-py
+    if: inputs.releases
+    needs: [retag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check RELEASE_TOKEN
+        id: token
+        env:
+          HAS_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
+        run: |
+          if [ "${HAS_TOKEN}" != "true" ]; then
+            echo "::notice::RELEASE_TOKEN secret is not set; releases keep their current author. Add the secret and re-run."
+          fi
+          echo "present=${HAS_TOKEN}" >> "${GITHUB_OUTPUT}"
+
+      - name: Recreate releases
+        if: steps.token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ME=$(gh api user --jq .login)
+          echo "Recreating releases as ${ME}"
+          COUNT=$(jq length .github/maintenance/releases.json)
+          for i in $(seq 0 $((COUNT - 1))); do
+            TAG=$(jq -r ".[$i].tag_name" .github/maintenance/releases.json)
+            NAME=$(jq -r ".[$i].name" .github/maintenance/releases.json)
+            PRE=$(jq -r ".[$i].prerelease" .github/maintenance/releases.json)
+            jq -r ".[$i].body" .github/maintenance/releases.json > notes.md
+            AUTHOR=$(gh release view "${TAG}" --repo "${REPO}" --json author --jq .author.login 2>/dev/null || echo "")
+            if [ "${AUTHOR}" = "${ME}" ]; then
+              echo "${TAG}: already owned by ${ME}"
+              continue
+            fi
+            rm -rf assets && mkdir -p assets
+            if [ -n "${AUTHOR}" ]; then
+              gh release download "${TAG}" --repo "${REPO}" --dir assets
+              gh release delete "${TAG}" --repo "${REPO}" --yes
+            fi
+            ARGS=(--repo "${REPO}" --title "${NAME}" --notes-file notes.md --verify-tag)
+            [ "${PRE}" != "true" ] || ARGS+=(--prerelease)
+            if [ "$i" -eq $((COUNT - 1)) ]; then ARGS+=(--latest); else ARGS+=(--latest=false); fi
+            if compgen -G "assets/*" > /dev/null; then
+              gh release create "${TAG}" "${ARGS[@]}" assets/*
+            else
+              gh release create "${TAG}" "${ARGS[@]}"
+            fi
+            echo "${TAG}: recreated by ${ME} with $(find assets -type f | wc -l) assets"
+          done
