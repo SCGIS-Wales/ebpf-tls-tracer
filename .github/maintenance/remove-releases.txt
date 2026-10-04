@@ -1,0 +1,3 @@
+# Releases (and their tags) to remove: created by the previous pipeline
+# on the force push of the rewritten main, with no code change.
+v1.0.24

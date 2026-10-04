@@ -89,6 +89,29 @@ jobs:
           echo "tags still not re-pointed: ${FAILED}"
           [ "${FAILED}" -eq 0 ]
 
+      # The force push of the rewritten main ran the previous pipeline, which
+      # auto-tagged a release with no code change. Remove such releases and
+      # their tags (.github/maintenance/remove-releases.txt).
+      - name: Remove spurious releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          while read -r TAG; do
+            if [ -z "${TAG}" ] || [ "${TAG#\#}" != "${TAG}" ]; then continue; fi
+            if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+              gh release delete "${TAG}" --repo "${REPO}" --yes && echo "${TAG}: release deleted"
+            else
+              echo "${TAG}: no release"
+            fi
+            if gh api "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+              gh api -X DELETE "repos/${REPO}/git/refs/tags/${TAG}" && echo "${TAG}: tag deleted"
+            else
+              echo "${TAG}: no tag"
+            fi
+          done < .github/maintenance/remove-releases.txt
+
   releases:
     name: Recreate releases under api-py
     if: github.event_name == 'push' || inputs.releases
@@ -120,29 +143,34 @@ jobs:
           set -euo pipefail
           ME=$(gh api user --jq .login)
           echo "Recreating releases as ${ME}"
-          COUNT=$(jq length .github/maintenance/releases.json)
-          for i in $(seq 0 $((COUNT - 1))); do
-            TAG=$(jq -r ".[$i].tag_name" .github/maintenance/releases.json)
-            NAME=$(jq -r ".[$i].name" .github/maintenance/releases.json)
-            PRE=$(jq -r ".[$i].prerelease" .github/maintenance/releases.json)
-            jq -r ".[$i].body" .github/maintenance/releases.json > notes.md
-            AUTHOR=$(gh release view "${TAG}" --repo "${REPO}" --json author --jq .author.login 2>/dev/null || echo "")
+          # Every published release, oldest first by semantic version. Any
+          # release not owned by api-py is recreated; releases.json only
+          # supplies cleaned release notes where the generated ones carried
+          # the old assistant branch names.
+          gh api --paginate "repos/${REPO}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | [.tag_name, .name, .prerelease, .author.login] | @tsv' \
+            | sort -t. -k1,1V > releases.tsv
+          LATEST=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)
+          while IFS=$'\t' read -r TAG NAME PRE AUTHOR; do
             if [ "${AUTHOR}" = "${ME}" ]; then
               echo "${TAG}: already owned by ${ME}"
               continue
             fi
-            rm -rf assets && mkdir -p assets
-            if [ -n "${AUTHOR}" ]; then
-              gh release download "${TAG}" --repo "${REPO}" --dir assets
-              gh release delete "${TAG}" --repo "${REPO}" --yes
+            if jq -e --arg t "${TAG}" '.[] | select(.tag_name == $t)' .github/maintenance/releases.json >/dev/null; then
+              jq -r --arg t "${TAG}" '.[] | select(.tag_name == $t) | .body' .github/maintenance/releases.json > notes.md
+            else
+              gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.body // ""' > notes.md
             fi
-            ARGS=(--repo "${REPO}" --title "${NAME}" --notes-file notes.md --verify-tag)
+            rm -rf assets && mkdir -p assets
+            gh release download "${TAG}" --repo "${REPO}" --dir assets || true
+            gh release delete "${TAG}" --repo "${REPO}" --yes
+            ARGS=(--repo "${REPO}" --title "${NAME:-${TAG}}" --notes-file notes.md --verify-tag)
             [ "${PRE}" != "true" ] || ARGS+=(--prerelease)
-            if [ "$i" -eq $((COUNT - 1)) ]; then ARGS+=(--latest); else ARGS+=(--latest=false); fi
+            if [ "${TAG}" = "${LATEST}" ]; then ARGS+=(--latest); else ARGS+=(--latest=false); fi
             if compgen -G "assets/*" > /dev/null; then
               gh release create "${TAG}" "${ARGS[@]}" assets/*
             else
               gh release create "${TAG}" "${ARGS[@]}"
             fi
             echo "${TAG}: recreated by ${ME} with $(find assets -type f | wc -l) assets"
-          done
+          done < releases.tsv
