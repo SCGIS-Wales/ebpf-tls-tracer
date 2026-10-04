@@ -225,8 +225,16 @@ int metrics_start(int port, const char *path, const char *bind_addr)
         .sin_port = htons((uint16_t)port),
         .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
     };
-    if (bind_addr && bind_addr[0])
-        inet_pton(AF_INET, bind_addr, &addr.sin_addr);
+    if (bind_addr && bind_addr[0] &&
+        inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+        /* Fail loudly instead of silently falling back to loopback with a
+         * misleading "listening on <bind_addr>" message. */
+        fprintf(stderr, "Error: invalid --metrics-bind address '%s' "
+                "(expected a dotted IPv4 address)\n", bind_addr);
+        close(server_fd);
+        server_fd = -1;
+        return -1;
+    }
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(server_fd);

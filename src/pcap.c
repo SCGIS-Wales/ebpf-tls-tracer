@@ -10,6 +10,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include "pcap.h"
 
@@ -81,9 +83,16 @@ static void write_idb(FILE *fp)
 
 struct pcap_handle *pcap_open(const char *path)
 {
-    FILE *fp = fopen(path, "wb");
-    if (!fp)
+    /* The capture holds decrypted traffic: create it owner-only and refuse
+     * to follow a symlink so a planted link cannot redirect root's write. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0)
         return NULL;
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        close(fd);
+        return NULL;
+    }
 
     write_shb(fp);
     write_idb(fp);
@@ -94,12 +103,14 @@ struct pcap_handle *pcap_open(const char *path)
 }
 
 /* Synthesize and write an Enhanced Packet Block (EPB) */
-void pcap_write_event(struct pcap_handle *h, const struct tls_event_t *event)
+void pcap_write_event(struct pcap_handle *h, const struct tls_event_t *event,
+                      __u32 data_len)
 {
-    if (!h || !h->fp || event->data_len == 0)
+    if (!h || !h->fp || data_len == 0)
         return;
 
-    __u32 data_len = event->data_len;
+    if (data_len > event->data_len)
+        data_len = event->data_len;
     if (data_len > MAX_DATA_LEN)
         data_len = MAX_DATA_LEN;
 
@@ -198,11 +209,12 @@ void pcap_write_event(struct pcap_handle *h, const struct tls_event_t *event)
     fflush(fp);
 }
 
-void pcap_write_event_from_tls(const char *path, const struct tls_event_t *event)
+void pcap_write_event_from_tls(const char *path, const struct tls_event_t *event,
+                               __u32 data_len)
 {
     (void)path;
     if (global_pcap.fp)
-        pcap_write_event(&global_pcap, event);
+        pcap_write_event(&global_pcap, event, data_len);
 }
 
 void pcap_close(struct pcap_handle *h)

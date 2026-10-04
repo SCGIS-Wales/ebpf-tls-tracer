@@ -310,7 +310,9 @@ static int add_sanitize_pattern(const char *pattern)
         return -1;
     }
     struct sanitize_pattern *sp = &cfg.sanitize[cfg.sanitize_count];
-    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    /* No REG_NOSUB: sanitize_string() needs match offsets from regexec().
+     * With REG_NOSUB glibc ignores pmatch and the offsets are uninitialised. */
+    int ret = regcomp(&sp->regex, pattern, REG_EXTENDED | REG_ICASE);
     if (ret != 0) {
         char errbuf[128];
         regerror(ret, &sp->regex, errbuf, sizeof(errbuf));
@@ -330,9 +332,11 @@ void sanitize_string(char *str, size_t len, const struct config *c)
         return;
 
     for (int i = 0; i < c->sanitize_count; i++) {
-        regmatch_t match;
+        regmatch_t match = { .rm_so = -1, .rm_eo = -1 };
         char *p = str;
         while (regexec(&c->sanitize[i].regex, p, 1, &match, 0) == 0) {
+            if (match.rm_so < 0 || match.rm_eo < match.rm_so)
+                break;
             size_t match_start = (size_t)(p - str) + (size_t)match.rm_so;
             size_t match_len = (size_t)(match.rm_eo - match.rm_so);
             const char *redacted = "[REDACTED]";
@@ -494,6 +498,8 @@ static int verify_boringssl_symbols(const char *binary_path, int verbose)
         if (!data)
             continue;
 
+        if (shdr.sh_entsize == 0)
+            continue;  /* malformed section header: avoid division by zero */
         int num_syms = (int)(shdr.sh_size / shdr.sh_entsize);
         for (int i = 0; i < num_syms; i++) {
             GElf_Sym sym;
@@ -1743,10 +1749,10 @@ int main(int argc, char **argv)
             health_file = NULL;
         }
     }
-    FILE *hf = health_file ? fopen(health_file, "w") : NULL;
-    if (hf) {
-        fprintf(hf, "ready\n");
-        fclose(hf);
+    if (health_file && health_file_touch(health_file) != 0) {
+        fprintf(stderr, "Warning: Cannot write %s: %s (health file disabled)\n",
+                health_file, strerror(errno));
+        health_file = NULL;
     }
     /* Expose health file path to event callback for event-driven updates */
     g_health_file = health_file;
@@ -1789,10 +1795,15 @@ int main(int argc, char **argv)
         /* Periodic tasks every ~10 poll cycles (~1 second) */
         poll_count++;
 
-        /* Session sweep: emit summaries for idle connections */
+        /* Session sweep: emit summaries for idle connections. Event
+         * timestamps come from bpf_ktime_get_ns() (CLOCK_MONOTONIC), so the
+         * sweep clock must be monotonic too; wall-clock time would expire
+         * every session on every sweep. */
         if (cfg.aggregate && poll_count % 10 == 0) {
-            session_sweep(time(NULL), cfg.aggregate_timeout,
-                          session_emit_json, &cfg);
+            struct timespec mono;
+            clock_gettime(CLOCK_MONOTONIC, &mono);
+            session_sweep((__u64)mono.tv_sec * 1000000000ULL + (__u64)mono.tv_nsec,
+                          cfg.aggregate_timeout, session_emit_json, &cfg);
         }
 
         /* Periodic monitoring every ~10 seconds (100ms poll * 100) */
@@ -1800,15 +1811,9 @@ int main(int argc, char **argv)
             poll_count = 0;
 
             /* Update health file */
-            if (health_file) {
-                hf = fopen(health_file, "w");
-                if (hf) {
-                    fprintf(hf, "%ld\n", (long)time(NULL));
-                    if (fclose(hf) != 0)
-                        fprintf(stderr, "Warning: fclose(%s) failed: %s\n",
-                                health_file, strerror(errno));
-                }
-            }
+            if (health_file && health_file_touch(health_file) != 0)
+                fprintf(stderr, "Warning: cannot refresh %s: %s\n",
+                        health_file, strerror(errno));
 
             /* Check for dropped events and warn in real-time */
             {

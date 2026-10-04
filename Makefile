@@ -27,14 +27,25 @@ BPF_CFLAGS := -O2 -g -target bpf \
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
 # User-space compilation flags (hardened for enterprise use)
+# Control-flow protection (CET) is only available on x86; stack-clash
+# protection and FORTIFY_SOURCE=3 work on every supported architecture.
+ifeq ($(UNAME_M),x86_64)
+CF_PROTECT := -fcf-protection=full
+else
+CF_PROTECT :=
+endif
+
 CFLAGS     := -O2 -g -Wall -Wextra -Werror \
               -I$(INCLUDE_DIR) \
               -fstack-protector-strong \
-              -D_FORTIFY_SOURCE=2 \
+              -fstack-clash-protection \
+              $(CF_PROTECT) \
+              -D_FORTIFY_SOURCE=3 \
               -Wformat=2 -Wformat-security \
               -fPIE \
               -DVERSION=\"$(VERSION)\"
-LDFLAGS    := -lbpf -lelf -lz -ldl -lpthread -pie -Wl,-z,relro,-z,now
+LDFLAGS    := -lbpf -lelf -lz -ldl -lpthread -pie \
+              -Wl,-z,relro,-z,now,-z,noexecstack
 
 # Source files
 BPF_SRC    := $(SRC_DIR)/bpf_program.c

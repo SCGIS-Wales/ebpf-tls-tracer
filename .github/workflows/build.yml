@@ -6,37 +6,195 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release:
+        description: >-
+          Release bump to apply when run on main. "auto" derives it from the
+          commit messages since the last tag, "none" builds without tagging.
+        type: choice
+        default: none
+        options: [none, auto, patch, minor, major]
 
+# Least privilege by default. Jobs that need more declare it explicitly.
 permissions:
   contents: read
-  packages: write
+
+# Cancel superseded PR runs. Never cancel a run on main: it may be half-way
+# through tagging and publishing a release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHON_VERSION: "3.14"
+  APT_BUILD_DEPS: clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev linux-libc-dev libc6-dev
 
 jobs:
-  build:
+  # ---------- Version resolution ----------
+  # Decides the version embedded in every artefact and whether this run
+  # produces a release. Semantic bump from Conventional Commits:
+  #   feat!: / BREAKING CHANGE  -> major
+  #   feat:                     -> minor
+  #   anything else             -> patch
+  # "[skip release]" in the head commit suppresses tagging.
+
+  version:
+    name: Resolve version
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      previous_tag: ${{ steps.resolve.outputs.previous_tag }}
+      release: ${{ steps.resolve.outputs.release }}
+
+    steps:
+      - name: Checkout repository (full history for tags)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve next version
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REQUESTED_BUMP: ${{ github.event.inputs.release || 'none' }}
+        run: |
+          set -euo pipefail
+          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          CURRENT="${LATEST_TAG#v}"
+          [ -n "${CURRENT}" ] || CURRENT="0.0.0"
+
+          BUMP="none"
+          if [ "${REF}" = "refs/heads/main" ]; then
+            case "${EVENT_NAME}" in
+              push) BUMP="auto" ;;
+              workflow_dispatch) BUMP="${REQUESTED_BUMP}" ;;
+            esac
+          fi
+
+          if [ "${BUMP}" = "auto" ]; then
+            RANGE="HEAD"
+            [ -z "${LATEST_TAG}" ] || RANGE="${LATEST_TAG}..HEAD"
+            LOG=$(git log --format='%s%n%b' "${RANGE}")
+            if git log -1 --format='%s%n%b' | grep -qiE '\[(skip|no)[ -]release\]'; then
+              BUMP="none"
+            elif grep -qE '^[A-Za-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:' <<<"${LOG}"; then
+              BUMP="major"
+            elif grep -qE '^feat(\([^)]*\))?:' <<<"${LOG}"; then
+              BUMP="minor"
+            else
+              BUMP="patch"
+            fi
+          fi
+
+          IFS=. read -r MAJOR MINOR PATCH <<<"${CURRENT}"
+          PATCH="${PATCH%%-*}"
+          case "${BUMP}" in
+            major) NEXT="$((MAJOR + 1)).0.0" ;;
+            minor) NEXT="${MAJOR}.$((MINOR + 1)).0" ;;
+            patch) NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            *)     NEXT="" ;;
+          esac
+
+          RELEASE=false
+          if [ -n "${NEXT}" ]; then
+            if git rev-parse -q --verify "refs/tags/v${NEXT}" >/dev/null; then
+              echo "::warning::Tag v${NEXT} already exists, this run will not release"
+            else
+              RELEASE=true
+            fi
+          fi
+
+          if [ "${RELEASE}" = "true" ]; then
+            VERSION="${NEXT}"
+          else
+            VERSION="${CURRENT}-dev.$(git rev-parse --short=12 HEAD)"
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "tag=v${VERSION}"
+            echo "previous_tag=${LATEST_TAG}"
+            echo "release=${RELEASE}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Previous tag: ${LATEST_TAG:-none}; bump: ${BUMP}; version: ${VERSION}; release: ${RELEASE}"
+
+  # ---------- Static checks (fast, fail early) ----------
+
+  lint:
+    name: Lint (workflows, Dockerfile, Helm, Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install dependencies
+      - name: Lint GitHub Actions workflows (actionlint)
+        run: |
+          docker run --rm -v "${PWD}:/repo" -w /repo \
+            rhysd/actionlint:1.7.12 -no-color -pyflakes=
+
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      - name: Lint Helm chart
+        run: |
+          helm lint helm/tls-tracer --strict
+          # Render every optional component to catch template errors early.
+          helm template tls-tracer helm/tls-tracer \
+            --namespace tls-tracer \
+            --kube-version 1.37.0 \
+            --set s3.enabled=true --set s3.bucket=example \
+            --set kinesis.enabled=true --set kinesis.deliveryStreamName=example \
+            --set splunk.enabled=true \
+            --set splunk.hecUrl=https://splunk.example/services/collector \
+            --set splunk.hecTokenSecret.name=splunk-hec-token \
+            --set vpa.enabled=true --set createNamespace=true > /dev/null
+          echo "Helm chart renders cleanly"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Lint Python shippers (ruff)
+        run: |
+          pip install --quiet ruff
+          ruff check scripts tests
+          ruff format --check scripts tests
+
+  # ---------- Build and test (amd64) ----------
+
+  build:
+    name: Build and test (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [version]
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            llvm \
-            gcc \
-            make \
-            libbpf-dev \
-            libelf-dev \
-            zlib1g-dev \
-            linux-libc-dev \
-            libc6-dev
+          # shellcheck disable=SC2086 # word splitting of the package list is intended
+          sudo apt-get install -y --no-install-recommends ${APT_BUILD_DEPS}
 
       - name: Audit libbpf version for CVE-2025-29481
         run: |
@@ -54,7 +212,7 @@ jobs:
           OPENSSL_VER=$(openssl version | awk '{print $2}')
           echo "OpenSSL version: ${OPENSSL_VER}"
           echo "NOTE: CVE-2025-15467 affects OpenSSL 3.0-3.6 (pre-auth RCE via CMS AuthEnvelopedData)."
-          echo "Ensure runtime container and AL2023 nodes use patched OpenSSL."
+          echo "The runtime image applies Debian security updates at build time; keep nodes patched too."
 
       - name: Build
         run: make all
@@ -68,73 +226,87 @@ jobs:
           test -f bin/bpf_program.o && echo "BPF object OK"
           file bin/tls_tracer
           file bin/bpf_program.o
+          # Hardening checks: PIE, full RELRO, non-executable stack, CET
+          readelf -hW bin/tls_tracer | grep -q 'Type:.*DYN' && echo "PIE OK"
+          readelf -lW bin/tls_tracer | grep -q 'GNU_RELRO' && echo "RELRO OK"
+          readelf -lW bin/tls_tracer | grep 'GNU_STACK' | grep -qv 'RWE' && echo "NX stack OK"
+          readelf -dW bin/tls_tracer | grep -q 'BIND_NOW' && echo "BIND_NOW OK"
 
-      - name: Smoke test (help output)
-        run: ./bin/tls_tracer --help
+      - name: Smoke test (help and version output)
+        run: |
+          ./bin/tls_tracer --help
+          ./bin/tls_tracer --version | grep -F "${VERSION}"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
 
       - name: Run Python shipper tests
         run: |
-          pip install boto3 --quiet
-          python3 -m unittest tests.test_s3_shipper tests.test_kinesis_shipper -v
+          pip install --quiet -r scripts/requirements.txt
+          python3 -m unittest \
+            tests.test_s3_shipper \
+            tests.test_kinesis_shipper \
+            tests.test_splunk_hec_shipper -v
 
       - name: SonarQube code analysis
+        if: vars.SONAR_HOST_URL != ''
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
-        run: |
-          if [ -z "${SONAR_HOST_URL}" ]; then
-            echo "SONAR_HOST_URL not configured, skipping SonarQube analysis"
-            echo "To enable, add SONAR_HOST_URL variable and SONAR_TOKEN secret to the repository"
-            exit 0
-          fi
-          echo "Running SonarQube analysis..."
-          wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610-linux-x64.zip -O /tmp/sonar.zip
-          unzip -q /tmp/sonar.zip -d /tmp
-          /tmp/sonar-scanner-*/bin/sonar-scanner \
-            -Dsonar.projectKey=ebpf-tls-cli \
-            -Dsonar.sources=src,include \
-            -Dsonar.tests=tests \
-            -Dsonar.host.url="${SONAR_HOST_URL}" \
-            -Dsonar.login="${SONAR_TOKEN}" \
-            -Dsonar.sourceEncoding=UTF-8 \
-            -Dsonar.exclusions="**/build/**,**/bin/**,**/__pycache__/**"
-          echo "SonarQube analysis complete"
+        with:
+          args: >
+            -Dsonar.projectKey=ebpf-tls-cli
+            -Dsonar.sources=src,include,scripts
+            -Dsonar.tests=tests
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.exclusions=**/build/**,**/bin/**,**/__pycache__/**
 
       - name: Package release artifacts
         run: |
           mkdir -p release
-          cp bin/tls_tracer release/
-          cp bin/bpf_program.o release/
-          cp README.md release/
-          cp LICENSE release/
+          cp bin/tls_tracer bin/bpf_program.o README.md LICENSE release/
           ARCH=$(uname -m)
-          cd release && tar czf ../tls_tracer-linux-${ARCH}.tar.gz *
+          tar -C release -czf "tls_tracer-linux-${ARCH}.tar.gz" .
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tls_tracer-linux-amd64
           path: tls_tracer-linux-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
 
   # ---------- ARM64 cross-build via QEMU ----------
 
   build-arm64:
-    name: Build (arm64)
+    name: Build and test (arm64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [version]
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
       - name: Cross-build arm64 binary via Docker
         run: |
           docker run --rm --platform linux/arm64 \
-            -v "${{ github.workspace }}:/build" -w /build \
+            -e VERSION="${VERSION}" \
+            -v "${PWD}:/build" -w /build \
             debian:trixie-slim bash -c '
               apt-get update && apt-get install -y --no-install-recommends \
                 clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev \
@@ -145,32 +317,37 @@ jobs:
       - name: Package arm64 release artifacts
         run: |
           mkdir -p release
-          cp bin/tls_tracer release/
-          cp bin/bpf_program.o release/
-          cp README.md release/
-          cp LICENSE release/
-          cd release && tar czf ../tls_tracer-linux-aarch64.tar.gz *
+          cp bin/tls_tracer bin/bpf_program.o release/
+          cp README.md LICENSE release/
+          tar -C release -czf tls_tracer-linux-aarch64.tar.gz .
 
       - name: Upload arm64 build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tls_tracer-linux-arm64
           path: tls_tracer-linux-aarch64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------- Functional test on the runner kernel ----------
 
   functional-test:
+    name: Functional test (BPF load)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: build
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev \
-            linux-libc-dev libc6-dev openssl curl
+          # shellcheck disable=SC2086 # word splitting of the package list is intended
+          sudo apt-get install -y --no-install-recommends ${APT_BUILD_DEPS} openssl curl
 
       - name: Build
         run: make all
@@ -189,7 +366,7 @@ jobs:
           cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo "Cannot read JIT setting"
           echo "=== Kernel config checks ==="
           for cfg in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT CONFIG_UPROBE_EVENTS CONFIG_KPROBE_EVENTS; do
-            grep -q "${cfg}=y" /boot/config-$(uname -r) 2>/dev/null && echo "$cfg=y OK" || echo "$cfg not found in config (may be built-in)"
+            grep -q "${cfg}=y" "/boot/config-$(uname -r)" 2>/dev/null && echo "$cfg=y OK" || echo "$cfg not found in config (may be built-in)"
           done
 
       - name: Verify BPF object loads
@@ -229,48 +406,97 @@ jobs:
             echo "=== Tracer exited early (may be expected if probes cannot attach in CI) ==="
           fi
 
+  # ---------- Container build and vulnerability gate ----------
+
   docker-build:
-    name: Docker Build
+    name: Docker build and scan
     runs-on: ubuntu-latest
-    needs: [build, functional-test]
+    timeout-minutes: 30
+    needs: [version, build, functional-test]
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Build Docker image
-        run: docker build -t tls_tracer:test .
+      # Built once here with the GitHub Actions cache; the integration test
+      # and the publish job reuse the cached layers instead of rebuilding.
+      - name: Build image (amd64, loaded into the local daemon)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: tls_tracer:test
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Smoke test container
-        run: docker run --rm tls_tracer:test --help
+        run: |
+          docker run --rm tls_tracer:test --help
+          docker run --rm tls_tracer:test --version
+          # Every shipper sidecar referenced by the Helm chart must be present
+          for s in s3_shipper kinesis_shipper splunk_hec_shipper; do
+            docker run --rm --entrypoint python3 tls_tracer:test \
+              -m py_compile "/opt/tls_tracer/scripts/${s}.py" && echo "${s}.py OK"
+          done
 
-      - name: Scan container image for vulnerabilities (Trivy)
-        uses: aquasecurity/trivy-action@master
+      - name: Scan container image (Trivy, human-readable)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: tls_tracer:test
-          format: 'table'
-          severity: 'CRITICAL,HIGH'
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
           exit-code: '0'
+
+      # Gate: any fixable CRITICAL or HIGH vulnerability fails the build.
+      # Unfixed findings are reported above but do not block.
+      - name: Scan container image (Trivy, SARIF gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: tls_tracer:test
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          skip-setup-trivy: true
+
+      - name: Upload Trivy results to code scanning
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
 
   # ---------- Sanitizer build ----------
 
   sanitizer-build:
     name: Build (ASan + UBSan)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang llvm gcc make libbpf-dev libelf-dev zlib1g-dev \
-            linux-libc-dev libc6-dev
+          # shellcheck disable=SC2086 # word splitting of the package list is intended
+          sudo apt-get install -y --no-install-recommends ${APT_BUILD_DEPS}
 
       - name: Build with AddressSanitizer and UndefinedBehaviorSanitizer
         run: |
@@ -284,39 +510,57 @@ jobs:
   integration-k8s:
     name: Integration - K8s (kind)
     runs-on: ubuntu-latest
-    needs: [build, docker-build]
+    timeout-minutes: 30
+    needs: [version, build, docker-build]
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
-
-      # Use K8s v1.35 for CI. The Helm chart supports >=1.34 but kindest/node:v1.34.x
-      # has glibc < 2.38 which is incompatible with our Debian trixie-compiled binary
-      # when the host-ssl volume mount (/usr/lib/x86_64-linux-gnu) replaces the
-      # container's libc with the node's older version.
-      - name: Create kind cluster (Kubernetes v1.35)
-        uses: helm/kind-action@v1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      # The Helm chart supports Kubernetes >=1.34. CI runs the newest kind
+      # node image (digest-pinned) so regressions against current Kubernetes
+      # surface first. Older kindest/node images ship a glibc older than the
+      # Debian trixie build and are incompatible with the host-ssl mounts.
+      - name: Create kind cluster (Kubernetes v1.37)
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          version: v0.33.0
           cluster_name: tls-tracer-ci
-          node_image: kindest/node:v1.35.0
+          node_image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
           wait: 60s
 
       - name: Verify Kubernetes version
         run: |
           K8S_VERSION=$(kubectl version -o json | jq -r '.serverVersion.gitVersion')
           echo "Kubernetes version: ${K8S_VERSION}"
-          MINOR=$(echo "${K8S_VERSION}" | sed 's/v[0-9]*\.\([0-9]*\)\..*/\1/')
+          MINOR="${K8S_VERSION#v*.}"
+          MINOR="${MINOR%%.*}"
           if [ "${MINOR}" -lt 34 ]; then
             echo "ERROR: Kubernetes version ${K8S_VERSION} is below required v1.34.0"
             exit 1
           fi
           echo "Kubernetes ${K8S_VERSION} meets requirement (>=1.34.0)"
 
-      - name: Build and load tls_tracer image into kind
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build tls_tracer image (from the shared build cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: tls_tracer:ci-kind
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Load tls_tracer image into kind
         run: |
-          docker build -t tls_tracer:ci-kind .
           kind load docker-image tls_tracer:ci-kind --name tls-tracer-ci
-          echo "tls_tracer image built and loaded into kind"
+          echo "tls_tracer image loaded into kind"
 
       - name: Create apigee namespace with test workload
         run: |
@@ -358,9 +602,11 @@ jobs:
             sh -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates wget > /dev/null 2>&1"
 
           # Install grpcurl for real gRPC traffic generation
+          # shellcheck disable=SC2016 # ${ARCH} is expanded by the pod's shell, not here
           kubectl exec -n apigee apigee-test-client -- \
             sh -c 'ARCH=$(dpkg --print-architecture) && \
-                   wget -q https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_${ARCH}.tar.gz -O /tmp/grpcurl.tar.gz && \
+                   case "${ARCH}" in amd64) ARCH=x86_64 ;; esac && \
+                   wget -q https://github.com/fullstorydev/grpcurl/releases/download/v1.9.4/grpcurl_1.9.4_linux_${ARCH}.tar.gz -O /tmp/grpcurl.tar.gz && \
                    tar -xzf /tmp/grpcurl.tar.gz -C /usr/local/bin grpcurl && \
                    chmod +x /usr/local/bin/grpcurl && \
                    grpcurl --version' 2>/dev/null || echo "grpcurl install: failed (gRPC tests will be skipped)"
@@ -388,7 +634,7 @@ jobs:
           spec:
             containers:
               - name: kafka
-                image: apache/kafka:3.9.0
+                image: apache/kafka:4.3.1
                 ports:
                   - containerPort: 9092
                 env:
@@ -743,8 +989,7 @@ jobs:
 
             # Validate JSON structure
             FIRST_LINE=$(echo "${JSON_LINES}" | head -1)
-            echo "${FIRST_LINE}" | python3 -m json.tool > /dev/null 2>&1
-            if [ $? -eq 0 ]; then
+            if echo "${FIRST_LINE}" | python3 -m json.tool > /dev/null 2>&1; then
               echo "JSON output is valid"
             else
               echo "ERROR: JSON output is not valid JSON"
@@ -930,146 +1175,169 @@ jobs:
           fi
           echo "Integration test passed: tls-tracer deployed and running on K8s"
 
-  # ---------- Auto-tag on merge to main ----------
+
+  # ---------- Tag release on main ----------
+  # Runs only when every build, test, scan and integration job is green on
+  # main. The tag is annotated so `git describe` and the GitHub UI show the
+  # release metadata.
 
   auto-tag:
-    name: Auto-tag release
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [build, functional-test, docker-build, integration-k8s]
+    name: Tag release
+    if: needs.version.outputs.release == 'true'
+    needs: [version, lint, build, build-arm64, sanitizer-build, functional-test, docker-build, integration-k8s]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
     outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      version: ${{ steps.version.outputs.version }}
-      created: ${{ steps.create_tag.outputs.created }}
+      tag: ${{ needs.version.outputs.tag }}
+      version: ${{ needs.version.outputs.version }}
+      previous_tag: ${{ needs.version.outputs.previous_tag }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Determine next version
-        id: version
+      - name: Create and push annotated tag
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
-          if [ -z "$LATEST_TAG" ]; then
-            NEXT="1.0.0"
-          else
-            CURRENT="${LATEST_TAG#v}"
-            MAJOR=$(echo "$CURRENT" | cut -d. -f1)
-            MINOR=$(echo "$CURRENT" | cut -d. -f2)
-            PATCH=$(echo "$CURRENT" | cut -d. -f3 | cut -d- -f1)
-            NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::notice::Tag ${TAG} already exists, nothing to do"
+            exit 0
           fi
-          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${NEXT}" >> "$GITHUB_OUTPUT"
-          echo "Next version: ${NEXT} (tag: v${NEXT})"
-
-      - name: Check if tag already exists
-        id: check_tag
-        run: |
-          if git rev-parse "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${{ steps.version.outputs.tag }} already exists, skipping"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create tag
-        id: create_tag
-        if: steps.check_tag.outputs.exists == 'false'
-        run: |
-          TAG="${{ steps.version.outputs.tag }}"
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "$TAG"
-          git push origin "$TAG"
-          echo "::notice::Created tag $TAG"
-          echo "created=true" >> "$GITHUB_OUTPUT"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "refs/tags/${TAG}"
+          echo "::notice::Created tag ${TAG}"
 
-  # ---------- GitHub Release ----------
+  # ---------- GitHub Release with signed provenance ----------
 
   github-release:
-    name: GitHub Release
-    if: needs.auto-tag.outputs.created == 'true'
-    needs: [auto-tag, build-arm64]
+    name: GitHub release
+    needs: [auto-tag]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.auto-tag.outputs.tag }}
+          persist-credentials: false
 
       - name: Download amd64 build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tls_tracer-linux-amd64
 
       - name: Download arm64 build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tls_tracer-linux-arm64
 
       - name: Create checksums
-        run: sha256sum tls_tracer-linux-*.tar.gz > checksums.txt
+        run: sha256sum tls_tracer-linux-*.tar.gz | tee checksums.txt
 
-      - name: Delete existing draft releases
+      # SLSA build provenance: consumers verify with
+      #   gh attestation verify tls_tracer-linux-x86_64.tar.gz --repo SCGIS-Wales/ebpf-tls-tracer
+      - name: Attest build provenance for release archives
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: tls_tracer-linux-*.tar.gz
+
+      - name: Compose release notes header
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.auto-tag.outputs.tag }}
+          VERSION: ${{ needs.auto-tag.outputs.version }}
+          REPO: ${{ github.repository }}
         run: |
-          TAG="${{ needs.auto-tag.outputs.tag }}"
-          gh api "repos/${{ github.repository }}/releases" --jq \
-            ".[] | select(.tag_name==\"${TAG}\" and .draft==true) | .id" \
-          | while read -r DRAFT_ID; do
-            echo "Deleting draft release (id=${DRAFT_ID})..."
-            gh api -X DELETE "repos/${{ github.repository }}/releases/${DRAFT_ID}"
-          done
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          OWNER="${REPO%%/*}"
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "# Container image (multi-arch, provenance and SBOM attached)"
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo
+            echo "# Helm chart"
+            echo "helm install tls-tracer oci://${REGISTRY}/${OWNER,,}/charts/tls-tracer \\"
+            echo "  --version ${VERSION} --namespace tls-tracer --create-namespace"
+            echo
+            echo "# Static binaries"
+            echo "curl -LO https://github.com/${REPO}/releases/download/${TAG}/tls_tracer-linux-x86_64.tar.gz"
+            echo "gh attestation verify tls_tracer-linux-x86_64.tar.gz --repo ${REPO}"
+            echo '```'
+            echo
+            echo "## Checksums (SHA-256)"
+            echo
+            echo '```'
+            cat checksums.txt
+            echo '```'
+            echo
+          } > release-notes-header.md
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.auto-tag.outputs.tag }}
+          PREVIOUS_TAG: ${{ needs.auto-tag.outputs.previous_tag }}
         run: |
-          TAG="${{ needs.auto-tag.outputs.tag }}"
+          set -euo pipefail
+          NOTES_ARGS=(--generate-notes --notes-file release-notes-header.md)
+          [ -z "${PREVIOUS_TAG}" ] || NOTES_ARGS+=(--notes-start-tag "${PREVIOUS_TAG}")
+
           if gh release view "${TAG}" > /dev/null 2>&1; then
-            echo "Release ${TAG} already exists, updating..."
+            echo "Release ${TAG} already exists, refreshing assets..."
             gh release edit "${TAG}" --latest
             gh release upload "${TAG}" --clobber tls_tracer-linux-*.tar.gz checksums.txt
           else
-            echo "Creating new release ${TAG}..."
+            echo "Creating release ${TAG}..."
             gh release create "${TAG}" \
               --title "${TAG}" \
-              --generate-notes \
+              --verify-tag \
               --latest \
+              "${NOTES_ARGS[@]}" \
               tls_tracer-linux-*.tar.gz checksums.txt
           fi
 
-  # ---------- Publish Container to GHCR ----------
+  # ---------- Publish container to GHCR ----------
 
   publish-container:
-    name: Publish Container
-    if: needs.auto-tag.outputs.created == 'true'
-    needs: [auto-tag, docker-build]
+    name: Publish container
+    needs: [auto-tag]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.auto-tag.outputs.tag }}
+          persist-credentials: false
 
       - name: Set up QEMU (for multi-arch builds)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1077,7 +1345,7 @@ jobs:
 
       - name: Extract metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -1087,12 +1355,66 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push multi-arch container image
-        uses: docker/build-push-action@v6
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=${{ needs.auto-tag.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Resolve lowercase image name
+        id: image
+        run: echo "name=${REGISTRY}/${IMAGE_NAME,,}" >> "${GITHUB_OUTPUT}"
+
+      # Signed provenance in the registry: consumers verify with
+      #   gh attestation verify oci://ghcr.io/scgis-wales/ebpf-tls-tracer:<tag> --repo SCGIS-Wales/ebpf-tls-tracer
+      - name: Attest container image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # ---------- Publish Helm chart to GHCR (OCI) ----------
+
+  publish-helm-chart:
+    name: Publish Helm chart
+    needs: [auto-tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.auto-tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Package and push chart
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.auto-tag.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          helm registry login "${REGISTRY}" --username "${ACTOR}" --password-stdin <<< "${GH_TOKEN}"
+          helm package helm/tls-tracer \
+            --version "${VERSION}" \
+            --app-version "${VERSION}" \
+            --destination dist
+          helm push "dist/tls-tracer-${VERSION}.tgz" "oci://${REGISTRY}/${OWNER,,}/charts"
+          echo "::notice::Published oci://${REGISTRY}/${OWNER,,}/charts/tls-tracer:${VERSION}"

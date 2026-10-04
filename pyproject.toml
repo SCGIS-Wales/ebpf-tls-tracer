@@ -1,0 +1,28 @@
+[project]
+name = "ebpf-tls-tracer-shippers"
+version = "0.0.0"
+description = "Log shipper sidecars for the eBPF TLS tracer (S3, Kinesis Firehose, Splunk HEC)"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+dependencies = ["boto3"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["scripts", "tests"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, B bugbear, UP pyupgrade, S bandit
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+ignore = [
+    # Shippers deliberately log and continue on any exception so a
+    # single bad batch never takes the sidecar down.
+    "BLE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use fixed placeholder credentials and assert-based checks.
+"tests/*.py" = ["S101", "S105", "S106", "S108"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["s3_shipper", "kinesis_shipper", "splunk_hec_shipper"]

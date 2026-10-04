@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # GitHub Actions (all actions are pinned to full commit SHAs; Dependabot
+  # bumps both the SHA and the version comment).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/London
+    labels: [dependencies, ci]
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Container base images in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/London
+    labels: [dependencies, security]
+
+  # Python dependencies for the shipper sidecars.
+  - package-ecosystem: pip
+    directory: /scripts
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/London
+    labels: [dependencies]

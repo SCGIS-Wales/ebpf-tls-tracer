@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Unit tests for S3 log shipper."""
 
-import json
 import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch, call
+from datetime import UTC
+from unittest.mock import MagicMock, patch
 
 # Add scripts directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -129,9 +129,7 @@ class TestS3ShipperTailFile(unittest.TestCase):
         os.unlink(self.log_file)
         os.rename(alt_file, self.log_file)
 
-        lines, new_offset, new_inode = s3_shipper.tail_file(
-            self.log_file, offset, inode
-        )
+        lines, new_offset, new_inode = s3_shipper.tail_file(self.log_file, offset, inode)
         # Either inode changed (reset to 0) or file shrunk (size < offset reset)
         # In both cases, we should read the full new file content
         self.assertGreaterEqual(len(lines), 1)
@@ -143,24 +141,28 @@ class TestS3ShipperParseIntEnv(unittest.TestCase):
 
     def test_valid_int(self):
         import s3_shipper
+
         with patch.dict(os.environ, {"TEST_VAR": "42"}):
             val = s3_shipper._parse_int_env("TEST_VAR", 10)
             self.assertEqual(val, 42)
 
     def test_invalid_int_uses_default(self):
         import s3_shipper
+
         with patch.dict(os.environ, {"TEST_VAR": "abc"}):
             val = s3_shipper._parse_int_env("TEST_VAR", 10)
             self.assertEqual(val, 10)
 
     def test_below_min_clamps(self):
         import s3_shipper
+
         with patch.dict(os.environ, {"TEST_VAR": "0"}):
             val = s3_shipper._parse_int_env("TEST_VAR", 10, min_val=1)
             self.assertEqual(val, 1)
 
     def test_above_max_clamps(self):
         import s3_shipper
+
         with patch.dict(os.environ, {"TEST_VAR": "99999"}):
             val = s3_shipper._parse_int_env("TEST_VAR", 10, max_val=100)
             self.assertEqual(val, 100)
@@ -169,25 +171,31 @@ class TestS3ShipperParseIntEnv(unittest.TestCase):
 class TestS3ShipperBuildKey(unittest.TestCase):
     """Test build_s3_key() function."""
 
-    @patch.dict(os.environ, {
-        "S3_PREFIX": "logs",
-        "AWS_ACCOUNT_ID": "123456",
-        "AWS_REGION": "us-east-1",
-        "CLUSTER_NAME": "prod",
-        "TARGET_NAMESPACE": "apigee",
-        "APP_NAME": "gateway",
-        "ENVIRONMENT": "production",
-        "NODE_NAME": "node-1",
-    })
+    @patch.dict(
+        os.environ,
+        {
+            "S3_PREFIX": "logs",
+            "AWS_ACCOUNT_ID": "123456",
+            "AWS_REGION": "us-east-1",
+            "CLUSTER_NAME": "prod",
+            "TARGET_NAMESPACE": "apigee",
+            "APP_NAME": "gateway",
+            "ENVIRONMENT": "production",
+            "NODE_NAME": "node-1",
+        },
+    )
     def test_hive_style_key(self):
         """Should produce Apache Hive-style partitioned path."""
         # Re-import to pick up env vars
         import importlib
+
         import s3_shipper
+
         importlib.reload(s3_shipper)
 
-        from datetime import datetime, timezone
-        now = datetime(2026, 3, 15, 14, 30, 45, tzinfo=timezone.utc)
+        from datetime import datetime
+
+        now = datetime(2026, 3, 15, 14, 30, 45, tzinfo=UTC)
         key = s3_shipper.build_s3_key(now)
 
         self.assertIn("account=123456", key)
@@ -210,6 +218,7 @@ class TestS3ShipperFlushBatch(unittest.TestCase):
     def test_flush_success(self):
         """Should upload batch to S3."""
         import s3_shipper
+
         s3_shipper.BUCKET = "test-bucket"
 
         mock_s3 = MagicMock()
@@ -229,6 +238,7 @@ class TestS3ShipperFlushBatch(unittest.TestCase):
     def test_flush_empty_batch(self):
         """Should return True for empty batch without calling S3."""
         import s3_shipper
+
         mock_s3 = MagicMock()
         result = s3_shipper.flush_batch(mock_s3, [])
         self.assertTrue(result)
@@ -236,8 +246,10 @@ class TestS3ShipperFlushBatch(unittest.TestCase):
 
     def test_flush_retry_on_failure(self):
         """Should retry on ClientError."""
-        import s3_shipper
         from botocore.exceptions import ClientError
+
+        import s3_shipper
+
         s3_shipper.BUCKET = "test-bucket"
 
         mock_s3 = MagicMock()
@@ -253,8 +265,10 @@ class TestS3ShipperFlushBatch(unittest.TestCase):
 
     def test_flush_fails_after_max_retries(self):
         """Should return False after exhausting retries."""
-        import s3_shipper
         from botocore.exceptions import ClientError
+
+        import s3_shipper
+
         s3_shipper.BUCKET = "test-bucket"
         s3_shipper.MAX_RETRIES = 2  # Reduce for fast test
 
@@ -273,6 +287,7 @@ class TestS3ShipperMain(unittest.TestCase):
     def test_exits_without_bucket(self):
         """Should exit with error if S3_BUCKET not set."""
         import s3_shipper
+
         s3_shipper.BUCKET = ""
 
         with self.assertRaises(SystemExit) as ctx:

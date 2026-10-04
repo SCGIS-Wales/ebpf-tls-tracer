@@ -1,0 +1,4 @@
+# Runtime dependencies for the log shipper sidecars.
+# Installed into the container image by the Dockerfile. Dependabot keeps
+# this pin current (see .github/dependabot.yml).
+boto3==1.43.108

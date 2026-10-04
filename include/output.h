@@ -21,4 +21,8 @@ void print_printable(const char *data, __u32 len);
 /* Ring buffer event handler callback */
 int handle_event(void *ctx, void *data, size_t size);
 
+/* Create/refresh the health file safely (O_NOFOLLOW, fixed mode).
+ * Returns 0 on success, -1 on error with errno set. */
+int health_file_touch(const char *path);
+
 #endif /* OUTPUT_H */

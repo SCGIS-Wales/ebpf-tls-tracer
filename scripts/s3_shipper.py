@@ -18,13 +18,13 @@ Resilience:
 """
 
 import os
+import signal
 import sys
 import time
-import signal
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import BotoCoreError, ClientError
 
 
 def _parse_int_env(name, default, min_val=1, max_val=None):
@@ -33,16 +33,25 @@ def _parse_int_env(name, default, min_val=1, max_val=None):
     try:
         val = int(raw)
     except ValueError:
-        print(f"[s3-shipper] ERROR: {name}={raw!r} is not a valid integer, "
-              f"using default {default}", file=sys.stderr, flush=True)
+        print(
+            f"[s3-shipper] ERROR: {name}={raw!r} is not a valid integer, using default {default}",
+            file=sys.stderr,
+            flush=True,
+        )
         return default
     if val < min_val:
-        print(f"[s3-shipper] WARN: {name}={val} below minimum {min_val}, "
-              f"clamping", file=sys.stderr, flush=True)
+        print(
+            f"[s3-shipper] WARN: {name}={val} below minimum {min_val}, clamping",
+            file=sys.stderr,
+            flush=True,
+        )
         return min_val
     if max_val is not None and val > max_val:
-        print(f"[s3-shipper] WARN: {name}={val} above maximum {max_val}, "
-              f"clamping", file=sys.stderr, flush=True)
+        print(
+            f"[s3-shipper] WARN: {name}={val} above maximum {max_val}, clamping",
+            file=sys.stderr,
+            flush=True,
+        )
         return max_val
     return val
 
@@ -104,7 +113,7 @@ def flush_batch(s3_client, batch):
     if not batch or not BUCKET:
         return True
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     key = build_s3_key(now)
     body = "\n".join(batch) + "\n"
 
@@ -119,7 +128,7 @@ def flush_batch(s3_client, batch):
             log("INFO", f"Uploaded {len(batch)} records to s3://{BUCKET}/{key}")
             return True
         except (ClientError, BotoCoreError) as e:
-            delay = min(2 ** attempt, 60)
+            delay = min(2**attempt, 60)
             log("WARN", f"Upload attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if attempt < MAX_RETRIES:
                 log("INFO", f"Retrying in {delay}s...")
@@ -128,8 +137,11 @@ def flush_batch(s3_client, batch):
             log("ERROR", f"Unexpected error: {e}")
             return False
 
-    log("ERROR", f"Failed to upload after {MAX_RETRIES} attempts, "
-        f"writing {len(batch)} records to dead-letter file")
+    log(
+        "ERROR",
+        f"Failed to upload after {MAX_RETRIES} attempts, "
+        f"writing {len(batch)} records to dead-letter file",
+    )
     # S9 fix: use restrictive permissions (0o600) on dead-letter file
     # R-6 fix: cap dead-letter file at DEAD_LETTER_MAX_BYTES to prevent pod eviction
     try:
@@ -141,8 +153,11 @@ def flush_batch(s3_client, batch):
         if dlq_size >= DEAD_LETTER_MAX_BYTES:
             global dead_letter_drops
             dead_letter_drops += len(batch)
-            log("WARN", f"Dead-letter file at {dlq_size // (1024*1024)}MB cap, "
-                f"dropping {len(batch)} records (total dropped: {dead_letter_drops})")
+            log(
+                "WARN",
+                f"Dead-letter file at {dlq_size // (1024 * 1024)}MB cap, "
+                f"dropping {len(batch)} records (total dropped: {dead_letter_drops})",
+            )
             return False
         fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as dlq:
@@ -159,9 +174,9 @@ def rotate_log_if_needed(path, max_bytes=200 * 1024 * 1024):
     try:
         size = os.path.getsize(path)
         if size > max_bytes:
-            with open(path, 'w') as f:
+            with open(path, "w") as f:
                 f.truncate(0)
-            log("INFO", f"Rotated {path} (was {size // (1024*1024)}MB)")
+            log("INFO", f"Rotated {path} (was {size // (1024 * 1024)}MB)")
             return 0  # Reset offset since file was truncated
     except OSError:
         pass
@@ -192,7 +207,7 @@ def tail_file(path, offset, last_inode):
         if size == offset:
             return lines, offset, current_inode
 
-        with open(path, "r") as f:
+        with open(path) as f:
             f.seek(offset)
             for line in f:
                 stripped = line.strip()
