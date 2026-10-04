@@ -13,14 +13,14 @@ Resilience:
   - R10 fix: tracks file inode to detect tee restarts
 """
 
-import os
-import sys
 import json
-import time
+import os
 import signal
+import sys
+import time
 
 import boto3
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import BotoCoreError, ClientError
 
 
 def _parse_int_env(name, default, min_val=1, max_val=None):
@@ -29,16 +29,26 @@ def _parse_int_env(name, default, min_val=1, max_val=None):
     try:
         val = int(raw)
     except ValueError:
-        print(f"[kinesis-shipper] ERROR: {name}={raw!r} is not a valid integer, "
-              f"using default {default}", file=sys.stderr, flush=True)
+        print(
+            f"[kinesis-shipper] ERROR: {name}={raw!r} is not a valid integer, "
+            f"using default {default}",
+            file=sys.stderr,
+            flush=True,
+        )
         return default
     if val < min_val:
-        print(f"[kinesis-shipper] WARN: {name}={val} below minimum {min_val}, "
-              f"clamping", file=sys.stderr, flush=True)
+        print(
+            f"[kinesis-shipper] WARN: {name}={val} below minimum {min_val}, clamping",
+            file=sys.stderr,
+            flush=True,
+        )
         return min_val
     if max_val is not None and val > max_val:
-        print(f"[kinesis-shipper] WARN: {name}={val} above maximum {max_val}, "
-              f"clamping", file=sys.stderr, flush=True)
+        print(
+            f"[kinesis-shipper] WARN: {name}={val} above maximum {max_val}, clamping",
+            file=sys.stderr,
+            flush=True,
+        )
         return max_val
     return val
 
@@ -93,9 +103,7 @@ def send_chunk(firehose, records):
     """Send a chunk of records to Firehose with retry on partial failures."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = firehose.put_record_batch(
-                DeliveryStreamName=STREAM, Records=records
-            )
+            resp = firehose.put_record_batch(DeliveryStreamName=STREAM, Records=records)
             failed_count = resp.get("FailedPutCount", 0)
             if failed_count == 0:
                 return True
@@ -108,17 +116,20 @@ def send_chunk(firehose, records):
                     failed_records.append(records[i])
             records = failed_records
 
-            delay = min(2 ** attempt, 60)
+            delay = min(2**attempt, 60)
             time.sleep(delay)
 
         except (ClientError, BotoCoreError) as e:
-            delay = min(2 ** attempt, 60)
+            delay = min(2**attempt, 60)
             log("WARN", f"Attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(delay)
             else:
-                log("ERROR", f"Failed after {MAX_RETRIES} attempts, "
-                    f"writing {len(records)} records to dead-letter file")
+                log(
+                    "ERROR",
+                    f"Failed after {MAX_RETRIES} attempts, "
+                    f"writing {len(records)} records to dead-letter file",
+                )
                 # S9 fix: use restrictive permissions (0o600) on dead-letter file
                 # R-6 fix: cap dead-letter file at DEAD_LETTER_MAX_BYTES
                 try:
@@ -130,10 +141,13 @@ def send_chunk(firehose, records):
                     if dlq_size >= DEAD_LETTER_MAX_BYTES:
                         global dead_letter_drops
                         dead_letter_drops += len(records)
-                        log("WARN", f"Dead-letter file at "
-                            f"{dlq_size // (1024*1024)}MB cap, "
+                        log(
+                            "WARN",
+                            f"Dead-letter file at "
+                            f"{dlq_size // (1024 * 1024)}MB cap, "
                             f"dropping {len(records)} records "
-                            f"(total dropped: {dead_letter_drops})")
+                            f"(total dropped: {dead_letter_drops})",
+                        )
                         return False
                     fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                     with os.fdopen(fd, "a") as dlq:
@@ -155,10 +169,7 @@ def flush_batch(firehose, batch):
     if not batch or not STREAM:
         return True
 
-    records = [
-        {"Data": (enrich_record(line) + "\n").encode("utf-8")}
-        for line in batch
-    ]
+    records = [{"Data": (enrich_record(line) + "\n").encode("utf-8")} for line in batch]
 
     total_sent = 0
     for i in range(0, len(records), FIREHOSE_MAX_BATCH):
@@ -176,9 +187,9 @@ def rotate_log_if_needed(path, max_bytes=200 * 1024 * 1024):
     try:
         size = os.path.getsize(path)
         if size > max_bytes:
-            with open(path, 'w') as f:
+            with open(path, "w") as f:
                 f.truncate(0)
-            log("INFO", f"Rotated {path} (was {size // (1024*1024)}MB)")
+            log("INFO", f"Rotated {path} (was {size // (1024 * 1024)}MB)")
             return 0  # Reset offset since file was truncated
     except OSError:
         pass
@@ -209,7 +220,7 @@ def tail_file(path, offset, last_inode):
         if size == offset:
             return lines, offset, current_inode
 
-        with open(path, "r") as f:
+        with open(path) as f:
             f.seek(offset)
             for line in f:
                 stripped = line.strip()

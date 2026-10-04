@@ -19,18 +19,20 @@ Environment variables:
   SPLUNK_SOURCETYPE    - Sourcetype for events (default: tls:tracer)
   SPLUNK_SOURCE        - Source field (default: tls_tracer)
   SPLUNK_VERIFY_SSL    - Verify TLS certs (default: true)
+  SPLUNK_HEC_ALLOW_HTTP - Permit a plain http:// HEC URL (default: false)
   SPLUNK_BATCH_SIZE    - Events per batch (default: 50)
   SPLUNK_FLUSH_INTERVAL - Seconds between flushes (default: 5)
 """
 
-import os
-import sys
 import json
-import time
+import os
 import signal
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 import ssl as _ssl
+import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 
 def _parse_int_env(name, default, min_val=1, max_val=None):
@@ -63,6 +65,7 @@ INDEX = os.environ.get("SPLUNK_INDEX", "")
 SOURCETYPE = os.environ.get("SPLUNK_SOURCETYPE", "tls:tracer")
 SOURCE = os.environ.get("SPLUNK_SOURCE", "tls_tracer")
 VERIFY_SSL = _parse_bool_env("SPLUNK_VERIFY_SSL", True)
+ALLOW_HTTP = _parse_bool_env("SPLUNK_HEC_ALLOW_HTTP", False)
 BATCH_SIZE = _parse_int_env("SPLUNK_BATCH_SIZE", 50, min_val=1, max_val=10000)
 FLUSH_INTERVAL = _parse_int_env("SPLUNK_FLUSH_INTERVAL", 5, min_val=1, max_val=3600)
 MAX_RETRIES = 5
@@ -119,7 +122,8 @@ def wrap_event(line):
     if ts:
         try:
             # Parse ISO 8601 with microseconds
-            from datetime import datetime, timezone
+            from datetime import datetime
+
             if ts.endswith("Z"):
                 ts = ts[:-1] + "+00:00"
             dt = datetime.fromisoformat(ts)
@@ -136,7 +140,7 @@ def send_batch(events, ssl_ctx):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            req = Request(
+            req = Request(  # noqa: S310
                 HEC_URL,
                 data=payload,
                 headers={
@@ -145,16 +149,19 @@ def send_batch(events, ssl_ctx):
                 },
                 method="POST",
             )
-            resp = urlopen(req, timeout=30, context=ssl_ctx)
+            # Scheme is validated once at startup by validate_hec_url().
+            resp = urlopen(req, timeout=30, context=ssl_ctx)  # noqa: S310
             resp_body = resp.read().decode("utf-8")
 
             try:
                 result = json.loads(resp_body)
                 if result.get("code") != 0:
-                    log("WARN", f"HEC returned code {result.get('code')}: "
-                        f"{result.get('text', 'unknown')}")
+                    log(
+                        "WARN",
+                        f"HEC returned code {result.get('code')}: {result.get('text', 'unknown')}",
+                    )
                     if attempt < MAX_RETRIES:
-                        time.sleep(min(2 ** attempt, 60))
+                        time.sleep(min(2**attempt, 60))
                         continue
                     else:
                         _write_dead_letter(events)
@@ -165,7 +172,7 @@ def send_batch(events, ssl_ctx):
             return True
 
         except HTTPError as e:
-            delay = min(2 ** attempt, 60)
+            delay = min(2**attempt, 60)
             log("WARN", f"Attempt {attempt}/{MAX_RETRIES}: HTTP {e.code} - {e.reason}")
             if e.code == 403:
                 log("ERROR", "HEC token rejected (403 Forbidden). Check SPLUNK_HEC_TOKEN.")
@@ -179,7 +186,7 @@ def send_batch(events, ssl_ctx):
                 return False
 
         except (URLError, OSError) as e:
-            delay = min(2 ** attempt, 60)
+            delay = min(2**attempt, 60)
             log("WARN", f"Attempt {attempt}/{MAX_RETRIES}: {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(delay)
@@ -202,8 +209,11 @@ def _write_dead_letter(events):
         if dlq_size >= DEAD_LETTER_MAX_BYTES:
             global dead_letter_drops
             dead_letter_drops += len(events)
-            log("WARN", f"Dead-letter file at {dlq_size // (1024 * 1024)}MB cap, "
-                f"dropping {len(events)} events (total dropped: {dead_letter_drops})")
+            log(
+                "WARN",
+                f"Dead-letter file at {dlq_size // (1024 * 1024)}MB cap, "
+                f"dropping {len(events)} events (total dropped: {dead_letter_drops})",
+            )
             return
         fd = os.open(dlq_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as dlq:
@@ -235,7 +245,7 @@ def tail_file(path, offset, last_inode):
         if size == offset:
             return lines, offset, current_inode
 
-        with open(path, "r") as f:
+        with open(path) as f:
             f.seek(offset)
             for line in f:
                 stripped = line.strip()
@@ -258,10 +268,14 @@ def check_hec_health(ssl_ctx):
     # Use the health endpoint if available, else try a small test POST
     health_url = HEC_URL.replace("/services/collector", "/services/collector/health")
     try:
-        req = Request(health_url, headers={
-            "Authorization": f"Splunk {HEC_TOKEN}",
-        })
-        resp = urlopen(req, timeout=10, context=ssl_ctx)
+        req = Request(  # noqa: S310
+            health_url,
+            headers={
+                "Authorization": f"Splunk {HEC_TOKEN}",
+            },
+        )
+        # Scheme is validated once at startup by validate_hec_url().
+        resp = urlopen(req, timeout=10, context=ssl_ctx)  # noqa: S310
         resp.read()
         return True
     except HTTPError as e:
@@ -274,6 +288,29 @@ def check_hec_health(ssl_ctx):
         return True  # Non-fatal — proceed and retry on actual send
 
 
+def validate_hec_url(url, allow_http=False):
+    """Return True if url is an absolute http(s) URL the shipper may POST to.
+
+    Only https is accepted by default so the HEC token is never sent in clear
+    text. Plain http can be enabled explicitly for lab environments.
+    """
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        log("ERROR", "SPLUNK_HEC_URL must be an absolute URL")
+        return False
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme == "http" and allow_http:
+        log("WARN", "SPLUNK_HEC_URL uses plain http, the HEC token is sent unencrypted")
+        return True
+    log(
+        "ERROR",
+        f"SPLUNK_HEC_URL scheme {parsed.scheme!r} not allowed "
+        "(use https, or set SPLUNK_HEC_ALLOW_HTTP=true)",
+    )
+    return False
+
+
 def main():
     if not HEC_URL:
         log("ERROR", "SPLUNK_HEC_URL not set")
@@ -281,13 +318,14 @@ def main():
     if not HEC_TOKEN:
         log("ERROR", "SPLUNK_HEC_TOKEN not set")
         sys.exit(1)
+    if not validate_hec_url(HEC_URL, allow_http=ALLOW_HTTP):
+        sys.exit(1)
 
     ssl_ctx = build_ssl_context()
 
     log("INFO", f"Splunk HEC: {HEC_URL}")
     log("INFO", f"Token: {_mask_token(HEC_TOKEN)}")
-    log("INFO", f"Index: {INDEX or '(HEC default)'}, "
-        f"Sourcetype: {SOURCETYPE}, Source: {SOURCE}")
+    log("INFO", f"Index: {INDEX or '(HEC default)'}, Sourcetype: {SOURCETYPE}, Source: {SOURCE}")
     log("INFO", f"Batch size: {BATCH_SIZE}, Flush interval: {FLUSH_INTERVAL}s")
     if not VERIFY_SSL:
         log("WARN", "SSL certificate verification disabled")

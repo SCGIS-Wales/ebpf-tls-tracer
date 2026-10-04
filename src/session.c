@@ -217,11 +217,10 @@ void session_emit_json(const struct session_entry *entry,
     printf(",\"close_reason\":\"%s\"}\n", close_str);
 }
 
-void session_sweep(time_t now, int timeout_secs,
+void session_sweep(__u64 now_ns, int timeout_secs,
                    session_emit_fn emit_fn, const struct config *cfg)
 {
     __u64 timeout_ns = (__u64)timeout_secs * 1000000000ULL;
-    __u64 now_ns = (__u64)now * 1000000000ULL;
 
     for (__u32 i = 0; i < session_table_sz; i++) {
         if (!session_table[i].occupied)

@@ -42,8 +42,10 @@ metadata:
 
 image:
   repository: ghcr.io/scgis-wales/ebpf-tls-tracer
-  # Pin to a specific version in production to avoid non-deterministic deploys
-  tag: "0.1.0"
+  # Empty = use the chart's appVersion, which the release pipeline sets to the
+  # matching tracer release. Pin explicitly in production if you need to hold
+  # a specific version independently of chart upgrades.
+  tag: ""
   pullPolicy: IfNotPresent
 
 # --- 3. Tracer Settings ---

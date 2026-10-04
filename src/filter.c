@@ -75,7 +75,9 @@ int parse_cidr(const char *str, struct cidr_entry *entry)
 
     char *endp;
     long prefix_len = strtol(prefix_str, &endp, 10);
-    if (*endp != '\0' || prefix_len < 0)
+    /* Reject an empty prefix ("10.0.0.0/"): strtol returns 0 without
+     * consuming anything, which would silently match every address. */
+    if (endp == prefix_str || *endp != '\0' || prefix_len < 0)
         return -1;
 
     /* Try IPv4 first */

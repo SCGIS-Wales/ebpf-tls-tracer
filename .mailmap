@@ -1,0 +1,13 @@
+# Canonical identity for every contribution in this repository.
+# git log, git shortlog and git blame map the historical author and
+# committer identities below to api-py (Dejan Gregor).
+#
+# Format: Canonical Name <canonical@email> Old Name <old@email>
+api-py <5954680+api-py@users.noreply.github.com> api-py <dejan.gregor@gmail.com>
+api-py <5954680+api-py@users.noreply.github.com> Dejan Gregor <dejan.gregor@gmail.com>
+api-py <5954680+api-py@users.noreply.github.com> Dejan Gregor <5954680+api-py@users.noreply.github.com>
+api-py <5954680+api-py@users.noreply.github.com> ssddgreg <dejan.gregor@gmail.com>
+api-py <5954680+api-py@users.noreply.github.com> D G <5954680+plaformsre@users.noreply.github.com>
+api-py <5954680+api-py@users.noreply.github.com> Claude <noreply@anthropic.com>
+api-py <5954680+api-py@users.noreply.github.com> GitHub <noreply@github.com>
+api-py <5954680+api-py@users.noreply.github.com> github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>

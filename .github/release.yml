@@ -1,0 +1,46 @@
+# Controls the automatically generated release notes
+# (gh release create --generate-notes / "Generate release notes" button).
+# Pull requests are grouped by label; unlabelled changes land in "Other changes".
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+    authors:
+      - dependabot[bot]
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking
+        - breaking-change
+    - title: Security
+      labels:
+        - security
+    - title: New features
+      labels:
+        - enhancement
+        - feature
+    - title: Bug fixes
+      labels:
+        - bug
+        - fix
+    - title: Reliability and performance
+      labels:
+        - reliability
+        - performance
+    - title: Kubernetes and Helm
+      labels:
+        - helm
+        - kubernetes
+    - title: CI and tooling
+      labels:
+        - ci
+        - build
+    - title: Dependencies
+      labels:
+        - dependencies
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other changes
+      labels:
+        - "*"

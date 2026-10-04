@@ -100,9 +100,7 @@ class TestKinesisShipperTailFile(unittest.TestCase):
         os.unlink(self.log_file)
         os.rename(alt_file, self.log_file)
 
-        lines, new_offset, new_inode = kinesis_shipper.tail_file(
-            self.log_file, offset, inode
-        )
+        lines, new_offset, new_inode = kinesis_shipper.tail_file(self.log_file, offset, inode)
         # Either inode changed (reset to 0) or file shrunk (size < offset reset)
         # In both cases, we should read the full new file content
         self.assertGreaterEqual(len(lines), 1)
@@ -114,18 +112,21 @@ class TestKinesisShipperParseIntEnv(unittest.TestCase):
 
     def test_valid_int(self):
         import kinesis_shipper
+
         with patch.dict(os.environ, {"TEST_VAR": "42"}):
             val = kinesis_shipper._parse_int_env("TEST_VAR", 10)
             self.assertEqual(val, 42)
 
     def test_invalid_int_uses_default(self):
         import kinesis_shipper
+
         with patch.dict(os.environ, {"TEST_VAR": "abc"}):
             val = kinesis_shipper._parse_int_env("TEST_VAR", 10)
             self.assertEqual(val, 10)
 
     def test_below_min_clamps(self):
         import kinesis_shipper
+
         with patch.dict(os.environ, {"TEST_VAR": "0"}):
             val = kinesis_shipper._parse_int_env("TEST_VAR", 10, min_val=1)
             self.assertEqual(val, 1)
@@ -134,17 +135,22 @@ class TestKinesisShipperParseIntEnv(unittest.TestCase):
 class TestKinesisShipperEnrichRecord(unittest.TestCase):
     """Test enrich_record() function."""
 
-    @patch.dict(os.environ, {
-        "CLUSTER_NAME": "prod-cluster",
-        "TARGET_NAMESPACE": "apigee",
-        "APP_NAME": "gateway",
-        "ENVIRONMENT": "production",
-        "NODE_NAME": "node-1",
-    })
+    @patch.dict(
+        os.environ,
+        {
+            "CLUSTER_NAME": "prod-cluster",
+            "TARGET_NAMESPACE": "apigee",
+            "APP_NAME": "gateway",
+            "ENVIRONMENT": "production",
+            "NODE_NAME": "node-1",
+        },
+    )
     def test_enrich_adds_metadata(self):
         """Should add cluster/namespace/app metadata to JSON record."""
         import importlib
+
         import kinesis_shipper
+
         importlib.reload(kinesis_shipper)
 
         result = kinesis_shipper.enrich_record('{"pid":1234,"direction":"REQUEST"}')
@@ -181,6 +187,7 @@ class TestKinesisShipperSendChunk(unittest.TestCase):
     def test_send_success(self):
         """Should send chunk successfully."""
         import kinesis_shipper
+
         kinesis_shipper.STREAM = "test-stream"
 
         mock_firehose = MagicMock()
@@ -195,6 +202,7 @@ class TestKinesisShipperSendChunk(unittest.TestCase):
     def test_send_retries_partial_failures(self):
         """Should retry only failed records on partial failure."""
         import kinesis_shipper
+
         kinesis_shipper.STREAM = "test-stream"
 
         mock_firehose = MagicMock()
@@ -220,8 +228,10 @@ class TestKinesisShipperSendChunk(unittest.TestCase):
 
     def test_send_fails_after_max_retries(self):
         """Should return False after exhausting retries."""
-        import kinesis_shipper
         from botocore.exceptions import ClientError
+
+        import kinesis_shipper
+
         kinesis_shipper.STREAM = "test-stream"
         kinesis_shipper.MAX_RETRIES = 2
 
@@ -241,6 +251,7 @@ class TestKinesisShipperFlushBatch(unittest.TestCase):
     def test_flush_empty_batch(self):
         """Should return True for empty batch."""
         import kinesis_shipper
+
         mock_firehose = MagicMock()
         result = kinesis_shipper.flush_batch(mock_firehose, [])
         self.assertTrue(result)
@@ -249,6 +260,7 @@ class TestKinesisShipperFlushBatch(unittest.TestCase):
     def test_flush_respects_batch_limit(self):
         """Should split large batches into 500-record chunks."""
         import kinesis_shipper
+
         kinesis_shipper.STREAM = "test-stream"
         kinesis_shipper.FIREHOSE_MAX_BATCH = 500
 
@@ -268,6 +280,7 @@ class TestKinesisShipperMain(unittest.TestCase):
     def test_exits_without_stream(self):
         """Should exit with error if DELIVERY_STREAM not set."""
         import kinesis_shipper
+
         kinesis_shipper.STREAM = ""
 
         with self.assertRaises(SystemExit) as ctx:

@@ -57,8 +57,10 @@ void session_update(const struct tls_event_t *event,
                     const struct http_info *http,
                     const struct config *cfg);
 
-/* Sweep sessions: emit summaries for idle sessions, remove them */
-void session_sweep(time_t now, int timeout_secs,
+/* Sweep sessions: emit summaries for idle sessions, remove them.
+ * now_ns must come from CLOCK_MONOTONIC, the same clock as the
+ * bpf_ktime_get_ns() timestamps stored in each session. */
+void session_sweep(__u64 now_ns, int timeout_secs,
                    session_emit_fn emit_fn, const struct config *cfg);
 
 /* Emit a session summary as JSON */

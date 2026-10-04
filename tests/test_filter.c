@@ -99,6 +99,8 @@ static void test_parse_cidr_invalid(void)
     ASSERT(parse_cidr("not-an-ip/8", &entry) != 0, "garbage address");
     ASSERT(parse_cidr("/8", &entry) != 0, "empty address");
     ASSERT(parse_cidr("10.0.0.0/-1", &entry) != 0, "negative prefix");
+    ASSERT(parse_cidr("10.0.0.0/", &entry) != 0, "empty prefix length");
+    ASSERT(parse_cidr("10.0.0.0/8x", &entry) != 0, "trailing garbage in prefix");
 }
 
 static void test_ip_matches_cidr_v4(void)

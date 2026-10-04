@@ -33,7 +33,7 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: tls-tracer
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if or .Values.s3.enabled .Values.kinesis.enabled .Values.splunk.enabled }}
           command: ["sh", "-c"]
@@ -189,7 +189,7 @@ spec:
             {{- end }}
         {{- if .Values.s3.enabled }}
         - name: s3-shipper
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["python3", "/opt/tls_tracer/scripts/s3_shipper.py"]
           env:
@@ -239,7 +239,7 @@ spec:
         {{- end }}
         {{- if .Values.kinesis.enabled }}
         - name: kinesis-shipper
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["python3", "/opt/tls_tracer/scripts/kinesis_shipper.py"]
           env:
@@ -286,7 +286,7 @@ spec:
         {{- end }}
         {{- if .Values.splunk.enabled }}
         - name: splunk-hec-shipper
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["python3", "/opt/tls_tracer/scripts/splunk_hec_shipper.py"]
           env:

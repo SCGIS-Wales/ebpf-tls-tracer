@@ -5,9 +5,12 @@
 
 #define _GNU_SOURCE  /* for memmem() */
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include "output.h"
 #include "config.h"
@@ -127,7 +130,11 @@ int handle_event(void *ctx, void *data, size_t size)
     struct tls_event_t *event = data;
     struct config *c = ctx;
 
-    if (size < sizeof(*event) - MAX_DATA_LEN)
+    /* The BPF side emits offsetof(data) + data_len bytes. Compare against the
+     * real header size, not sizeof() minus the payload: trailing struct
+     * padding made the old check drop every event with data_len < 4
+     * (connect/TLS errors, close and QUIC notifications). */
+    if (size < offsetof(struct tls_event_t, data))
         return 0;
 
     /* Apply filters */
@@ -143,6 +150,10 @@ int handle_event(void *ctx, void *data, size_t size)
     __u32 data_len = event->data_len;
     if (data_len > MAX_DATA_LEN)
         data_len = MAX_DATA_LEN;
+    /* Never trust data_len beyond what the ring buffer sample actually holds */
+    __u32 avail = (__u32)(size - offsetof(struct tls_event_t, data));
+    if (data_len > avail)
+        data_len = avail;
 
     /* Early HTTP parse for traffic filter (method filter needs HTTP info) */
     struct http_info http_early;
@@ -167,21 +178,22 @@ int handle_event(void *ctx, void *data, size_t size)
 
     /* Event-driven health update: keeps health file fresh even when
      * the periodic task in the main loop is delayed by CPU throttling. */
-    if (g_health_file && (stat_events_captured % 1000) == 0) {
-        FILE *hf = fopen(g_health_file, "w");
-        if (hf) {
-            fprintf(hf, "%ld\n", (long)time(NULL));
-            fclose(hf);
-        }
-    }
+    if (g_health_file && (stat_events_captured % 1000) == 0)
+        health_file_touch(g_health_file);
 
     /* Update Prometheus metrics counters */
     if (c->metrics_port > 0)
         metrics_update_event(event);
 
-    /* Write to PCAP file (data events only) */
-    if (c->pcap_path[0] && event->event_type == EVENT_TLS_DATA)
-        pcap_write_event_from_tls(c->pcap_path, event);
+    /* Write to PCAP file (data events only). Honour --headers-only
+     * truncation and --pcap-snaplen so the capture never holds more
+     * than the operator asked for. */
+    if (c->pcap_path[0] && event->event_type == EVENT_TLS_DATA) {
+        __u32 pcap_len = data_len;
+        if (c->pcap_snaplen > 0 && pcap_len > (__u32)c->pcap_snaplen)
+            pcap_len = (__u32)c->pcap_snaplen;
+        pcap_write_event_from_tls(c->pcap_path, event, pcap_len);
+    }
 
     /* Session aggregation: update session tracking */
     if (c->aggregate) {
@@ -778,10 +790,23 @@ int handle_event(void *ctx, void *data, size_t size)
         }
 
         if (data_len > 0) {
-            if (c->hex_dump)
+            if (c->hex_dump) {
                 print_hex_dump(event->data, data_len);
-            else
+            } else if (c->sanitize_count > 0 &&
+                       memchr(event->data, '\0', data_len) == NULL) {
+                /* Text payloads (HTTP/1.x headers and bodies) go through
+                 * the same redaction patterns as the JSON path/host fields
+                 * so Authorization/Cookie values are not printed verbatim.
+                 * Binary payloads (HTTP/2, Kafka, TLS records) are left
+                 * untouched because the patterns are line-oriented. */
+                char payload[MAX_DATA_LEN + 1];
+                memcpy(payload, event->data, data_len);
+                payload[data_len] = '\0';
+                sanitize_string(payload, sizeof(payload), c);
+                print_printable(payload, (__u32)strlen(payload));
+            } else {
                 print_printable(event->data, data_len);
+            }
 
             if (!c->hex_dump)
                 printf("\n");
@@ -789,4 +814,21 @@ int handle_event(void *ctx, void *data, size_t size)
     }
 
     return 0;
+}
+
+/* Create or refresh the readiness/liveness file with the current epoch
+ * time. Opens with O_NOFOLLOW and a fixed mode so a symlink planted in a
+ * shared health directory can never make the (root) tracer overwrite an
+ * arbitrary file. Returns 0 on success, -1 on error (errno set). */
+int health_file_touch(const char *path)
+{
+    if (!path || !path[0])
+        return -1;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return -1;
+    int ret = dprintf(fd, "%ld\n", (long)time(NULL)) < 0 ? -1 : 0;
+    if (close(fd) != 0)
+        ret = -1;
+    return ret;
 }

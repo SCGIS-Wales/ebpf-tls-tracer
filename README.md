@@ -43,6 +43,8 @@ eBPF TLS Tracer attaches to TLS libraries at the kernel level to capture **decry
 - [Architecture](#architecture)
 - [Splunk Integration](#splunk-integration)
 - [Requirements](#requirements)
+- [Security Scanning](#security-scanning)
+- [Releases and Versioning](#releases-and-versioning)
 - [Licence](#licence)
 
 ---
@@ -428,6 +430,16 @@ Events are automatically enriched with Kubernetes metadata (pod name, namespace,
 
 ### Helm Chart
 
+Every release publishes the chart as an OCI artefact alongside the container image, with the chart version and `appVersion` matching the tracer release:
+
+```bash
+helm install tls-tracer oci://ghcr.io/scgis-wales/charts/tls-tracer \
+  --version 1.0.24 \
+  --namespace tls-tracer --create-namespace
+```
+
+Or install from a checkout of this repository:
+
 ```bash
 helm install tls-tracer helm/tls-tracer \
   --namespace tls-tracer --create-namespace
@@ -457,7 +469,7 @@ helm uninstall tls-tracer -n tls-tracer
 | `sanitizePatterns` | `["apikey=[^&]*"]` | URL sanitisation regex patterns |
 | `companyPrefix` | `""` | Prefix for Kubernetes resource names |
 | `image.repository` | `ghcr.io/scgis-wales/ebpf-tls-tracer` | Container image |
-| `image.tag` | `0.1.0` | Image tag (pin to a specific version in production) |
+| `image.tag` | `""` | Image tag. Empty uses the chart `appVersion`, which the release pipeline keeps equal to the tracer release. Pin explicitly to hold a version across chart upgrades |
 
 ### AWS Integration (S3 & Kinesis)
 
@@ -792,6 +804,12 @@ Add custom patterns with the `-s` flag (case-insensitive, repeatable):
 sudo ./bin/tls_tracer -f json -s 'token=[^&]*' -s 'password=[^&]*'
 ```
 
+Where the patterns apply:
+
+- JSON output: `http_path` and `http_host` fields (the raw payload is never emitted as JSON).
+- Text output: the printed payload, for text payloads such as HTTP/1.x. Binary payloads (HTTP/2, Kafka) are printed unchanged because the patterns are line oriented.
+- PCAP export: not redacted. The capture is written owner-only (`0600`) and honours `--headers-only` and `--pcap-snaplen`.
+
 ---
 
 ## Performance
@@ -1076,16 +1094,27 @@ index=tls_traffic sourcetype="tls:tracer" event_type="dropped" | timechart count
 
 The CI pipeline integrates multiple security scanning tools suitable for enterprise security evaluation:
 
-| Tool | Purpose | CI Workflow |
-|---|---|---|
-| **CodeQL** | Static Application Security Testing (SAST) for C/C++ and Python | `codeql.yml` |
-| **Semgrep** | Pattern-based SAST with community rules | `semgrep.yml` |
-| **Trivy** | Container image vulnerability scanning | `build.yml` |
-| **AddressSanitizer** | Runtime memory error detection (buffer overflow, use-after-free) | `build.yml` |
-| **UndefinedBehaviorSanitizer** | Runtime UB detection (integer overflow, null deref) | `build.yml` |
-| **SonarQube** | Code quality and security analysis (optional, requires external server) | `build.yml` |
-| **libbpf CVE check** | Detects vulnerable libbpf 1.5.0 (CVE-2025-29481) | `build.yml` |
-| **OpenSSL CVE check** | Warns about CVE-2025-15467 affected versions | `build.yml` |
+| Tool | Purpose | Gate | CI Workflow |
+|---|---|---|---|
+| **CodeQL** | SAST for C/C++ and Python (GitHub default setup) | Security tab | repository setting |
+| **Semgrep** | Pattern-based SAST (C, Python, Dockerfile, Kubernetes, GitHub Actions, secrets) | Fails on ERROR severity | `semgrep.yml` |
+| **Trivy** | Container image vulnerability scan, results in the Security tab | Fails on fixable CRITICAL/HIGH | `build.yml` |
+| **actionlint** | Workflow linting including shellcheck of every `run:` script | Fails | `build.yml` |
+| **hadolint** | Dockerfile linting | Fails on warning | `build.yml` |
+| **ruff** | Python lint and format check for the shipper sidecars | Fails | `build.yml` |
+| **helm lint** | Chart lint (strict) and a full render with every sidecar enabled | Fails | `build.yml` |
+| **AddressSanitizer** | Runtime memory error detection (buffer overflow, use-after-free) | Fails | `build.yml` |
+| **UndefinedBehaviorSanitizer** | Runtime UB detection (integer overflow, null deref) | Fails | `build.yml` |
+| **SonarQube** | Code quality and security analysis (optional, enabled by the `SONAR_HOST_URL` variable) | Quality gate | `build.yml` |
+| **libbpf CVE check** | Detects vulnerable libbpf 1.5.0 (CVE-2025-29481) | Fails | `build.yml`, `Dockerfile` |
+| **Dependabot** | Weekly updates for GitHub Actions, base images and Python dependencies | PRs | `dependabot.yml` |
+
+Supply chain controls:
+
+- Every GitHub Action is pinned to a full commit SHA with the version in a comment.
+- Workflow permissions default to `contents: read`; jobs that publish request only what they need.
+- Release archives and the container image carry SLSA build provenance attestations. The image is also pushed with a BuildKit SBOM.
+- Verify a download with `gh attestation verify tls_tracer-linux-x86_64.tar.gz --repo SCGIS-Wales/ebpf-tls-tracer`.
 
 ### Running Locally
 
@@ -1097,10 +1126,20 @@ make CFLAGS="-O1 -g -Wall -Wextra -Werror -Iinclude -fsanitize=address,undefined
 
 # Container image scan with Trivy
 docker build -t tls_tracer:scan .
-trivy image --severity CRITICAL,HIGH tls_tracer:scan
+trivy image --severity CRITICAL,HIGH --ignore-unfixed tls_tracer:scan
 
 # Semgrep scan
-semgrep scan --config auto src/ include/
+semgrep scan --config p/default --config p/c --config p/python --metrics=off .
+
+# Python shippers
+pip install ruff -r scripts/requirements.txt
+ruff check scripts tests && ruff format --check scripts tests
+python3 -m unittest tests.test_s3_shipper tests.test_kinesis_shipper tests.test_splunk_hec_shipper
+
+# Workflows, Dockerfile and chart
+actionlint
+hadolint Dockerfile
+helm lint helm/tls-tracer --strict
 ```
 
 ### Build Hardening
@@ -1108,10 +1147,43 @@ semgrep scan --config auto src/ include/
 The binary is compiled with full hardening flags:
 
 - `-fstack-protector-strong` — Stack canaries for buffer overflow detection
-- `-D_FORTIFY_SOURCE=2` — Runtime buffer overflow checks in libc functions
+- `-fstack-clash-protection` — Probes large stack allocations so they cannot jump the guard page
+- `-fcf-protection=full` — Intel CET shadow stack and indirect branch tracking (x86_64 only)
+- `-D_FORTIFY_SOURCE=3` — Runtime buffer overflow checks in libc functions, including dynamically sized objects
 - `-fPIE` / `-pie` — Position-independent executable (ASLR support)
 - `-Wl,-z,relro,-z,now` — Full RELRO (GOT hardening against overwrite attacks)
+- `-Wl,-z,noexecstack` — Non-executable stack
 - `-Wformat=2 -Wformat-security` — Format string vulnerability detection
+
+The CI build step verifies PIE, RELRO, BIND_NOW and the non-executable stack on the produced binary.
+
+---
+
+## Releases and Versioning
+
+Releases are fully automated from the `main` branch. No manual tagging is required.
+
+1. Every push to `main` runs the full pipeline: lint, amd64 and arm64 builds, unit tests, sanitizer build, functional BPF load test, container build with Trivy gate, and the kind integration test.
+2. When everything is green the pipeline derives the next semantic version from the commits since the previous tag, following Conventional Commits:
+   - `feat!:` or a `BREAKING CHANGE:` footer bumps the major version
+   - `feat:` bumps the minor version
+   - anything else bumps the patch version
+   - `[skip release]` in the merge commit message builds without releasing
+3. An annotated tag `vX.Y.Z` is pushed and the release assets are published in parallel:
+   - GitHub release with `tls_tracer-linux-x86_64.tar.gz`, `tls_tracer-linux-aarch64.tar.gz`, `checksums.txt` and provenance attestations
+   - Container image `ghcr.io/scgis-wales/ebpf-tls-tracer` tagged `X.Y.Z`, `X.Y`, `X` and `latest`, multi-arch, with SBOM and provenance
+   - Helm chart `oci://ghcr.io/scgis-wales/charts/tls-tracer` at version `X.Y.Z`
+
+Release notes are generated automatically from the merged pull requests. Label pull requests to place them in the right section (`breaking`, `security`, `enhancement`, `bug`, `reliability`, `performance`, `helm`, `ci`, `dependencies`, `documentation`); the categories are defined in `.github/release.yml`. Dependabot pull requests are excluded from the notes.
+
+A release can also be cut on demand from the Actions tab using **Run workflow** on `main` with the `release` input set to `patch`, `minor` or `major`.
+
+Verify what you run:
+
+```bash
+gh attestation verify tls_tracer-linux-x86_64.tar.gz --repo SCGIS-Wales/ebpf-tls-tracer
+gh attestation verify oci://ghcr.io/scgis-wales/ebpf-tls-tracer:1.0.24 --repo SCGIS-Wales/ebpf-tls-tracer
+```
 
 ---
 

@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 # Add scripts directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -18,6 +18,7 @@ class TestSplunkHecWrapEvent(unittest.TestCase):
     def test_wrap_valid_json(self):
         """Should wrap JSON line into HEC envelope."""
         import splunk_hec_shipper
+
         result = splunk_hec_shipper.wrap_event('{"pid":1234,"comm":"curl"}')
         parsed = json.loads(result)
         self.assertEqual(parsed["event"]["pid"], 1234)
@@ -28,6 +29,7 @@ class TestSplunkHecWrapEvent(unittest.TestCase):
     def test_wrap_invalid_json(self):
         """Should wrap non-JSON as raw string."""
         import splunk_hec_shipper
+
         result = splunk_hec_shipper.wrap_event("not json at all")
         parsed = json.loads(result)
         self.assertEqual(parsed["event"]["raw"], "not json at all")
@@ -35,6 +37,7 @@ class TestSplunkHecWrapEvent(unittest.TestCase):
     def test_wrap_with_index(self):
         """Should include index when SPLUNK_INDEX is set."""
         import splunk_hec_shipper
+
         original = splunk_hec_shipper.INDEX
         try:
             splunk_hec_shipper.INDEX = "test_index"
@@ -47,6 +50,7 @@ class TestSplunkHecWrapEvent(unittest.TestCase):
     def test_wrap_no_index_when_empty(self):
         """Should omit index when not configured."""
         import splunk_hec_shipper
+
         original = splunk_hec_shipper.INDEX
         try:
             splunk_hec_shipper.INDEX = ""
@@ -59,6 +63,7 @@ class TestSplunkHecWrapEvent(unittest.TestCase):
     def test_wrap_preserves_timestamp(self):
         """Should convert ISO 8601 timestamp to epoch."""
         import splunk_hec_shipper
+
         event = '{"timestamp":"2025-01-15T10:30:00.123456Z","pid":1}'
         result = splunk_hec_shipper.wrap_event(event)
         parsed = json.loads(result)
@@ -72,12 +77,14 @@ class TestSplunkHecMaskToken(unittest.TestCase):
     def test_mask_long_token(self):
         """Should show first 4 and last 4 chars."""
         import splunk_hec_shipper
+
         result = splunk_hec_shipper._mask_token("abcdefgh12345678")
         self.assertEqual(result, "abcd...5678")
 
     def test_mask_short_token(self):
         """Should fully mask short tokens."""
         import splunk_hec_shipper
+
         result = splunk_hec_shipper._mask_token("short")
         self.assertEqual(result, "***")
 
@@ -88,20 +95,24 @@ class TestSplunkHecParseBoolEnv(unittest.TestCase):
     @patch.dict(os.environ, {"TEST_BOOL": "true"})
     def test_true_values(self):
         import splunk_hec_shipper
+
         self.assertTrue(splunk_hec_shipper._parse_bool_env("TEST_BOOL"))
 
     @patch.dict(os.environ, {"TEST_BOOL": "false"})
     def test_false_values(self):
         import splunk_hec_shipper
+
         self.assertFalse(splunk_hec_shipper._parse_bool_env("TEST_BOOL"))
 
     @patch.dict(os.environ, {"TEST_BOOL": "1"})
     def test_numeric_true(self):
         import splunk_hec_shipper
+
         self.assertTrue(splunk_hec_shipper._parse_bool_env("TEST_BOOL"))
 
     def test_default_when_missing(self):
         import splunk_hec_shipper
+
         self.assertTrue(splunk_hec_shipper._parse_bool_env("MISSING_VAR", True))
         self.assertFalse(splunk_hec_shipper._parse_bool_env("MISSING_VAR", False))
 
@@ -112,24 +123,26 @@ class TestSplunkHecParseIntEnv(unittest.TestCase):
     @patch.dict(os.environ, {"TEST_INT": "42"})
     def test_valid_int(self):
         import splunk_hec_shipper
+
         self.assertEqual(splunk_hec_shipper._parse_int_env("TEST_INT", 10), 42)
 
     @patch.dict(os.environ, {"TEST_INT": "abc"})
     def test_invalid_returns_default(self):
         import splunk_hec_shipper
+
         self.assertEqual(splunk_hec_shipper._parse_int_env("TEST_INT", 10), 10)
 
     @patch.dict(os.environ, {"TEST_INT": "0"})
     def test_clamp_min(self):
         import splunk_hec_shipper
+
         self.assertEqual(splunk_hec_shipper._parse_int_env("TEST_INT", 10, min_val=1), 1)
 
     @patch.dict(os.environ, {"TEST_INT": "99999"})
     def test_clamp_max(self):
         import splunk_hec_shipper
-        self.assertEqual(
-            splunk_hec_shipper._parse_int_env("TEST_INT", 10, max_val=100), 100
-        )
+
+        self.assertEqual(splunk_hec_shipper._parse_int_env("TEST_INT", 10, max_val=100), 100)
 
 
 class TestSplunkHecDeadLetter(unittest.TestCase):
@@ -138,15 +151,14 @@ class TestSplunkHecDeadLetter(unittest.TestCase):
     def test_writes_events_to_file(self):
         """Should write events to dead-letter file."""
         import splunk_hec_shipper
+
         with tempfile.TemporaryDirectory() as tmpdir:
             dlq_path = os.path.join(tmpdir, "splunk-dead-letter.json")
             original = splunk_hec_shipper.DEAD_LETTER_MAX_BYTES
             try:
                 # Patch the dead letter path
-                with patch.object(splunk_hec_shipper, '_write_dead_letter') as mock_dlq:
-                    mock_dlq.side_effect = lambda events: _test_write_dlq(
-                        events, dlq_path
-                    )
+                with patch.object(splunk_hec_shipper, "_write_dead_letter") as mock_dlq:
+                    mock_dlq.side_effect = lambda events: _test_write_dlq(events, dlq_path)
                     # Actually test the real function with a temp path
                     pass
             finally:
@@ -168,6 +180,7 @@ class TestSplunkHecSendBatch(unittest.TestCase):
     def test_successful_send(self, mock_urlopen):
         """Should return True on successful HEC response."""
         import splunk_hec_shipper
+
         original_url = splunk_hec_shipper.HEC_URL
         original_token = splunk_hec_shipper.HEC_TOKEN
         try:
@@ -178,6 +191,7 @@ class TestSplunkHecSendBatch(unittest.TestCase):
             mock_urlopen.return_value = mock_resp
 
             import ssl
+
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -192,8 +206,10 @@ class TestSplunkHecSendBatch(unittest.TestCase):
     @patch("splunk_hec_shipper.urlopen")
     def test_403_stops_retrying(self, mock_urlopen):
         """Should stop retrying on 403 Forbidden."""
-        import splunk_hec_shipper
         from urllib.error import HTTPError
+
+        import splunk_hec_shipper
+
         original_url = splunk_hec_shipper.HEC_URL
         original_token = splunk_hec_shipper.HEC_TOKEN
         try:
@@ -204,11 +220,12 @@ class TestSplunkHecSendBatch(unittest.TestCase):
             )
 
             import ssl
+
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
-            with patch.object(splunk_hec_shipper, '_write_dead_letter'):
+            with patch.object(splunk_hec_shipper, "_write_dead_letter"):
                 events = ['{"event":{"test":1}}']
                 result = splunk_hec_shipper.send_batch(events, ctx)
                 self.assertFalse(result)
@@ -225,11 +242,13 @@ class TestSplunkHecBuildSslContext(unittest.TestCase):
     def test_default_verifies_ssl(self):
         """Should verify SSL by default."""
         import splunk_hec_shipper
+
         original = splunk_hec_shipper.VERIFY_SSL
         try:
             splunk_hec_shipper.VERIFY_SSL = True
             ctx = splunk_hec_shipper.build_ssl_context()
             import ssl
+
             self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
         finally:
             splunk_hec_shipper.VERIFY_SSL = original
@@ -237,11 +256,13 @@ class TestSplunkHecBuildSslContext(unittest.TestCase):
     def test_disable_ssl_verification(self):
         """Should disable SSL verification when configured."""
         import splunk_hec_shipper
+
         original = splunk_hec_shipper.VERIFY_SSL
         try:
             splunk_hec_shipper.VERIFY_SSL = False
             ctx = splunk_hec_shipper.build_ssl_context()
             import ssl
+
             self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
         finally:
             splunk_hec_shipper.VERIFY_SSL = original
@@ -253,6 +274,7 @@ class TestSplunkHecSignalHandler(unittest.TestCase):
     def test_signal_sets_running_false(self):
         """Should set running to False on signal."""
         import splunk_hec_shipper
+
         original = splunk_hec_shipper.running
         try:
             splunk_hec_shipper.running = True
@@ -272,20 +294,75 @@ class TestSplunkHecMainValidation(unittest.TestCase):
         if "splunk_hec_shipper" in sys.modules:
             del sys.modules["splunk_hec_shipper"]
         import splunk_hec_shipper
+
         splunk_hec_shipper.HEC_URL = ""
         with self.assertRaises(SystemExit):
             splunk_hec_shipper.main()
 
-    @patch.dict(os.environ, {"SPLUNK_HEC_URL": "https://splunk:8088/services/collector",
-                              "SPLUNK_HEC_TOKEN": ""})
+    @patch.dict(
+        os.environ,
+        {"SPLUNK_HEC_URL": "https://splunk:8088/services/collector", "SPLUNK_HEC_TOKEN": ""},
+    )
     def test_exits_without_token(self):
         """Should exit if SPLUNK_HEC_TOKEN is not set."""
         if "splunk_hec_shipper" in sys.modules:
             del sys.modules["splunk_hec_shipper"]
         import splunk_hec_shipper
+
         splunk_hec_shipper.HEC_TOKEN = ""
         with self.assertRaises(SystemExit):
             splunk_hec_shipper.main()
+
+    @patch.dict(
+        os.environ,
+        {"SPLUNK_HEC_URL": "http://splunk:8088/services/collector", "SPLUNK_HEC_TOKEN": "test"},
+    )
+    def test_exits_on_plain_http_by_default(self):
+        """Should refuse a plain http:// HEC URL unless explicitly allowed."""
+        if "splunk_hec_shipper" in sys.modules:
+            del sys.modules["splunk_hec_shipper"]
+        import splunk_hec_shipper
+
+        with self.assertRaises(SystemExit):
+            splunk_hec_shipper.main()
+
+
+class TestSplunkHecValidateUrl(unittest.TestCase):
+    """Test validate_hec_url() scheme checks."""
+
+    def test_https_allowed(self):
+        import splunk_hec_shipper
+
+        self.assertTrue(
+            splunk_hec_shipper.validate_hec_url("https://splunk:8088/services/collector")
+        )
+
+    def test_http_rejected_by_default(self):
+        import splunk_hec_shipper
+
+        self.assertFalse(
+            splunk_hec_shipper.validate_hec_url("http://splunk:8088/services/collector")
+        )
+
+    def test_http_allowed_when_opted_in(self):
+        import splunk_hec_shipper
+
+        self.assertTrue(
+            splunk_hec_shipper.validate_hec_url(
+                "http://splunk:8088/services/collector", allow_http=True
+            )
+        )
+
+    def test_file_scheme_rejected(self):
+        import splunk_hec_shipper
+
+        self.assertFalse(splunk_hec_shipper.validate_hec_url("file:///etc/passwd"))
+        self.assertFalse(splunk_hec_shipper.validate_hec_url("file:///etc/passwd", allow_http=True))
+
+    def test_relative_url_rejected(self):
+        import splunk_hec_shipper
+
+        self.assertFalse(splunk_hec_shipper.validate_hec_url("services/collector"))
 
 
 if __name__ == "__main__":
