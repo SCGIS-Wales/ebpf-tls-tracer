@@ -11,6 +11,13 @@ name: Maintenance - attribution
 #             skipped with a notice when the secret is absent.
 
 on:
+  # Runs automatically when the maintenance data or this file changes on any
+  # branch (workflow_dispatch is only available once the file is on main).
+  push:
+    branches: ['**']
+    paths:
+      - .github/maintenance/**
+      - .github/workflows/maintenance-attribution.yml
   workflow_dispatch:
     inputs:
       retag:
@@ -32,7 +39,7 @@ concurrency:
 jobs:
   retag:
     name: Re-point release tags
-    if: inputs.retag
+    if: github.event_name == 'push' || inputs.retag
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -68,7 +75,7 @@ jobs:
 
   releases:
     name: Recreate releases under api-py
-    if: inputs.releases
+    if: github.event_name == 'push' || inputs.releases
     needs: [retag]
     runs-on: ubuntu-latest
     timeout-minutes: 30
