@@ -67,8 +67,16 @@ RUN apt-get update \
     zlib1g \
     libssl3t64 \
     && pip install --no-cache-dir -r /tmp/requirements.txt \
+    # pip is only needed to install the pinned dependencies above. Its
+    # vendored copies of urllib3, msgpack and setuptools carry known CVEs
+    # and are never executed at runtime, so remove pip (and the ensurepip
+    # bundle) from the final image to keep the attack surface and the
+    # vulnerability scan clean.
+    && python3 -m pip uninstall -y pip \
+    && rm -rf /usr/local/lib/python3.*/ensurepip /usr/local/bin/pip* /root/.cache \
     && rm -rf /var/lib/apt/lists/* /tmp/requirements.txt \
-    && openssl version
+    && openssl version \
+    && python3 -c "import boto3, botocore, urllib3; print('boto3', boto3.__version__, 'urllib3', urllib3.__version__)"
 
 WORKDIR /opt/tls_tracer
 
