@@ -1,7 +1,7 @@
 name: Maintenance - attribution
 
 # One off maintenance after the history rewrite that attributed every commit
-# to api-py. Run manually from the Actions tab.
+# to api-py.
 #   retag:    re-point every release tag to its rewritten commit
 #             (.github/maintenance/tag-map.txt).
 #   releases: delete and recreate every release under api-py's account
@@ -48,30 +48,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          fetch-depth: 0
 
       - name: Force update tags from the map
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          FAILED=0
           while read -r TAG SHA; do
             if [ -z "${TAG}" ] || [ "${TAG#\#}" != "${TAG}" ]; then continue; fi
-            # The rewritten commit must exist in the repository
-            gh api "repos/${REPO}/git/commits/${SHA}" --jq .sha >/dev/null
             CURRENT=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null || echo "")
             if [ "${CURRENT}" = "${SHA}" ]; then
               echo "${TAG}: already at ${SHA}"
               continue
             fi
-            if [ -n "${CURRENT}" ]; then
-              gh api -X PATCH "repos/${REPO}/git/refs/tags/${TAG}" -f sha="${SHA}" -F force=true --jq .object.sha
-            else
-              gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" --jq .object.sha
+            # 1. REST force update
+            if gh api -X PATCH "repos/${REPO}/git/refs/tags/${TAG}" -f sha="${SHA}" -F force=true --jq .object.sha 2>/tmp/err; then
+              echo "${TAG}: ${CURRENT:-none} -> ${SHA} (api patch)"
+              continue
             fi
-            echo "${TAG}: ${CURRENT:-none} -> ${SHA}"
+            echo "${TAG}: api patch refused: $(tr -d '\n' </tmp/err)"
+            # 2. git push with the workflow token
+            git tag -f "${TAG}" "${SHA}" >/dev/null
+            if git push --force origin "refs/tags/${TAG}" 2>/tmp/err; then
+              echo "${TAG}: ${CURRENT:-none} -> ${SHA} (git push)"
+              continue
+            fi
+            echo "${TAG}: git push refused: $(tail -n 3 /tmp/err | tr -d '\n')"
+            # 3. REST delete and recreate
+            if gh api -X DELETE "repos/${REPO}/git/refs/tags/${TAG}" 2>/tmp/err \
+               && gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" --jq .object.sha 2>>/tmp/err; then
+              echo "${TAG}: ${CURRENT:-none} -> ${SHA} (api delete+create)"
+              continue
+            fi
+            echo "${TAG}: delete+create refused: $(tr -d '\n' </tmp/err)"
+            FAILED=$((FAILED + 1))
           done < .github/maintenance/tag-map.txt
+          echo "tags still not re-pointed: ${FAILED}"
+          [ "${FAILED}" -eq 0 ]
 
   releases:
     name: Recreate releases under api-py
