@@ -1195,10 +1195,15 @@ jobs:
       previous_tag: ${{ needs.version.outputs.previous_tag }}
 
     steps:
+      # RELEASE_TOKEN is a fine grained personal access token owned by api-py
+      # (contents: write, packages: write). With it the tag, the release and
+      # the published packages are owned by api-py. Without it the workflow
+      # still works but GitHub shows github-actions[bot] as the author.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Create and push annotated tag
         env:
@@ -1209,8 +1214,9 @@ jobs:
             echo "::notice::Tag ${TAG} already exists, nothing to do"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # All tags are attributed to api-py, the repository owner.
+          git config user.name "api-py"
+          git config user.email "5954680+api-py@users.noreply.github.com"
           git tag -a "${TAG}" -m "Release ${TAG}"
           git push origin "refs/tags/${TAG}"
           echo "::notice::Created tag ${TAG}"
@@ -1288,7 +1294,8 @@ jobs:
 
       - name: Create release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # api-py's token so the release is owned by api-py (see auto-tag)
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.auto-tag.outputs.tag }}
           PREVIOUS_TAG: ${{ needs.auto-tag.outputs.previous_tag }}
         run: |
@@ -1340,8 +1347,9 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Push as api-py when RELEASE_TOKEN is configured (see auto-tag)
+          username: ${{ secrets.RELEASE_TOKEN && 'api-py' || github.actor }}
+          password: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -1405,10 +1413,11 @@ jobs:
 
       - name: Package and push chart
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Push as api-py when RELEASE_TOKEN is configured (see auto-tag)
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.auto-tag.outputs.version }}
           OWNER: ${{ github.repository_owner }}
-          ACTOR: ${{ github.actor }}
+          ACTOR: ${{ secrets.RELEASE_TOKEN && 'api-py' || github.actor }}
         run: |
           set -euo pipefail
           helm registry login "${REGISTRY}" --username "${ACTOR}" --password-stdin <<< "${GH_TOKEN}"
