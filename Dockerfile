@@ -36,7 +36,7 @@ RUN make all && make test
 # --- Runtime stage ---
 # Python 3.14 is the current stable interpreter line; the slim trixie variant
 # tracks Debian stable security updates for the shared libraries we need.
-FROM python:3.14-slim-trixie
+FROM python:3.15-slim-trixie
 
 ARG VERSION=dev
 ARG VCS_REF=unknown
